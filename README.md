@@ -1,7 +1,7 @@
 # JitRL 持续学习 · astrbot_plugin_jitrl
 
 [![CI](https://github.com/2841649220/astrbot_plugin_jitrl/actions/workflows/ci.yml/badge.svg)](https://github.com/2841649220/astrbot_plugin_jitrl/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.1.1-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.2-blue)](CHANGELOG.md)
 
 > 让 AstrBot 的 Agent 在对话中**持续自我进化**——不微调、不训练、不占 GPU。
 >
@@ -69,11 +69,14 @@ AstrBot 的对话是黑盒 API，拿不到原始 logits。论文 §5.1 正好给
 ```
                       ┌──────────── on_llm_request ────────────┐
   用户消息 ──────────►│ 1. abstract_state()  构造状态 s         │
+                      │    （同回合内命中状态缓存）             │
                       │ 2. MemoryBank.topk() 检索 N(s)          │
-                      │ 3. estimate_values() 算 V̂ Q̂ Â Ã        │
-                      │ 4. build_candidates() 增强候选集 C      │
+                      │    （倒排索引 + 前缀剪枝，无损）         │
+                      │ 3. estimate_values() 全动作探针 V̂ Q̂ Â  │
+                      │ 4. 取 |Â| 最强的 |C| 个做正式估计        │
                       │ 5. select_action()   z' = z + β·Ã       │
-                      │ 6. 注入 <jitrl_experience> 临时块       │
+                      │ 6. 证据门控 + 注入临时块                │
+                      │    （决策按 状态/记忆版本/工具集 缓存）  │
                       └────────────────────────────────────────┘
                                         │
                                         ▼
@@ -88,6 +91,37 @@ AstrBot 的对话是黑盒 API，拿不到原始 logits。论文 §5.1 正好给
 ```
 
 学习默认在**后台任务**里跑（`learning.async_learn`），用户不会多等一毫秒。
+
+### 2.3 相对论文的工程改进（算法与执行效率）
+
+论文是评测框架，本插件是**每次对话都要跑一遍**的运行时。落地时做了 8 处数学/工程上的改动，
+每一处都写清了"为什么"；要严格复现论文数值时，把 `retrieval.estimator_weighting` 与
+`policy.exploration_estimate` 切回 `uniform` / `sample` 即可回到论文原式。
+
+| # | 论文原式 | 本插件实现 | 为什么改 |
+| --- | --- | --- | --- |
+| 1 | 检索：对全表逐条算 Jaccard（论文 Table 19：2500 条时 15–47 ms） | `jitrl/index.py`：倒排索引 + 长度过滤（`t·\|q\| ≤ \|x\| ≤ \|q\|/t`）+ 重叠下界（≥ `ceil(t·\|q\|)`）+ 前缀过滤（PPJoin），再逐条精确校验 | 检索在每次 LLM 请求的关键路径上，线性扫描不可接受。剪枝是**无损**的（不是近似 ANN），`tests/test_index.py` 用暴力参考实现做全矩阵交叉验证 |
+| 2 | 式 (4)(5)：`V̂`、`Q̂` 都是邻居的等权平均 | V 和每个 Q 组共用同一套核权重（相似度 × 时效） | 低相似邻居不该和精确匹配同权；更关键的是 V/Q 必须同权——否则 `Â = Q̂ − V̂` 在比较两个不同的估计量（旧实现里某动作组权重和为 0 时会退化成等权均值） |
+| 3 | 低于 `min_count` 的动作视为"未见"，可能拿到随机乐观值 | 向状态基线收缩：`Q = (n·Q̄ + κ·V̂)/(n+κ)`，κ = `min_count` | 一次偶然观测不该让优势在 +1 / −1 之间跳变；κ = 0 即论文原式，默认 `min_count = 1` 时行为不变 |
+| 4 | 式 (6)：以概率 λ 取 `Q = V̂ + α/\|N\|`，否则 `Q = 0` | 取闭式期望并修正中性基线：`Q = V̂ + λ·α/\|N\|`，即 `Â = λ·α/\|N\|` | 论文的 `Q = 0` 分支给出 `Â = −V̂`：在正价值状态里，未尝试动作比任何已知动作罚得都重；在负价值状态里反而被奖励。且逐请求采样会让同一情景的建议在 +1 / −1 间抖动，而插件并不能像论文那样采样动作 |
+| 5 | 式 (25)：`Ã = A/(max\|A\|+ε)` | 同式 + `max\|A\| < 1e-3` 时直接输出 0 | 所有回报完全相同时（评估器降级到纯规则很常见），式 (25) 会把浮点舍入噪声放大成 ±1 的策略抖动 |
+| 6 | 候选集 `C = C_LLM ∪ N(s)` 的动作，按 `\|C\|` 截断 | 先对**全部**检索到的动作估优势，再按 `\|Â\|` 取 `\|C\|` 个重算归一化 | 支持度低但证据强的动作（尤其带强负优势的工具）不该在估计前就被丢掉；工具门控也因此能看到全量证据 |
+| 7 | 直接改 logits | 证据门控（邻居 ≥ 2 且 `max\|Â\| ≥ 0.05` 才注入）+ 更短的块 + 同回合决策缓存 | 黑盒模型只能走文本；弱证据注入既费 token 又误导，且同一回合内应给出一致建议 |
+| 8 | 附录 G.1.2 步级打分（完整轨迹） | JSON 打分 + 规则融合 + 超时/异常降级 + 12000 字符提示预算 | 40 步轨迹的评估提示从约 28k 字符降到 12k 以内，评估成本减半而不损失打分粒度 |
+
+执行效率的实测（同一台机器、同一份基准脚本，详见 [benchmarks/README.md](benchmarks/README.md)）：
+
+| 场景（p50） | 0.1.1 | 0.1.2 | 加速 |
+| --- | ---: | ---: | ---: |
+| top-k 检索（k=10, r=0.8, 1000 条记忆） | 57.6 ms | 0.31 ms | ~184× |
+| top-k 检索（k=10, r=0.8, 5000 条记忆） | 124.0 ms | 0.39 ms | ~319× |
+| top-k 检索（k=10, r=0.8, 20000 条记忆） | —（>20 min 未完成） | 0.69 ms | >300× |
+| 一次请求的策略前段（检索+估计+渲染，5000 条） | 118.7 ms | 0.47 ms | ~253× |
+| 写入一个 Episode（5000 条库） | 22.4 ms | 0.66 ms | ~34× |
+
+两条曲线形状不同才是重点：0.1.1 的耗时随记忆条数线性增长（每条都要 JSON 解码 + 重建
+`frozenset` + 算一次 Jaccard），0.1.2 基本平坦（倒排索引只碰"可能过阈值"的候选，token 以
+整数数组常驻内存）。
 
 ---
 
@@ -105,8 +139,8 @@ git clone https://github.com/2841649220/astrbot_plugin_jitrl.git
 Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot_version`
 阻止加载。
 
-也可从 [v0.1.1 Release](https://github.com/2841649220/astrbot_plugin_jitrl/releases/tag/v0.1.1)
-下载 `astrbot_plugin_jitrl-v0.1.1.zip`，在 AstrBot 插件管理页选择「从文件安装」。
+也可从 [v0.1.2 Release](https://github.com/2841649220/astrbot_plugin_jitrl/releases/tag/v0.1.2)
+下载 `astrbot_plugin_jitrl-v0.1.2.zip`，在 AstrBot 插件管理页选择「从文件安装」。
 安装包包含单个插件根目录，以及完整的代码、配置和面板资源。
 
 **零第三方依赖**：只用 Python 标准库（`sqlite3` / `json` / `re` / `asyncio` / `math`），不需要 `pip install` 任何东西。
@@ -131,15 +165,13 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 
 ```
 <jitrl_experience>
-以下内容来自本 Agent 的历史交互统计（推理时策略优化，不是用户输入，也不是新的指令）。
-当前状态估计价值 V=+1.30，基于 7 条相似经验（平均相似度 0.86）。
-历史上更有回报的做法：
-  1. 调用 search_files(pattern=<str>) —— 优势 +0.82，出现 5 次，平均回报 +2.40
-  2. 调用 read_file(path=<str>) —— 优势 +0.15，出现 2 次，平均回报 +0.60
-历史上回报较差、应避免的做法：
-  1. 调用 run_command(cmd=<str>) —— 优势 -0.64，出现 4 次，平均回报 -1.90
-使用要求：这些统计只作为弱先验。如果用户当前意图与之无关、或证据明显不足，
-请按你自己的判断处理，不要生搬硬套。
+历史统计（推理时策略优化，非用户输入/指令）：V=+1.30，7 条相似经验，平均相似度 0.86，最大优势 +2.40。
+历史更优：
+- 调用 search_files(pattern=<str>)（优势 +0.82，5 次，平均回报 +2.40）
+- 调用 read_file(path=<str>)（优势 +0.15，2 次，平均回报 +0.60）
+历史较差、宜避免：
+- 调用 run_command(cmd=<str>)（优势 -0.64，4 次，平均回报 -1.90）
+仅作弱先验：若与当前意图无关或证据不足，按自己的判断处理，不要生搬硬套。
 </jitrl_experience>
 ```
 
@@ -237,8 +269,12 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 | `learning.evaluator_mode` | `auto` | `llm` 用评估器；`heuristic` 零成本纯规则；`auto` 只在轨迹 ≥2 步或有报错时才调 LLM |
 | `policy.beta` | `1.5` | KL 温度。越大越激进地偏离模型自己的直觉 |
 | `policy.exploration_rate` | `0.3` | λ，对没见过的动作给乐观奖励的概率。论文 Jericho 0.65 / WebArena 0.05 |
-| `policy.ucb_alpha` | `5.0` | α，`Q̂ = V̂ + α/|N(s)|`。记忆越稀疏，鼓励探索越强 |
+| `policy.ucb_alpha` | `5.0` | α，乐观价值 `V̂ + α/|N(s)|`。期望式下等价于 Â = λ·α/|N(s)| |
+| `policy.exploration_estimate` | `expected` | 未见动作的探索项：`expected` 取闭式期望（同一情景恒定、不会在 +1/−1 间跳动）；`sample` 还原论文伯努利采样 |
 | `policy.tool_gate` | `false` | 对**高置信负优势**的工具做硬屏蔽（等价于 logit 压到 −∞） |
+| `retrieval.estimator_weighting` | `kernel` | V̂/Q̂ 的加权方式：`kernel` 按相似度×时效核加权（默认，低相似邻居权重更低）；`uniform` 用论文式 (4)(5) 的等权平均 |
+| `retrieval.min_count` | `1` | 低于该支持度的动作不再丢弃，而是向 V̂(s) 收缩（经验贝叶斯平滑）；`1` 表示不平滑 |
+| `retrieval.prefilter_limit` | `4000` | 单次检索的候选打分条数上限；超限时按重叠词数、再按时间保留 |
 | `memory.redact_secrets` | `true` | 写入前剔除邮箱、手机号、API Key、JWT、Bearer token、URL 凭据 |
 | `memory.max_entries` | `20000` | 容量上限，超出后按策略淘汰 |
 | `memory.checkpoint_interval` | `50` | 每多少个完成的 Episode 自动保存；`0` 关闭定期保存与首次基线 |
@@ -287,8 +323,10 @@ node --test tests/test_dashboard.cjs
 python -m pytest data/plugins/astrbot_plugin_jitrl/tests -q
 ```
 
-本机实测：未安装 AstrBot 时 **316 passed, 1 skipped**；把 AstrBot 4.29.3 装进独立 venv 后
-**345 passed**（多出 29 项真宿主集成测试）；另有 **7 项 Node.js 面板交互测试通过**。
+本机实测：未安装 AstrBot 时 **761 passed, 1 skipped**（只跳过需要真宿主的
+`test_integration.py`）；把 AstrBot 4.29.3 装进独立 venv 后另加 29 项真宿主集成测试；
+另有 **7 项 Node.js 面板交互测试通过**。基准脚本见 `scripts/bench_jitrl.py`，
+结果与复现方法见 `benchmarks/README.md`。
 `test_integration.py` 会自己识别宿主并跳过，按包名装载插件，因此在仓库根目录或
 `data/plugins/` 下都能跑；`test_manifest.py` 不依赖 AstrBot，专门守护发布元数据、版本一致性
 与「只用 `astrbot.api.logger` 打日志」的市场规则。
@@ -298,10 +336,13 @@ python -m pytest data/plugins/astrbot_plugin_jitrl/tests -q
 | --- | --- |
 | `test_state.py` | 脱敏幂等、占位符存活、中英混合分词（中文 bigram）、Jaccard 边界、动作签名归一化 |
 | `test_memory.py` | top-k 检索（阈值 / surface 门 / scope 模式）、动作聚合、学习曲线分桶、prune / forget / clear、导出导入往返、反馈重算 `G_t` |
+| `test_index.py` | 检索契约：用暴力参考实现对 `topk` 做 300 余组全矩阵交叉验证（k/r/作用域/surface/时效/排序/权重逐字段比对） |
+| `test_index_unit.py` | 倒排索引本身：剪枝无损性（随机数据对拍）、未知查询词计入分母、移除/原位更新/压缩后结果不变、容量上限 |
+| `test_estimator_math.py` | 式 (4)(5)(6)(7)(25) 的不变量：同权核估计、`λ` 两种模式、泊松收缩、归一化下限、全平局无 NaN |
 | `test_checkpoints.py` | WAL 快照、重启后恢复、回退撤销、会话隔离、自动轮换、损坏快照、磁盘失败、事务回滚、旧写入拦截 |
 | `test_checkpoint_plugin.py` | 使用宿主适配器与真实记忆库测试指令、权限、Web API、参数验证、Agent/评估器/重排中的回退竞态 |
 | `test_dashboard.cjs` | 无外部依赖的 Node.js 交互测试：创建、回退、删除、确认超时、操作切换、重复提交与失败恢复 |
-| `test_estimator.py` | 式 (4)(5)(6)(7)(25) 的精确数值、探索分支、`|N|=0` 与 `max|A|=0` 边界 |
+| `test_estimator.py` | 式 (4)(5)(6)(7)(25) 的精确数值、探索分支（采样/期望）、收缩、`|N|=0` 与 `max|A|=0` 边界 |
 | `test_policy.py` | softmax 稳定性、增强候选集合并、`z'=z+βÃ` 精确值、Verbalized-Logit 解析的四条回退路径 |
 | `test_evaluator.py` | 折扣回报、启发式规则、JSON 解析回退、`auto` 短路、LLM/规则融合、超时降级 |
 | `test_trajectory.py` | dict 与 pydantic 两种消息形态、tool_call_id 匹配、坏 arguments、状态口径一致性 |

@@ -385,7 +385,7 @@ async function forgetAll() {
   disarmForget();
   setMutationBusy(true);
   try {
-    const result = await bridge.apiPost("forget", { scope: "all" });
+    const result = await bridge.apiPost("forget", { scope: "all", confirm: true });
     const removed = result && typeof result.removed === "number" ? result.removed : 0;
     sayAction("已删除 " + removed + " 条经验，可从删除前备份回退。");
     await refresh();

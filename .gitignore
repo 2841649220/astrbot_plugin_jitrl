@@ -15,6 +15,9 @@ export-*.json
 .pytest_cache/
 .ruff_cache/
 .tmp-pytest/
+.tmp-check/
+.tmp-paper/
+.tmp-baseline/
 
 # AstrBot data directory, only present when running the tests from here
 data/

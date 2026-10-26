@@ -423,3 +423,91 @@ async def test_experience_block_rides_on_the_user_message(plugin):
     part = request.extra_user_content_parts[0]
     assert "<jitrl_experience>" in part.text
     assert part.temporary, "the injected part must never be persisted"
+
+
+def _tool_request(*names: str) -> SimpleNamespace:
+    """Build an outgoing request exposing the given tool names.
+
+    Args:
+        *names: Tool names available for this request.
+
+    Returns:
+        A minimal ProviderRequest stand-in.
+    """
+    return SimpleNamespace(
+        prompt="trusted task",
+        system_prompt="base",
+        func_tool=SimpleNamespace(names=lambda: list(names)),
+        extra_user_content_parts=[],
+    )
+
+
+async def test_decision_cache_reuses_a_state_and_drops_on_new_evidence(plugin):
+    for tool, reward in (("web_search", 2.0), ("bad_tool", -2.0)):
+        await _seed(plugin._bank, "trusted task", tool, reward)
+    first = _tool_request("web_search", "bad_tool")
+    await plugin.on_llm_request(Event(), first)
+    assert len(plugin._decision_cache) == 1
+    snapshot = next(iter(plugin._decision_cache.values()))
+
+    # A second request for the same state must reuse the decision instead of
+    # re-running retrieval and re-sampling the exploration branch.
+    second = _tool_request("web_search", "bad_tool")
+    await plugin.on_llm_request(Event(), second)
+    assert next(iter(plugin._decision_cache.values())) is snapshot
+    assert len(plugin._decision_cache) == 1
+    assert second.extra_user_content_parts
+
+    # New evidence invalidates the cache.
+    await learn(plugin)
+    assert plugin._decision_cache == {}
+
+
+async def test_two_pass_shortlist_keeps_the_most_informative_actions(plugin):
+    for tool, reward in (
+        ("tool_a", 2.0),
+        ("tool_b", -2.0),
+        ("tool_c", 1.0),
+        ("tool_d", -1.0),
+    ):
+        await _seed(plugin._bank, "trusted task", tool, reward)
+    request = _tool_request("tool_a", "tool_b", "tool_c", "tool_d")
+    await plugin.on_llm_request(Event(), request)
+    snapshot = next(iter(plugin._decision_cache.values()))
+
+    # The probe covers every retrieved action, while the decision is restricted
+    # to the |C| = 3 actions with the strongest evidence.
+    assert len(snapshot.probe.advantage) == 4
+    assert len(snapshot.estimate.advantage) == 3
+    assert not any("tool_d" in key for key in snapshot.estimate.advantage)
+
+
+async def test_single_neighbour_never_injects_evidence(plugin):
+    await _seed(plugin._bank, "trusted task", "web_search", 2.0)
+    request = _tool_request("web_search")
+    await plugin.on_llm_request(Event(), request)
+    assert request.extra_user_content_parts == []
+    snapshot = next(iter(plugin._decision_cache.values()))
+    assert snapshot.block == ""
+    assert snapshot.decision.applied
+
+
+async def test_web_forget_requires_explicit_confirmation(host, plugin):
+    await learn(plugin)
+    response = await web_call(host, plugin, "_web_forget", {"scope": "all"})
+    assert response.status_code == 400
+    assert await plugin._bank.count() == 1
+    response = await web_call(
+        host, plugin, "_web_forget", {"scope": "all", "confirm": True}
+    )
+    assert response.status_code == 200
+    assert await plugin._bank.count() == 0
+
+
+async def test_export_command_hides_the_server_path(plugin):
+    await learn(plugin)
+    text = await command(plugin.jitrl_export(Event()))
+    assert "export-" in text
+    assert "\\\\" not in text and "/" not in text.replace("http://", "")
+    files = list(plugin._db_path.parent.glob("export-*.json"))
+    assert len(files) == 1

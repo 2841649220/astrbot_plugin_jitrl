@@ -27,6 +27,7 @@ from typing import Any
 from astrbot.api import logger
 
 from .checkpoints import CheckpointStore
+from .index import ExperienceIndex, IndexHit
 from .models import Episode, Neighbor, StateView
 from .state import jaccard, redact
 
@@ -41,6 +42,21 @@ _RECENCY_FLOOR: float = 0.5
 
 _SECONDS_PER_DAY: float = 86400.0
 _EXPORT_VERSION: int = 1
+
+_INDEX_MAX_ENTRIES: int = 100000
+"""Row cap above which the in-memory retrieval index is not used.
+
+The index costs roughly 0.55 KB per 60-token experience, so 100k rows is about
+55 MB -- already generous for a chat deployment. Beyond that the bank falls back
+to the exact SQL scan so a misconfigured cap can never exhaust memory.
+"""
+
+_EAGER_WARM_ROWS: int = 4000
+"""Build the index during initialize() up to this row count.
+
+Small banks get a ready index before the first request; larger ones are warmed
+in the background by the plugin so startup never blocks on a slow build.
+"""
 
 _SCHEMA_STATEMENTS: tuple[str, ...] = (
     "CREATE TABLE IF NOT EXISTS episodes ("
@@ -75,8 +91,14 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     "reward_source TEXT NOT NULL DEFAULT '', "
     "created_at REAL NOT NULL DEFAULT 0"
     ")",
-    "CREATE INDEX IF NOT EXISTS idx_experiences_surface ON experiences(surface)",
-    "CREATE INDEX IF NOT EXISTS idx_experiences_scope ON experiences(scope)",
+    # Composite indexes: the retrieval scan filters on surface/scope and orders
+    # by created_at, and every episode insert deletes by episode_id first. The
+    # old single-column indexes could not serve either access pattern.
+    "CREATE INDEX IF NOT EXISTS idx_experiences_episode ON experiences(episode_id)",
+    "CREATE INDEX IF NOT EXISTS idx_experiences_surface_created "
+    "ON experiences(surface, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_experiences_scope_created "
+    "ON experiences(scope, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_experiences_action ON experiences(action_key)",
     "CREATE INDEX IF NOT EXISTS idx_experiences_created ON experiences(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_episodes_scope ON episodes(scope)",
@@ -203,6 +225,8 @@ class MemoryBank:
         self._conn: sqlite3.Connection | None = None
         self._lock = threading.Lock()
         self._generation = 0
+        self._index: ExperienceIndex | None = None
+        self._row_count: int | None = None
         self._episodes_since_checkpoint = 0
         self.checkpoint_interval = max(0, _as_int(checkpoint_interval, 50))
         directory = (
@@ -242,6 +266,14 @@ class MemoryBank:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=NORMAL")
                 conn.execute("PRAGMA busy_timeout=5000")
+                # Retrieval reads the newest rows of a surface/scope; keeping the
+                # working set in memory keeps those scans off the disk on a
+                # plugin that queries on every single LLM request.
+                try:
+                    conn.execute("PRAGMA cache_size=-32000")
+                    conn.execute("PRAGMA temp_store=MEMORY")
+                except sqlite3.Error:
+                    pass
                 for statement in _SCHEMA_STATEMENTS:
                     conn.execute(statement)
                 conn.commit()
@@ -255,6 +287,93 @@ class MemoryBank:
                 conn.close()
                 raise
             self._conn = conn
+            try:
+                self._row_count = self._count_locked(scope=None)
+            except sqlite3.Error:
+                self._row_count = None
+            if self._row_count is not None and 0 < self._row_count <= _EAGER_WARM_ROWS:
+                self._ensure_index_locked()
+
+    async def warm_index(self) -> bool:
+        """Build the retrieval index in the background.
+
+        Returns:
+            True when an index is available afterwards, False when the bank is
+            too large, closed, or the build failed.
+        """
+        return await asyncio.to_thread(self._warm_index_sync)
+
+    def _warm_index_sync(self) -> bool:
+        """Build the index on a worker thread.
+
+        Returns:
+            True when the index is ready.
+        """
+        with self._lock:
+            if self._conn is None:
+                return False
+            try:
+                return self._ensure_index_locked() is not None
+            except (sqlite3.Error, ValueError):
+                logger.warning("[JitRL] retrieval index build failed", exc_info=True)
+                self._index = None
+                return False
+
+    def _ensure_index_locked(self) -> ExperienceIndex | None:
+        """Return the retrieval index, building it from SQLite when needed.
+
+        The lock must already be held. A bank larger than the index cap keeps
+        returning None, which makes topk() use the exact SQL scan.
+
+        Returns:
+            The ready index, or None when the bank is too large / unreadable.
+        """
+        if self._index is not None:
+            return self._index
+        conn = self._require_conn()
+        total = self._row_count
+        if total is None:
+            total = self._count_locked(scope=None)
+        if total > _INDEX_MAX_ENTRIES:
+            return None
+        index = ExperienceIndex(max_entries=_INDEX_MAX_ENTRIES)
+        rows = conn.execute(
+            "SELECT id, scope, surface, state_tokens, action_key, "
+            "discounted_return, reward, created_at FROM experiences ORDER BY id"
+        )
+        for row in rows:
+            tokens = _loads(row["state_tokens"], None)
+            if not isinstance(tokens, list | tuple):
+                continue
+            appended = index.append(
+                entry_id=_as_int(row["id"]),
+                tokens=(str(token) for token in tokens),
+                scope=str(row["scope"] or ""),
+                surface=str(row["surface"] or ""),
+                action_key=str(row["action_key"] or ""),
+                discounted_return=_as_float(row["discounted_return"]),
+                reward=_as_float(row["reward"]),
+                created_at=_as_float(row["created_at"]),
+            )
+            if not appended and index.is_full:
+                # Keep what fits; the caller still gets exact results for the
+                # indexed prefix and the scan fallback is not needed.
+                break
+        self._index = index
+        return index
+
+    def _invalidate_index_locked(self) -> None:
+        """Drop the in-memory index so the next query rebuilds it."""
+        self._index = None
+
+    def _purge_rows_locked(self, entry_ids: list[int]) -> None:
+        """Remove rows from the index after they were deleted from SQLite.
+
+        Args:
+            entry_ids: Database primary keys of the deleted rows.
+        """
+        if self._index is not None and entry_ids:
+            self._index.remove_many(entry_ids)
 
     async def close(self) -> None:
         """Close the connection. Idempotent and never raises."""
@@ -346,6 +465,8 @@ class MemoryBank:
             )
             self._generation += 1
             self._episodes_since_checkpoint = 0
+            self._row_count = None
+            self._invalidate_index_locked()
             return result
 
     def _backup_before_forget_locked(self) -> None:
@@ -447,9 +568,14 @@ class MemoryBank:
                 return 0
             try:
                 conn.execute("DELETE FROM episodes WHERE episode_id = ?", (episode_id,))
-                conn.execute(
+                replaced = conn.execute(
                     "DELETE FROM experiences WHERE episode_id = ?", (episode_id,)
                 )
+                replaced_rows = max(0, int(replaced.rowcount or 0))
+                if replaced_rows and self._index is not None:
+                    # The episode was rewritten under a fresh set of row ids;
+                    # drop the stale entries before indexing the new ones.
+                    self._invalidate_index_locked()
                 conn.execute(
                     _INSERT_EPISODE_SQL,
                     (
@@ -475,6 +601,10 @@ class MemoryBank:
                 except sqlite3.Error:
                     pass
                 raise
+            if self._row_count is not None:
+                self._row_count += len(rows) - replaced_rows
+            if self._index is not None and rows and self._row_count is not None:
+                self._append_episode_to_index_locked(conn, episode_id)
             self._episodes_since_checkpoint += 1
             if self.max_entries > 0:
                 total = self._count_locked(scope=None)
@@ -494,6 +624,39 @@ class MemoryBank:
                         exc_info=True,
                     )
         return len(rows)
+
+    def _append_episode_to_index_locked(
+        self, conn: sqlite3.Connection, episode_id: str
+    ) -> None:
+        """Index the rows of an episode that was just committed.
+
+        Args:
+            conn: Live connection (lock already held).
+            episode_id: Episode whose rows should be indexed.
+        """
+        index = self._index
+        if index is None:
+            return
+        rows = conn.execute(
+            "SELECT id, scope, surface, state_tokens, action_key, "
+            "discounted_return, reward, created_at FROM experiences "
+            "WHERE episode_id = ? ORDER BY id",
+            (episode_id,),
+        ).fetchall()
+        for row in rows:
+            tokens = _loads(row["state_tokens"], None)
+            if not isinstance(tokens, list | tuple):
+                continue
+            index.append(
+                entry_id=_as_int(row["id"]),
+                tokens=(str(token) for token in tokens),
+                scope=str(row["scope"] or ""),
+                surface=str(row["surface"] or ""),
+                action_key=str(row["action_key"] or ""),
+                discounted_return=_as_float(row["discounted_return"]),
+                reward=_as_float(row["reward"]),
+                created_at=_as_float(row["created_at"]),
+            )
 
     async def forget(
         self,
@@ -544,12 +707,20 @@ class MemoryBank:
             params.append(_as_float(older_than))
         if not conditions:
             return 0
-        sql = "DELETE FROM experiences WHERE " + " AND ".join(conditions)
+        where = " WHERE " + " AND ".join(conditions)
         with self._lock:
             conn = self._require_conn()
             self._backup_before_forget_locked()
+            deleted_ids: list[int] = []
+            if self._index is not None:
+                deleted_ids = [
+                    _as_int(row[0])
+                    for row in conn.execute(
+                        "SELECT id FROM experiences" + where, params
+                    ).fetchall()
+                ]
             try:
-                cursor = conn.execute(sql, params)
+                cursor = conn.execute("DELETE FROM experiences" + where, params)
                 removed = max(0, int(cursor.rowcount or 0))
                 self._drop_empty_episode_headers_locked()
                 conn.commit()
@@ -560,6 +731,9 @@ class MemoryBank:
                     pass
                 raise
             self._generation += 1
+            if self._row_count is not None:
+                self._row_count = max(0, self._row_count - removed)
+            self._purge_rows_locked(deleted_ids)
         return removed
 
     async def clear(self) -> int:
@@ -594,6 +768,9 @@ class MemoryBank:
                     pass
                 raise
             self._generation += 1
+            self._row_count = 0
+            if self._index is not None:
+                self._index.clear()
         return removed
 
     async def prune(self) -> int:
@@ -641,16 +818,28 @@ class MemoryBank:
             )
             groups = conn.execute(sql).fetchall()
             shortfall = total - self.max_entries
+            purged: list[int] = []
             for row in groups:
                 if shortfall <= 0:
                     break
                 episode_id = str(row["eid"] or "")
+                if self._index is not None:
+                    purged.extend(
+                        _as_int(item[0])
+                        for item in conn.execute(
+                            "SELECT id FROM experiences WHERE episode_id = ?",
+                            (episode_id,),
+                        ).fetchall()
+                    )
                 cursor = conn.execute(
                     "DELETE FROM experiences WHERE episode_id = ?", (episode_id,)
                 )
                 removed += max(0, int(cursor.rowcount or 0))
                 shortfall -= _as_int(row["n"])
             conn.commit()
+            if self._row_count is not None:
+                self._row_count = max(0, self._row_count - removed)
+            self._purge_rows_locked(purged)
         if self.keep_episodes > 0:
             conn.execute(
                 "DELETE FROM episodes WHERE id NOT IN ("
@@ -752,6 +941,14 @@ class MemoryBank:
                 except sqlite3.Error:
                     pass
                 raise
+            index = self._index
+            if index is not None:
+                for reward, discounted_return, entry_id in updates:
+                    index.update_return(
+                        entry_id,
+                        discounted_return=discounted_return,
+                        reward=reward,
+                    )
         return len(updates)
 
     async def import_json(self, data: Mapping[str, Any]) -> int:
@@ -841,6 +1038,9 @@ class MemoryBank:
                 except sqlite3.Error:
                     pass
                 raise
+            if imported:
+                self._row_count = None
+                self._invalidate_index_locked()
         return imported
 
     def _experience_row_from_json(
@@ -913,11 +1113,14 @@ class MemoryBank:
         """
         conn = self._require_conn()
         if scope is None:
+            if self._row_count is not None:
+                return self._row_count
             row = conn.execute("SELECT COUNT(*) FROM experiences").fetchone()
-        else:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM experiences WHERE scope = ?", (str(scope),)
-            ).fetchone()
+            self._row_count = _as_int(row[0]) if row is not None else 0
+            return self._row_count
+        row = conn.execute(
+            "SELECT COUNT(*) FROM experiences WHERE scope = ?", (str(scope),)
+        ).fetchone()
         return _as_int(row[0]) if row is not None else 0
 
     # -- reads ---------------------------------------------------------------
@@ -962,18 +1165,21 @@ class MemoryBank:
     ) -> list[Neighbor]:
         """Retrieve the k most similar experiences for a query state.
 
-        The SQL pass keeps the newest prefilter_limit rows (optionally gated by
-        surface), then Python scores them with Eq. 24. Rows below threshold are
-        dropped, cross-scope neighbours are down-weighted in hybrid mode, and
-        the survivors are ranked by similarity, newest first.
+        Candidate generation runs through the inverted index (jitrl.index), so
+        the cost is proportional to the rows that can clear the threshold rather
+        than to the size of the bank; the result is identical to an exhaustive
+        Eq. 24 scan. Rows below the threshold are dropped, cross-scope
+        neighbours are down-weighted in hybrid mode, and the survivors are
+        ranked by similarity, newest first.
 
         Args:
             query: Abstracted current state.
             scope: Scope of the current session.
             k: Maximum number of neighbours to return.
             threshold: Minimum Jaccard similarity.
-            surface_gate: Restrict the SQL pass to the query surface.
-            prefilter_limit: Maximum number of rows scored in Python.
+            surface_gate: Restrict results to the query surface.
+            prefilter_limit: Work cap on how many candidate rows are scored; when
+                more rows qualify, the highest-overlap, newest ones are kept.
             recency_half_life_days: Half-life of the recency weight; a value of
                 zero or less disables the recency factor.
             scope_mode: "session", "global" or "hybrid".
@@ -1002,6 +1208,49 @@ class MemoryBank:
             now=now,
         )
 
+    def _neighbours_from_hits_locked(self, hits: list[IndexHit]) -> list[Neighbor]:
+        """Attach the display fields of the ranked rows (lock already held).
+
+        The index only stores what retrieval needs; action and state text are
+        read back from SQLite for the k winners so the returned Neighbor always
+        reflects the committed row (and a row deleted in the meantime is simply
+        dropped).
+
+        Args:
+            hits: Ranked index hits.
+
+        Returns:
+            The neighbours, in the order of hits.
+        """
+        conn = self._require_conn()
+        placeholders = ",".join("?" * len(hits))
+        rows = conn.execute(
+            "SELECT id, action_key, action_text, discounted_return, reward, "
+            "state_text, scope FROM experiences WHERE id IN (" + placeholders + ")",
+            [hit.entry_id for hit in hits],
+        ).fetchall()
+        by_id = {_as_int(row["id"]): row for row in rows}
+        neighbours: list[Neighbor] = []
+        for hit in hits:
+            row = by_id.get(hit.entry_id)
+            if row is None:
+                continue
+            neighbours.append(
+                Neighbor(
+                    entry_id=hit.entry_id,
+                    similarity=hit.similarity,
+                    action_key=str(row["action_key"] or ""),
+                    action_text=str(row["action_text"] or ""),
+                    discounted_return=_as_float(row["discounted_return"]),
+                    similarity_weight=hit.weight,
+                    reward=_as_float(row["reward"]),
+                    state_text=str(row["state_text"] or ""),
+                    scope=str(row["scope"] or ""),
+                    created_at=hit.created_at,
+                )
+            )
+        return neighbours
+
     def _topk_sync(
         self,
         query: StateView,
@@ -1015,15 +1264,18 @@ class MemoryBank:
         scope_mode: str,
         now: float | None,
     ) -> list[Neighbor]:
-        """Run the SQL prefilter and the Python Jaccard pass (worker thread).
+        """Retrieve the exact top-k neighbours (worker thread).
+
+        Uses the in-memory inverted index when one is available and falls back
+        to the SQL scan for threshold = 0 or a bank above the index cap.
 
         Args:
             query: Abstracted current state.
             scope: Scope of the current session.
             k: Maximum number of neighbours.
             threshold: Minimum Jaccard similarity.
-            surface_gate: Restrict the SQL pass to the query surface.
-            prefilter_limit: Maximum number of rows scored in Python.
+            surface_gate: Restrict results to the query surface.
+            prefilter_limit: Work cap on how many candidate rows are scored.
             recency_half_life_days: Half-life of the recency weight.
             scope_mode: "session", "global" or "hybrid".
             now: Reference timestamp for the recency weight.
@@ -1041,6 +1293,43 @@ class MemoryBank:
         half_life = _as_float(recency_half_life_days, 0.0)
         reference_now = _as_float(now, time.time())
 
+        # Fast path: the inverted index returns exactly the rows the scan below
+        # would return (the test suite checks it against a brute-force reference)
+        # but only intersects the handful of rows that can possibly clear the
+        # threshold. At k = 10 and threshold = 0.8 a 20k-row bank costs a few
+        # hundred intersections instead of 20,000 full Jaccard computations.
+        if minimum > 0.0:
+            with self._lock:
+                try:
+                    index = self._ensure_index_locked()
+                except (sqlite3.Error, ValueError):
+                    logger.warning(
+                        "[JitRL] retrieval index unavailable; using the SQL scan",
+                        exc_info=True,
+                    )
+                    index = None
+                if index is not None:
+                    hits = index.search(
+                        query.tokens,
+                        k=neighbours_wanted,
+                        threshold=minimum,
+                        scope=query_scope,
+                        surface=str(query.surface or ""),
+                        surface_gate=bool(surface_gate),
+                        scope_mode=mode,
+                        prefilter_limit=limit,
+                        recency_half_life_days=half_life,
+                        cross_scope_penalty=_CROSS_SCOPE_PENALTY,
+                        recency_floor=_RECENCY_FLOOR,
+                        now=reference_now,
+                    )
+                    if not hits:
+                        return []
+                    return self._neighbours_from_hits_locked(hits)
+
+        # Degraded paths: threshold = 0 (every row is admissible, so an index
+        # cannot prune anything) or a bank larger than the index cap. Scan the
+        # newest prefilter_limit rows with the original exact code.
         sql = (
             "SELECT id, scope, state_tokens, action_key, action_text, "
             "discounted_return, reward, state_text, created_at "

@@ -174,7 +174,7 @@
           "max": 20000,
           "step": 100
         },
-        "hint": "单次检索最多参与相似度计算的记忆条数。"
+        "hint": "单次检索最多打分的候选记忆条数（工作量上限）。超过时优先保留重叠词最多、最新的候选，不再按「最新 N 条」截断。"
       },
       "recency_half_life_days": {
         "description": "时效半衰期（天）",
@@ -196,7 +196,21 @@
           "max": 5,
           "step": 1
         },
-        "hint": "低于该次数的动作不参与优势估计。"
+        "hint": "低于该次数的动作不再直接丢弃，而是把它的回报向状态基线 V(s) 收缩（经验贝叶斯平滑）；1 表示不做平滑。"
+      },
+      "estimator_weighting": {
+        "description": "价值估计加权方式",
+        "type": "string",
+        "default": "kernel",
+        "options": [
+          "kernel",
+          "uniform"
+        ],
+        "labels": [
+          "相似度核加权（推荐）",
+          "论文等权平均"
+        ],
+        "hint": "kernel：按检索相似度×时效加权平均 G，低相似邻居权重更低，噪声更小；uniform：论文式 (4)(5) 的 1/|N| 等权平均。"
       }
     }
   },
@@ -235,7 +249,21 @@
           "max": 20,
           "step": 0.5
         },
-        "hint": "Q(s,a) = V(s) + α/|N(s)|，记忆越稀疏奖励越大。"
+        "hint": "未见动作的乐观价值 V(s)+α/|N(s)|，记忆越稀疏奖励越大。期望式下等价于优势 A=λ·α/|N(s)|。"
+      },
+      "exploration_estimate": {
+        "description": "探索项计算方式",
+        "type": "string",
+        "default": "expected",
+        "options": [
+          "expected",
+          "sample"
+        ],
+        "labels": [
+          "期望式（稳定，推荐）",
+          "论文伯努利采样"
+        ],
+        "hint": "expected：对论文的概率分支取闭式期望，中性基线取 Q=V（A=0），同一情景每次给出相同建议；sample：论文原式，按 λ 采样，同一情景的建议会在 +1 与 -1 之间跳动。"
       },
       "normalize_advantage": {
         "description": "优势归一化",

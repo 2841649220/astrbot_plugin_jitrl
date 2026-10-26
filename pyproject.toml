@@ -7,6 +7,9 @@
 [tool.ruff]
 line-length = 88
 target-version = "py310"
+# Scratch directories used by local profiling sessions are never part of the
+# plugin and must not influence lint results.
+extend-exclude = [".tmp-check", ".tmp-paper", ".tmp-pytest", ".tmp-baseline"]
 
 [tool.ruff.lint]
 select = [

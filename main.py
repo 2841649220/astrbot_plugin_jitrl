@@ -35,6 +35,8 @@ import asyncio
 import random
 import time
 import uuid
+from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +44,6 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
-from astrbot.core.agent.message import TextPart
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from .jitrl.config import JitRLConfig
@@ -50,7 +51,7 @@ from .jitrl.estimator import estimate_values
 from .jitrl.evaluator import StepRewardEvaluator
 from .jitrl.hint import render_preference_block, render_recall_report
 from .jitrl.memory import MemoryBank
-from .jitrl.models import Neighbor, PolicyDecision, StateView
+from .jitrl.models import Neighbor, PolicyDecision, StateView, ValueEstimate
 from .jitrl.policy import build_candidates, select_action, verbalized_to_logit
 from .jitrl.reranker import VerbalizedReranker
 from .jitrl.state import abstract_state, redact
@@ -80,6 +81,75 @@ _LAST_EPISODE_TTL = 1800.0
 _FEEDBACK_DELTA = 2.0
 """Reward delta applied when the user confirms or rejects the last reply."""
 
+_STATE_CACHE_MAX = 64
+"""Abstracted states memoised per process.
+
+An agent run issues several LLM requests with the same user message, so the
+redaction/regularisation/tokenisation pipeline would otherwise run again on
+every step of the loop.
+"""
+
+_DECISION_CACHE_MAX = 512
+"""Policy decisions memoised per process.
+
+Retrieval, estimation and hint rendering only depend on (state, scope, memory
+epoch, tool set), so a multi-step agent run reuses one decision instead of
+recomputing it per request -- and, more importantly, sees stable advice instead
+of the sampled exploration branch changing its mind mid-run. The cache is
+dropped whenever memory changes.
+"""
+
+_EXPORT_KEEP = 5
+"""Number of JSON export files kept on disk."""
+
+
+def _make_temporary_part(text: str) -> Any | None:
+    """Wrap the evidence block into a provider-only content part.
+
+    TextPart lives outside the public astrbot.api surface, so it is imported
+    lazily: if a future host moves it, the plugin must keep loading and simply
+    stop injecting instead of failing at import time.
+
+    Args:
+        text: Rendered evidence block.
+
+    Returns:
+        A temporary content part, or None when the host API is unavailable.
+    """
+    try:
+        from astrbot.core.agent.message import TextPart
+
+        return TextPart(text=text).mark_as_temp()
+    except Exception:
+        logger.warning(
+            "[JitRL] host TextPart is unavailable; skipping the evidence block"
+        )
+        return None
+
+
+@dataclass(slots=True)
+class _DecisionSnapshot:
+    """Everything on_llm_request needs for one (state, scope, tools) triple.
+
+    Attributes:
+        decision: Sampled policy decision.
+        estimate: Value estimate over the final candidate set.
+        probe: Value estimate over every retrieved action, used by the tool gate
+            and to shortlist candidates.
+        neighbors: Retrieved neighbourhood, kept for the hint renderer.
+        block: Rendered evidence block (empty when the evidence is too weak).
+        task: Redacted user request that produced the state.
+        state: Abstracted query state.
+    """
+
+    decision: PolicyDecision
+    estimate: ValueEstimate
+    probe: ValueEstimate
+    neighbors: list[Neighbor]
+    block: str
+    task: str
+    state: StateView
+
 
 class JitRLLearner(Star):
     """Continuous, gradient-free learning layer for the AstrBot agent.
@@ -107,6 +177,12 @@ class JitRLLearner(Star):
         self._rng = random.Random()
         self._last_episode: dict[str, tuple[str, float]] = {}
         self._last_decision: dict[str, tuple[float, PolicyDecision]] = {}
+        self._state_cache: OrderedDict[tuple[str, str, str], tuple[str, StateView]] = (
+            OrderedDict()
+        )
+        self._decision_cache: OrderedDict[tuple[Any, ...], _DecisionSnapshot] = (
+            OrderedDict()
+        )
         self._stats: dict[str, int] = {
             "requests": 0,
             "biased": 0,
@@ -144,6 +220,10 @@ class JitRLLearner(Star):
             )
             await bank.initialize()
             self._bank = bank
+            # Warm the retrieval index off the request path. Small banks are
+            # already indexed by initialize(); this covers the rest and is a
+            # no-op when the index is ready.
+            self._spawn(bank.warm_index())
             logger.info("[JitRL] memory bank ready at %s", self._db_path)
 
     async def terminate(self) -> None:
@@ -305,28 +385,31 @@ class JitRLLearner(Star):
     def _apply_tool_gate(
         self,
         request: ProviderRequest,
-        decision: PolicyDecision,
+        estimate: ValueEstimate,
     ) -> None:
         """Mask tools whose advantage is confidently negative.
 
         Setting a tool's probability to zero is the `-inf` limit of the logit
         update, so this is the plugin's only *hard* constraint on the action
         space. It is applied only when there is enough evidence and at least
-        one tool would remain.
+        one tool would remain. The gate reads the probe estimate, which covers
+        every retrieved action rather than only the shortlisted candidates, so a
+        tool with strong negative evidence cannot escape by losing the
+        shortlist ranking.
 
         Args:
             request: The outgoing provider request whose tool set is mutated.
-            decision: Policy decision carrying the advantage estimates.
+            estimate: Value estimate over every retrieved action.
         """
         tool_set = request.func_tool
         if tool_set is None:
             return
         names = set(tool_set.names())
         blocked: list[str] = []
-        for key, advantage in decision.estimate.advantage_norm.items():
+        for key, advantage in estimate.advantage_norm.items():
             if self._action_kind(key) != "tool":
                 continue
-            count = decision.estimate.action_counts.get(key, 0)
+            count = estimate.action_counts.get(key, 0)
             if count < self.cfg.policy.tool_gate_min_count:
                 continue
             if advantage > self.cfg.policy.tool_gate_threshold:
@@ -381,6 +464,160 @@ class JitRLLearner(Star):
         if not result.ok:
             logger.debug("[JitRL] reranker degraded: %s", result.error)
         return result.scores if result.ok else {}
+
+    # ------------------------------------------------------------------
+    # decision pipeline
+    # ------------------------------------------------------------------
+    def _state_for(
+        self, umo: str, user_text: str, surface: str
+    ) -> tuple[str, StateView]:
+        """Return the redacted task and its abstracted state, memoised.
+
+        A single user turn usually produces several LLM requests (one per agent
+        step) with the same message, so the redaction/regularisation/tokenisation
+        pipeline only has to run once per turn.
+
+        Args:
+            umo: Unified message origin, part of the cache key.
+            user_text: Raw user message.
+            surface: Coarse retrieval partition.
+
+        Returns:
+            A (task, state) pair: the redacted request and its retrieval state.
+        """
+        key = (umo, surface, user_text)
+        cached = self._state_cache.get(key)
+        if cached is not None:
+            self._state_cache.move_to_end(key)
+            return cached
+        task = redact(user_text)[:_TASK_CHAR_LIMIT]
+        state = abstract_state(task=task, surface=surface, limit=_STATE_CHAR_LIMIT)
+        self._state_cache[key] = (task, state)
+        if len(self._state_cache) > _STATE_CACHE_MAX:
+            self._state_cache.popitem(last=False)
+        return task, state
+
+    async def _decide(
+        self,
+        *,
+        umo: str,
+        task: str,
+        state: StateView,
+        tool_names: set[str],
+    ) -> _DecisionSnapshot | None:
+        """Run Algorithm 1 steps 1-6 for one query state.
+
+        Two passes over the neighbourhood make the candidate set better than the
+        single-pass version. The first pass estimates the advantage of *every*
+        retrieved action, the shortlist keeps the |C| actions whose evidence is
+        strongest (largest absolute advantage, then support), and the second
+        pass renormalises Eq. 25 over exactly that set -- so a tool with strongly
+        negative evidence is shortlisted and penalised instead of being dropped
+        before it could influence the decision, while the temperature beta keeps
+        operating on a properly normalised advantage range.
+
+        Args:
+            umo: Unified message origin acting as the memory scope.
+            task: Redacted user request.
+            state: Abstracted query state.
+            tool_names: Tools available to the current request.
+
+        Returns:
+            The decision snapshot, or None when there is no usable evidence.
+        """
+        cfg = self.cfg
+        neighbors = await self._bank.topk(
+            state,
+            scope=umo,
+            k=cfg.retrieval.k,
+            threshold=cfg.retrieval.similarity_threshold,
+            surface_gate=cfg.retrieval.surface_gate,
+            prefilter_limit=cfg.retrieval.prefilter_limit,
+            recency_half_life_days=cfg.retrieval.recency_half_life_days,
+            scope_mode=cfg.retrieval.scope_isolation,
+        )
+        if not neighbors:
+            return None
+        memory_actions = self._available_memory_actions(neighbors, tool_names)
+        if not memory_actions:
+            return None
+
+        estimate_kwargs = {
+            "k": cfg.retrieval.k,
+            "ucb_alpha": cfg.policy.ucb_alpha,
+            "exploration_rate": cfg.policy.exploration_rate,
+            "min_count": cfg.retrieval.min_count,
+            "rng": self._rng,
+            "weighting": cfg.retrieval.estimator_weighting,
+            "exploration_estimate": cfg.policy.exploration_estimate,
+        }
+        all_keys = list(memory_actions)
+        probe = estimate_values(
+            neighbors,
+            all_keys,
+            normalize=cfg.policy.normalize_advantage,
+            **estimate_kwargs,
+        )
+        limit = max(1, cfg.policy.candidate_limit)
+        shortlist = sorted(
+            all_keys,
+            key=lambda key: (
+                -abs(probe.advantage.get(key, 0.0)),
+                -probe.action_counts.get(key, 0),
+                key,
+            ),
+        )[:limit]
+        chosen_actions = {key: memory_actions[key] for key in shortlist}
+
+        llm_actions: tuple[tuple[str, str, float], ...] = ()
+        if cfg.apply_mode == "logit":
+            options = [(key, chosen_actions[key][0]) for key in shortlist]
+            scores = await self._rerank(
+                umo=umo, state=state, task=task, options=options
+            )
+            if scores:
+                llm_actions = tuple(
+                    (key, text, verbalized_to_logit(scores.get(key, 0.5)))
+                    for key, text in options
+                )
+
+        candidates = build_candidates(
+            llm_actions=llm_actions,
+            memory_actions=chosen_actions,
+            limit=limit,
+            memory_order=shortlist,
+        )
+        if not candidates:
+            return None
+        estimate = estimate_values(
+            neighbors,
+            [candidate.key for candidate in candidates],
+            normalize=cfg.policy.normalize_advantage,
+            **estimate_kwargs,
+        )
+        decision = select_action(
+            candidates,
+            estimate,
+            beta=cfg.policy.beta,
+            temperature=cfg.policy.sample_temperature,
+            normalize=cfg.policy.normalize_advantage,
+            mode=cfg.apply_mode,
+            rng=self._rng,
+        )
+        block = render_preference_block(
+            decision,
+            neighbors=neighbors,
+            max_chars=cfg.policy.max_hint_chars,
+        )
+        return _DecisionSnapshot(
+            decision=decision,
+            estimate=estimate,
+            probe=probe,
+            neighbors=neighbors,
+            block=block,
+            task=task,
+            state=state,
+        )
 
     # ------------------------------------------------------------------
     # user feedback
@@ -441,6 +678,7 @@ class JitRLLearner(Star):
             episode_id, delta, expected_generation=self._bank.generation
         )
         self._last_episode.pop(umo, None)
+        self._decision_cache.clear()
         logger.info(
             "[JitRL] user feedback applied: episode=%s delta=%+.1f rows=%d",
             episode_id,
@@ -499,86 +737,47 @@ class JitRLLearner(Star):
 
         try:
             surface = self._surface(event)
-            task = redact(user_text)[:_TASK_CHAR_LIMIT]
-            state = abstract_state(task=task, surface=surface, limit=_STATE_CHAR_LIMIT)
-            neighbors = await self._bank.topk(
-                state,
-                scope=umo,
-                k=self.cfg.retrieval.k,
-                threshold=self.cfg.retrieval.similarity_threshold,
-                surface_gate=self.cfg.retrieval.surface_gate,
-                prefilter_limit=self.cfg.retrieval.prefilter_limit,
-                recency_half_life_days=self.cfg.retrieval.recency_half_life_days,
-                scope_mode=self.cfg.retrieval.scope_isolation,
-            )
-            if not neighbors:
-                return
-
+            task, state = self._state_for(umo, user_text, surface)
             tool_names = set(req.func_tool.names()) if req.func_tool else set()
-            memory_actions = self._available_memory_actions(neighbors, tool_names)
-            if not memory_actions:
-                return
-
-            llm_actions: list[tuple[str, str, float]] = []
-            if self.cfg.apply_mode == "logit":
-                options = list(memory_actions.items())
-                scores = await self._rerank(
-                    umo=umo,
-                    state=state,
-                    task=task,
-                    options=[(key, text) for key, (text, _count) in options],
+            cache_key = (
+                umo,
+                generation,
+                self.cfg.apply_mode,
+                tuple(sorted(tool_names)),
+                state.signature,
+            )
+            snapshot = self._decision_cache.get(cache_key)
+            if snapshot is None:
+                snapshot = await self._decide(
+                    umo=umo, task=task, state=state, tool_names=tool_names
                 )
-                if scores:
-                    llm_actions = [
-                        (key, text, verbalized_to_logit(scores.get(key, 0.5)))
-                        for key, (text, _count) in options
-                    ]
+                if snapshot is None:
+                    return
+                self._decision_cache[cache_key] = snapshot
+                if len(self._decision_cache) > _DECISION_CACHE_MAX:
+                    self._decision_cache.popitem(last=False)
+            else:
+                # Same state, same memory epoch, same tool set: an agent loop
+                # reuses one policy decision instead of recomputing (and
+                # re-sampling) it on every step.
+                self._decision_cache.move_to_end(cache_key)
 
-            candidates = build_candidates(
-                llm_actions=tuple(llm_actions),
-                memory_actions=memory_actions,
-                limit=self.cfg.policy.candidate_limit,
-            )
-            if not candidates:
-                return
-            estimate = estimate_values(
-                neighbors,
-                [candidate.key for candidate in candidates],
-                k=self.cfg.retrieval.k,
-                ucb_alpha=self.cfg.policy.ucb_alpha,
-                exploration_rate=self.cfg.policy.exploration_rate,
-                normalize=self.cfg.policy.normalize_advantage,
-                min_count=self.cfg.retrieval.min_count,
-                rng=self._rng,
-            )
-            decision = select_action(
-                candidates,
-                estimate,
-                beta=self.cfg.policy.beta,
-                temperature=self.cfg.policy.sample_temperature,
-                normalize=self.cfg.policy.normalize_advantage,
-                mode=self.cfg.apply_mode,
-                rng=self._rng,
-            )
-            block = render_preference_block(
-                decision,
-                neighbors=neighbors,
-                max_chars=self.cfg.policy.max_hint_chars,
-            )
             if generation != self._bank.generation:
                 return
-            if block:
+            if snapshot.block:
                 # The block is appended to the *user* message as a temporary
-                # content part, never to `system_prompt`: the system prompt is
+                # content part, never to req.system_prompt: the system prompt is
                 # the cached context prefix, so rewriting it on every request
-                # would wipe out prompt-cache hits. `mark_as_temp` keeps the
-                # part out of persisted history - it is valid for this turn only.
-                part = TextPart(text=block).mark_as_temp()
-                req.extra_user_content_parts.append(part)
-                event.set_extra(_INJECTED_KEY, True)
+                # would wipe out prompt-cache hits. mark_as_temp keeps the part
+                # out of persisted history - it is valid for this turn only.
+                part = _make_temporary_part(snapshot.block)
+                if part is not None:
+                    req.extra_user_content_parts.append(part)
+                    event.set_extra(_INJECTED_KEY, True)
             if self.cfg.policy.tool_gate:
-                self._apply_tool_gate(req, decision)
+                self._apply_tool_gate(req, snapshot.probe)
 
+            decision = snapshot.decision
             self._last_decision[umo] = (time.time(), decision)
             if len(self._last_decision) > 512:
                 cutoff = time.time() - _LAST_EPISODE_TTL
@@ -590,10 +789,10 @@ class JitRLLearner(Star):
             event.set_extra(
                 _EVENT_EXTRA_KEY,
                 {
-                    "state": state,
+                    "state": snapshot.state,
                     "decision": decision,
                     "surface": surface,
-                    "user_text": task,
+                    "user_text": snapshot.task,
                 },
             )
             self._stats["requests"] += 1
@@ -603,8 +802,8 @@ class JitRLLearner(Star):
                 logger.info(
                     "[JitRL] %s | neighbours=%d v=%+.3f",
                     decision.reason,
-                    estimate.neighbor_count,
-                    estimate.v_hat,
+                    snapshot.estimate.neighbor_count,
+                    snapshot.estimate.v_hat,
                 )
         except Exception:
             self._stats["failures"] += 1
@@ -752,6 +951,9 @@ class JitRLLearner(Star):
             return
         self._stats["episodes"] += 1
         self._stats["experiences"] += written
+        # Fresh evidence invalidates every cached decision (the state cache is a
+        # pure function of the message, so it stays).
+        self._decision_cache.clear()
         self._last_episode[umo] = (episode.episode_id, time.time())
         if len(self._last_episode) > 512:
             cutoff = time.time() - _LAST_EPISODE_TTL
@@ -812,6 +1014,8 @@ class JitRLLearner(Star):
                 normalize=self.cfg.policy.normalize_advantage,
                 min_count=self.cfg.retrieval.min_count,
                 rng=self._rng,
+                weighting=self.cfg.retrieval.estimator_weighting,
+                exploration_estimate=self.cfg.policy.exploration_estimate,
             )
             return render_recall_report(state.text, estimate, neighbors=neighbors)
         except Exception:
@@ -1030,16 +1234,14 @@ class JitRLLearner(Star):
             return
         try:
             await self._ensure_ready()
-            import json
-
             payload = await self._bank.export_json()
-            target = self._db_path.parent / f"export-{int(time.time())}.json"
-            target.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+            target = await asyncio.to_thread(
+                self._write_export, payload, f"export-{int(time.time())}.json"
             )
+            logger.info("[JitRL] export written to %s", target)
             yield event.plain_result(
-                f"已导出 {len(payload.get('experiences', []))} 条经验到：\n{target}"
+                f"已导出 {len(payload.get('experiences', []))} 条经验到插件数据目录"
+                f"（文件名 {target.name}，保留最近 {_EXPORT_KEEP} 份）。"
             )
         except Exception:
             logger.warning("[JitRL] export command failed", exc_info=True)
@@ -1079,11 +1281,48 @@ class JitRLLearner(Star):
             yield event.plain_result("读取 episode 失败，请查看 AstrBot 日志。")
 
     # ------------------------------------------------------------------
+    # exports
+    # ------------------------------------------------------------------
+    def _write_export(self, payload: dict[str, Any], name: str) -> Path:
+        """Write one export file and enforce the retention window.
+
+        Args:
+            payload: Serialised memory bank.
+            name: File name inside the plugin data directory.
+
+        Returns:
+            The path of the written file.
+        """
+        import json
+
+        target = self._db_path.parent / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        temporary.replace(target)
+        exports = sorted(
+            self._db_path.parent.glob("export-*.json"),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in exports[_EXPORT_KEEP:]:
+            try:
+                stale.unlink()
+            except OSError:
+                logger.debug("[JitRL] cannot remove stale export %s", stale)
+        return target
+
+    # ------------------------------------------------------------------
     # checkpoints
     # ------------------------------------------------------------------
     def _invalidate_memory_cache(self) -> None:
         self._last_episode.clear()
         self._last_decision.clear()
+        # Decisions embed advantage estimates and the rendered block, so they
+        # must never outlive the memory they were computed from.
+        self._decision_cache.clear()
 
     def _checkpoint_denied(self, event: AstrMessageEvent) -> str | None:
         denied = self._command_denied(event)
@@ -1294,6 +1533,8 @@ class JitRLLearner(Star):
                         "ucb_alpha": self.cfg.policy.ucb_alpha,
                         "scope": self.cfg.retrieval.scope_isolation,
                         "evaluator": self.cfg.learning.evaluator_mode,
+                        "weighting": self.cfg.retrieval.estimator_weighting,
+                        "exploration": self.cfg.policy.exploration_estimate,
                     },
                     "last_decision": last,
                     "db_path": str(self._db_path),
@@ -1442,6 +1683,10 @@ class JitRLLearner(Star):
             payload = await request.json(default={})
             if not isinstance(payload, dict):
                 return error_response("请求体必须是 JSON 对象。")
+            if payload.get("confirm") is not True:
+                # Same rule as the checkpoint routes: a destructive call must
+                # carry an explicit confirmation, never rely on the UI alone.
+                return error_response("清空记忆需要 confirm: true。")
             scope = str(payload.get("scope", "all")).strip().lower()
             if scope == "all":
                 removed = await self._bank.clear()

@@ -90,6 +90,7 @@ def build_candidates(
     memory_actions: Mapping[str, tuple[str, int]] | None = None,
     llm_scores: Mapping[str, float] | None = None,
     limit: int = 3,
+    memory_order: Sequence[str] | None = None,
 ) -> list[Candidate]:
     """Merge the LLM proposal set with the memory-derived action set.
 
@@ -106,6 +107,9 @@ def build_candidates(
             verbalized_to_logit.
         limit: Maximum size of the candidate set C. Values below one are
             clamped to one so the set cannot be emptied by configuration.
+        memory_order: Optional priority order for memory-derived actions, e.g.
+            the ranking produced by a first-pass value estimate. Actions absent
+            from the list fall back to the support count.
 
     Returns:
         At most max(limit, 1) candidates. Without LLM proposals every memory-side
@@ -176,10 +180,16 @@ def build_candidates(
         reverse=True,
     )
     # Memory-only actions, best supported first; the key breaks count ties so
-    # the result is stable across runs and dictionary insertion orders.
+    # the result is stable across runs and dictionary insertion orders. A caller
+    # supplied priority order (the two-pass shortlist) takes precedence.
+    priority = {key: position for position, key in enumerate(memory_order or ())}
     memory_only = sorted(
         (candidate for candidate in merged.values() if candidate.source == "memory"),
-        key=lambda candidate: (-candidate.count, candidate.key),
+        key=lambda candidate: (
+            priority.get(candidate.key, len(priority)),
+            -candidate.count,
+            candidate.key,
+        ),
     )
 
     selected = llm_ranked[:capacity]

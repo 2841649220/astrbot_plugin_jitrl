@@ -10,10 +10,54 @@ Learning* (Li et al., ICML 2026):
 * Eq. 7  -- advantage A(s, a) = Q(s, a) - V(s)
 * Eq. 25 -- normalised advantage A / (max|A| + eps)
 
-Retrieval itself (Jaccard top-k, Eq. 24) lives in jitrl.memory; this module
-only consumes the resulting neighbourhood, so it stays pure and deterministic.
-Randomness is injected as a random.Random instance: a fixed seed reproduces the
-exact estimates, which keeps the optimism branch unit-testable.
+Retrieval itself (Jaccard top-k, Eq. 24) lives in jitrl.index / jitrl.memory;
+this module only consumes the resulting neighbourhood, so it stays pure and
+deterministic. Randomness is injected as a random.Random instance, which keeps
+the paper-exact exploration branch reproducible.
+
+Engineering deviations from the paper, all selectable or documented:
+
+1. Kernel weighting (weighting="kernel", the default). Eq. 4/5 average the
+   neighbourhood uniformly. Averaging with the retrieval weight
+   (similarity * recency) instead is a Nadaraya-Watson kernel smoother: it is
+   still consistent under the paper's kNN regime (Assumption C.3) but has lower
+   bias, because a neighbour at the similarity threshold is not trusted as much
+   as an exact match -- which matters a lot here, since chat states are noisier
+   than WebArena URLs. The important fix over the previous implementation is
+   that V and Q now always use the *same* weighting scheme; before, a group
+   whose weights summed to zero silently fell back to an unweighted mean while
+   V stayed weighted, so A = Q - V compared two different estimators.
+   weighting="uniform" restores the paper's exact arithmetic.
+
+2. Empirically-shrunk thin support. The paper's min_count knife-edge decision
+   (below it an action is treated as unseen and may receive a random optimism
+   bonus) is replaced by a conjugate-style shrinkage towards V(s):
+   Q = (n * Q_empirical + kappa * V) / (n + kappa) with kappa = min_count. With
+   the default min_count = 1 nothing changes; with min_count > 1 a single lucky
+   observation no longer flips the advantage between +1 and -1 from one request
+   to the next. Actions with *no* support still take the exploration branch.
+
+3. Expected exploration instead of a sampled one
+   (exploration_estimate="expected", the default). The paper draws, per
+   candidate and per step, between Q = V + alpha/|N| with probability lambda and
+   Q = 0 otherwise. Two problems follow. First, its neutral branch sets Q = 0,
+   so A = Q - V = -V: in a state with positive value an untried action is
+   punished harder than any observed action, and in a negative-value state it is
+   rewarded, which is the opposite of "prevent over-exploration". Second, a
+   plugin cannot sample the next action -- it only injects evidence into another
+   model's prompt -- so a sampled estimate is pure variance: the same state
+   yields +1 on one request and -1 on the next.
+   This implementation therefore keeps the optimistic branch, uses the neutral
+   baseline Q = V (so A = 0 rather than -V) and takes the expectation,
+   A_unseen = lambda * alpha / |N(s)|: monotone, bounded, and constant for a
+   fixed neighbourhood. exploration_estimate="sample" restores the paper's
+   sampling, including its Q = 0 branch, for ablation studies.
+
+4. Normalisation floor. Eq. 25 divides by max|A|, which amplifies pure noise
+   when every advantage is ~0 (identical stored returns). Below
+   normalize_floor the advantages are reported as zero instead, so the policy
+   update becomes a no-op rather than an arbitrary shake-up. The unnormalised
+   scale is exposed as ValueEstimate.max_abs_advantage for evidence gating.
 """
 
 from __future__ import annotations
@@ -25,6 +69,12 @@ from .models import Neighbor, ValueEstimate
 
 EPSILON: float = 1e-8
 """Denominator guard added to max|A| in Eq. 25."""
+
+DEFAULT_NORMALIZE_FLOOR: float = 1e-3
+"""Below this max|A| the normalised advantage is reported as zero."""
+
+_WEIGHTING_MODES: frozenset[str] = frozenset({"kernel", "uniform"})
+_EXPLORATION_MODES: frozenset[str] = frozenset({"expected", "sample"})
 
 
 def estimate_values(
@@ -38,12 +88,11 @@ def estimate_values(
     min_count: int = 1,
     rng: random.Random | None = None,
     epsilon: float = EPSILON,
+    weighting: str = "kernel",
+    exploration_estimate: str = "expected",
+    normalize_floor: float = DEFAULT_NORMALIZE_FLOOR,
 ) -> ValueEstimate:
     """Estimate V(s), Q(s, a), A(s, a) and A-tilde(s, a) for one state.
-
-    The paper's uniform averages 1/|N| are implemented as normalised similarity
-    weights: the Neighbor.similarity_weight field is used when positive and the
-    average degrades to an unweighted mean when no positive weight exists.
 
     Args:
         neighbors: Retrieved neighbourhood N(s), already top-k by Jaccard
@@ -54,15 +103,24 @@ def estimate_values(
             call-site symmetry with RetrievalConfig.k; neighbors is already
             truncated by the memory layer, so no row is dropped here.
         ucb_alpha: Optimism scale alpha of Eq. 6.
-        exploration_rate: Probability lambda of taking the optimism bonus.
+        exploration_rate: Probability lambda of taking the optimism bonus. In
+            the expected mode it is the mixing weight of the optimistic value.
         normalize: Apply Eq. 25 to fill advantage_norm.
-        min_count: Minimum number of supporting neighbours before an action
-            counts as known; below it the Eq. 6 branch is used. Values below one
-            are clamped to one, so an action without any neighbour is always
-            treated as unknown.
-        rng: Random source for the Eq. 6 draw; a fresh random.Random instance is
-            used when omitted.
+        min_count: Minimum number of supporting neighbours before an action is
+            trusted. Below it the estimate shrinks towards V(s); zero support
+            still takes the exploration branch. Values below one are clamped to
+            one.
+        rng: Random source for the sampled exploration branch; a fresh
+            random.Random instance is used when omitted. The expected branch is
+            deterministic and ignores it.
         epsilon: Denominator guard used by Eq. 25.
+        weighting: "kernel" weights neighbours by similarity_weight (the
+            default); "uniform" restores the paper's exact 1/|N| arithmetic.
+        exploration_estimate: "expected" computes the closed-form expectation of
+            the exploration branch; "sample" restores the paper's Bernoulli
+            draw, including its Q = 0 neutral branch.
+        normalize_floor: max|A| below which normalisation is skipped and every
+            normalised advantage is reported as zero.
 
     Returns:
         A ValueEstimate whose q_hat, advantage and advantage_norm dicts follow
@@ -70,8 +128,6 @@ def estimate_values(
         estimate is zero and no optimism bonus is granted, because
         alpha / |N(s)| would be undefined.
     """
-    # De-duplicate the candidate set while keeping the caller's order, so the
-    # returned dicts line up with the candidate list used downstream.
     unique_keys: list[str] = []
     seen_keys: set[str] = set()
     for key in candidate_keys:
@@ -80,74 +136,109 @@ def estimate_values(
             unique_keys.append(key)
 
     neighbor_count = len(neighbors)
-    mean_similarity = (
-        sum(neighbor.similarity for neighbor in neighbors) / neighbor_count
-        if neighbor_count
-        else 0.0
-    )
-
-    # Eq. 4: V(s) is a similarity-weighted mean of the stored returns G_i.
-    total_weight = 0.0
-    weighted_return = 0.0
-    for neighbor in neighbors:
-        weight = neighbor.similarity_weight if neighbor.similarity_weight > 0.0 else 0.0
-        total_weight += weight
-        weighted_return += weight * neighbor.discounted_return
-    if total_weight > 0.0:
-        v_hat = weighted_return / total_weight
-    elif neighbor_count:
-        # Every stored weight is non-positive: degrade to an unweighted mean.
-        v_hat = (
-            sum(neighbor.discounted_return for neighbor in neighbors) / neighbor_count
+    if neighbor_count:
+        mean_similarity = (
+            sum(neighbor.similarity for neighbor in neighbors) / neighbor_count
         )
+    else:
+        mean_similarity = 0.0
+
+    mode = weighting if weighting in _WEIGHTING_MODES else "kernel"
+    explore = (
+        exploration_estimate
+        if exploration_estimate in _EXPLORATION_MODES
+        else "expected"
+    )
+    min_support = max(min_count, 1)
+    index_count = max(neighbor_count, 1)
+    bonus = ucb_alpha / index_count
+
+    # One weight per neighbour, shared by V and every Q group so the two
+    # estimates always live on the same scale.
+    if mode == "uniform" or neighbor_count == 0:
+        weights = [1.0] * neighbor_count
+    else:
+        weights = [
+            neighbor.similarity_weight if neighbor.similarity_weight > 0.0 else 0.0
+            for neighbor in neighbors
+        ]
+        if sum(weights) <= 0.0:
+            # Every row reports a non-positive weight: degrade to the paper's
+            # uniform mean instead of dividing by zero.
+            weights = [1.0] * neighbor_count
+    total_weight = sum(weights)
+
+    if neighbor_count and total_weight > 0.0:
+        weighted_return = 0.0
+        for position, neighbor in enumerate(neighbors):
+            weighted_return += weights[position] * neighbor.discounted_return
+        v_hat = weighted_return / total_weight
     else:
         v_hat = 0.0
 
-    grouped = aggregate_by_action(neighbors)
-    rng = rng if rng is not None else random.Random()
-    min_support = max(min_count, 1)
+    # Aggregate the neighbourhood once: per action we need the support count,
+    # the kernel mass and the kernel-weighted return. Using the same weights as
+    # V(s) is what keeps A = Q - V a comparison of like with like.
+    support: dict[str, int] = {}
+    group_weight: dict[str, float] = {}
+    group_return: dict[str, float] = {}
+    plain_return: dict[str, float] = {}
+    for position, neighbor in enumerate(neighbors):
+        key = neighbor.action_key
+        weight = weights[position]
+        support[key] = support.get(key, 0) + 1
+        group_weight[key] = group_weight.get(key, 0.0) + weight
+        group_return[key] = group_return.get(key, 0.0) + weight * (
+            neighbor.discounted_return
+        )
+        plain_return[key] = plain_return.get(key, 0.0) + neighbor.discounted_return
 
+    generator = rng if rng is not None else random.Random()
     q_hat: dict[str, float] = {}
     explored: set[str] = set()
     for key in unique_keys:
-        group = grouped.get(key, [])
-        if len(group) >= min_support:
-            # Eq. 5: Q(s, a) averages only the neighbours that took action a.
-            group_weight = 0.0
-            group_return = 0.0
-            for neighbor in group:
-                weight = (
-                    neighbor.similarity_weight
-                    if neighbor.similarity_weight > 0.0
-                    else 0.0
-                )
-                group_weight += weight
-                group_return += weight * neighbor.discounted_return
-            if group_weight > 0.0:
-                q_hat[key] = group_return / group_weight
+        count = support.get(key, 0)
+        if count == 0:
+            rate = max(0.0, exploration_rate)
+            if neighbor_count == 0:
+                # Divergence guard: alpha / |N(s)| is undefined.
+                q_hat[key] = 0.0
+            elif explore == "sample":
+                if rate > 0.0 and generator.random() < rate:
+                    q_hat[key] = v_hat + bonus
+                    explored.add(key)
+                else:
+                    # Paper's lambda = 0 case: the neutral branch sets Q = 0.
+                    q_hat[key] = 0.0
             else:
-                q_hat[key] = sum(
-                    neighbor.discounted_return for neighbor in group
-                ) / len(group)
-        elif (
-            neighbor_count
-            and exploration_rate > 0.0
-            and rng.random() < exploration_rate
-        ):
-            # Eq. 6: optimism for an action the neighbourhood has never tried.
-            q_hat[key] = v_hat + ucb_alpha / neighbor_count
-            explored.add(key)
-        else:
-            q_hat[key] = 0.0
+                # Expected optimistic branch with the neutral baseline Q = V, so
+                # A = lambda * alpha / |N|: zero at lambda = 0, positive above.
+                q_hat[key] = v_hat + rate * bonus
+                if rate > 0.0 and ucb_alpha > 0.0:
+                    explored.add(key)
+            continue
 
-    # Eq. 7: A(s, a) = Q(s, a) - V(s).
+        mass = group_weight.get(key, 0.0)
+        if mass > 0.0:
+            q_empirical = group_return[key] / mass
+        else:
+            # A group whose rows all carry zero kernel weight (only reachable
+            # with similarity 0) still has real observations: fall back to the
+            # paper's plain mean for that group alone.
+            q_empirical = plain_return[key] / count
+        if count >= min_support:
+            q_hat[key] = q_empirical
+        else:
+            # Empirical-Bayes shrinkage: kappa pseudo-observations at V(s).
+            kappa = float(min_support)
+            q_hat[key] = (count * q_empirical + kappa * v_hat) / (count + kappa)
+
     advantage = {key: q_hat[key] - v_hat for key in unique_keys}
 
+    max_abs = max((abs(value) for value in advantage.values()), default=0.0)
     if normalize:
-        # Eq. 25: divide by max|A| so the update is scale-free. An all-tie
-        # candidate set must yield zeros instead of 0/0 = NaN.
-        max_abs = max((abs(value) for value in advantage.values()), default=0.0)
-        if max_abs > 0.0:
+        floor = normalize_floor if normalize_floor > 0.0 else 0.0
+        if max_abs > floor:
             advantage_norm = {
                 key: value / (max_abs + epsilon) for key, value in advantage.items()
             }
@@ -161,10 +252,11 @@ def estimate_values(
         q_hat=q_hat,
         advantage=advantage,
         advantage_norm=advantage_norm,
-        action_counts={key: len(grouped.get(key, ())) for key in unique_keys},
+        action_counts={key: support.get(key, 0) for key in unique_keys},
         explored=explored,
         neighbor_count=neighbor_count,
         mean_similarity=mean_similarity,
+        max_abs_advantage=max_abs,
     )
 
 

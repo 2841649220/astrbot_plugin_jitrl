@@ -199,6 +199,9 @@ class ValueEstimate:
         explored: Actions that received the optimism bonus.
         neighbor_count: Size of `N(s)`.
         mean_similarity: Average similarity of the retrieved neighbourhood.
+        max_abs_advantage: max|A| before normalisation, i.e. the scale Eq. 25
+            divides by. Exposed so downstream code can tell weak evidence
+            (a few 0.01-scale advantages) from strong evidence.
     """
 
     v_hat: float = 0.0
@@ -209,6 +212,7 @@ class ValueEstimate:
     explored: set[str] = field(default_factory=set)
     neighbor_count: int = 0
     mean_similarity: float = 0.0
+    max_abs_advantage: float = 0.0
 
     @property
     def best_action(self) -> str | None:

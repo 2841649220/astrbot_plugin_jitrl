@@ -163,9 +163,12 @@ class RetrievalConfig:
         similarity_threshold: Minimum Jaccard similarity `r`.
         surface_gate: Restrict retrieval to the same `surface`.
         scope_isolation: `session`, `global` or `hybrid`.
-        prefilter_limit: Upper bound on rows scored per query.
+        prefilter_limit: Work cap on the candidate rows scored per query.
         recency_half_life_days: Half-life of the recency weight; `0` disables.
-        min_count: Minimum supporting neighbours for an action to be scored.
+        min_count: Minimum supporting neighbours before an action is trusted;
+            thinner support is shrunk towards V(s).
+        estimator_weighting: `kernel` weights neighbours by similarity (the
+            plugin default); `uniform` restores the paper's equal-weight mean.
     """
 
     k: int = _DEFAULT_K
@@ -175,6 +178,7 @@ class RetrievalConfig:
     prefilter_limit: int = 4000
     recency_half_life_days: float = 30.0
     min_count: int = 1
+    estimator_weighting: str = "kernel"
 
 
 @dataclass(slots=True)
@@ -192,12 +196,16 @@ class PolicyConfig:
         tool_gate_min_count: Minimum samples before a tool may be masked.
         tool_gate_threshold: Advantage below which a tool is masked.
         max_hint_chars: Cap on injected prompt text.
+        exploration_estimate: `expected` turns the paper's sampled optimism
+            branch into its closed-form expectation (stable across requests);
+            `sample` restores the paper's Bernoulli draw.
     """
 
     beta: float = 1.5
     exploration_rate: float = _DEFAULT_EXPLORATION_RATE
     ucb_alpha: float = _DEFAULT_UCB_ALPHA
     normalize_advantage: bool = True
+    exploration_estimate: str = "expected"
     sample_temperature: float = 1.0
     candidate_limit: int = _DEFAULT_CANDIDATE_LIMIT
     tool_gate: bool = False
@@ -394,6 +402,11 @@ class JitRLConfig:
                     retrieval.get("recency_half_life_days"), 30.0, low=0.0, high=3650.0
                 ),
                 min_count=_as_int(retrieval.get("min_count"), 1, low=1, high=20),
+                estimator_weighting=_as_str(
+                    retrieval.get("estimator_weighting"),
+                    "kernel",
+                    allowed=("kernel", "uniform"),
+                ),
             ),
             policy=PolicyConfig(
                 beta=_as_float(policy.get("beta"), 1.5, low=0.0, high=20.0),
@@ -407,6 +420,11 @@ class JitRLConfig:
                     policy.get("ucb_alpha"), _DEFAULT_UCB_ALPHA, low=0.0, high=50.0
                 ),
                 normalize_advantage=_as_bool(policy.get("normalize_advantage"), True),
+                exploration_estimate=_as_str(
+                    policy.get("exploration_estimate"),
+                    "expected",
+                    allowed=("expected", "sample"),
+                ),
                 sample_temperature=_as_float(
                     policy.get("sample_temperature"), 1.0, low=0.05, high=5.0
                 ),

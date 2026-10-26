@@ -354,7 +354,9 @@ def jaccard(a: frozenset[str], b: frozenset[str]) -> float:
     intersection = len(a & b)
     if not intersection:
         return 0.0
-    union = len(a | b)
+    # |a u b| = |a| + |b| - |a n b|; building the union set would allocate a new
+    # set on every candidate row of the SQL fallback scan.
+    union = len(a) + len(b) - intersection
     if not union:
         return 0.0
     return max(0.0, min(1.0, intersection / union))

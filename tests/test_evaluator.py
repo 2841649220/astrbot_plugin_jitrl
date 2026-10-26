@@ -271,6 +271,28 @@ def test_build_prompt_truncates_long_observations() -> None:
     assert "..." in user_prompt
 
 
+def test_build_prompt_budget_shrinks_per_step_allowance() -> None:
+    """Long episodes share one prompt budget instead of 600 chars per step."""
+    steps = 40
+    actions = [f"tool({index})" for index in range(steps)]
+    observations = ["y" * 600 for _ in range(steps)]
+    outcomes = ["ok"] * steps
+    _, user_prompt = StepRewardEvaluator.build_prompt(
+        "task", actions, observations, outcomes
+    )
+    # 12000 // 40 = 300 characters of observation per step.
+    assert user_prompt.count("y" * 300 + " ...") == steps
+    assert "y" * 301 not in user_prompt
+    assert f"STEPS ({steps} total)" in user_prompt
+
+    # A short episode keeps the full 600-character allowance.
+    _, short_prompt = StepRewardEvaluator.build_prompt(
+        "task", ["tool(0)"], ["y" * 600], ["ok"]
+    )
+    assert "y" * 600 in short_prompt
+    assert "y" * 601 not in short_prompt
+
+
 # --------------------------------------------------------------------------- #
 # score(): mode routing and degradation
 # --------------------------------------------------------------------------- #

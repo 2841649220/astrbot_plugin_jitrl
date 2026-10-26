@@ -134,6 +134,7 @@ def test_unseen_action_gets_optimism_bonus_at_injected_rate() -> None:
             rng=rng,
             exploration_rate=0.3,
             ucb_alpha=5.0,
+            exploration_estimate="sample",
         )
         assert estimate.q_hat["known"] == pytest.approx(2.0)
         assert estimate.action_counts["novel"] == 0
@@ -175,12 +176,14 @@ def test_all_tied_advantages_normalize_to_zero_not_nan() -> None:
     assert not any(math.isnan(value) for value in estimate.advantage_norm.values())
 
 
-def test_min_count_turns_a_thin_action_into_an_unknown_action() -> None:
+def test_min_count_shrinks_a_thin_action_toward_the_state_value() -> None:
+    """Thin support is smoothed towards V(s) instead of being treated as unseen."""
     neighbors = [make_neighbor(1, "seen", 2.0)]
-    unknown = estimate_values(neighbors, ["seen"], min_count=2, exploration_rate=0.0)
-    assert unknown.action_counts["seen"] == 1
-    assert unknown.q_hat["seen"] == 0.0
-    assert unknown.explored == set()
+    shrunk = estimate_values(neighbors, ["seen"], min_count=2, exploration_rate=0.0)
+    assert shrunk.action_counts["seen"] == 1
+    # V = 2, Q = (1*2 + 2*V) / 3 = 2: a single row equal to the baseline stays put.
+    assert shrunk.q_hat["seen"] == pytest.approx(2.0)
+    assert shrunk.explored == set()
 
     known = estimate_values(neighbors, ["seen"], min_count=1, exploration_rate=0.0)
     assert known.q_hat["seen"] == pytest.approx(2.0)
@@ -204,7 +207,10 @@ def test_empty_candidate_set_keeps_state_statistics() -> None:
 
 def test_candidate_deduplication_preserves_first_seen_order() -> None:
     estimate = estimate_values(
-        weighted_sample(), ["b", "a", "b", "c"], exploration_rate=0.0
+        weighted_sample(),
+        ["b", "a", "b", "c"],
+        exploration_rate=0.0,
+        exploration_estimate="sample",
     )
     assert list(estimate.q_hat) == ["b", "a", "c"]
     assert list(estimate.advantage) == ["b", "a", "c"]

@@ -71,6 +71,19 @@ _EMPTY_OBSERVATION_VALUES = {"[]", "{}", "null", "none", "ok"}
 # Below this many characters an observation is treated as low information.
 _LOW_INFO_CHARS = 8
 
+_PROMPT_CHAR_BUDGET = 12000
+"""Total character budget for the evaluator's step list.
+
+A 40-step agent episode with 600 characters of observation per step would push
+a ~28k-character prompt (roughly 10k tokens) through the evaluator on every
+episode, which costs more than the learning is worth. The budget is shared
+evenly across steps; short episodes keep the full per-step allowance.
+"""
+
+_MIN_OBSERVATION_CHARS = 120
+_MAX_OBSERVATION_CHARS = 600
+_MAX_ACTION_CHARS = 200
+
 _SYSTEM_PROMPT = """You are a rigorous step-level reward evaluator for a \
 tool-using AI agent.
 
@@ -510,13 +523,20 @@ class StepRewardEvaluator:
             "",
             f"STEPS ({step_count} total):",
         ]
+        # Share the prompt budget across the steps actually being scored.
+        per_step = _MAX_OBSERVATION_CHARS
+        if step_count > 0:
+            per_step = min(
+                _MAX_OBSERVATION_CHARS,
+                max(_MIN_OBSERVATION_CHARS, _PROMPT_CHAR_BUDGET // step_count),
+            )
         for index in range(step_count):
-            action = " ".join(str(actions[index]).split())[:300]
+            action = " ".join(str(actions[index]).split())[:_MAX_ACTION_CHARS]
             observation = " ".join(str(observations[index]).split())
             if not observation:
                 observation = "(empty)"
-            elif len(observation) > 600:
-                observation = observation[:600] + " ..."
+            elif len(observation) > per_step:
+                observation = observation[:per_step] + " ..."
             outcome = str(outcomes[index]).strip() or "unknown"
             lines.extend(
                 [

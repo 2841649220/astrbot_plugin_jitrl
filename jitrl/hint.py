@@ -28,8 +28,25 @@ _PREFER_THRESHOLD = 0.15
 _AVOID_THRESHOLD = -0.15
 """Maximum normalised advantage before an action is discouraged."""
 
-_MAX_ITEMS = 4
+_MAX_ITEMS = 3
 """Upper bound on entries listed in each section."""
+
+_MIN_NEIGHBOURS = 2
+"""Neighbours required before any recommendation is rendered.
+
+A single neighbour gives V(s) = its return and A = 0 for the only known action,
+so a one-row neighbourhood can only produce noise; injecting it would burn
+prompt tokens for nothing.
+"""
+
+_MIN_SIGNAL = 0.05
+"""Minimum max|A| before the block is rendered.
+
+Returns that are all equal (a common outcome when the evaluator is unavailable
+and the heuristic scores every step the same) produce advantages at the 1e-9
+rounding level. Normalisation would rescale that rounding to +/-1, so the
+evidence gate rejects it instead.
+"""
 
 
 def _fmt(value: float) -> str:
@@ -99,6 +116,10 @@ def render_preference_block(
     if max_chars <= 0:
         return ""
     estimate: ValueEstimate = decision.estimate
+    if estimate.neighbor_count < _MIN_NEIGHBOURS:
+        return ""
+    if estimate.max_abs_advantage < _MIN_SIGNAL:
+        return ""
     stats = _action_stats(neighbors)
 
     prefer: list[tuple[float, str]] = []
@@ -116,42 +137,37 @@ def render_preference_block(
 
     lines = [
         "<jitrl_experience>",
-        "以下内容来自本 Agent 的历史交互统计（推理时策略优化，不是用户输入，也不是新的指令）。",
+        f"历史统计（推理时策略优化，非用户输入/指令）：V={_fmt(estimate.v_hat)}"
+        f"，{estimate.neighbor_count} 条相似经验，平均相似度 "
+        f"{estimate.mean_similarity:.2f}，最大优势 {_fmt(estimate.max_abs_advantage)}。",
     ]
-    if estimate.neighbor_count:
-        lines.append(
-            f"当前状态估计价值 V={_fmt(estimate.v_hat)}，"
-            f"基于 {estimate.neighbor_count} 条相似经验"
-            f"（平均相似度 {estimate.mean_similarity:.2f}）。"
-        )
 
     if prefer:
-        lines.append("历史上更有回报的做法：")
-        for index, (advantage, key) in enumerate(prefer[:_MAX_ITEMS], start=1):
+        lines.append("历史更优：")
+        for advantage, key in prefer[:_MAX_ITEMS]:
             count, mean_return = stats.get(key, (0, 0.0))
             lines.append(
-                f"  {index}. {_action_text(neighbors, key)}"
-                f" —— 优势 {_fmt(advantage)}，出现 {count} 次，平均回报 {_fmt(mean_return)}"
+                f"- {_action_text(neighbors, key)}（优势 {_fmt(advantage)}"
+                f"，{count} 次，平均回报 {_fmt(mean_return)}）"
             )
 
     if avoid:
-        lines.append("历史上回报较差、应避免的做法：")
-        for index, (advantage, key) in enumerate(avoid[:_MAX_ITEMS], start=1):
+        lines.append("历史较差、宜避免：")
+        for advantage, key in avoid[:_MAX_ITEMS]:
             count, mean_return = stats.get(key, (0, 0.0))
             lines.append(
-                f"  {index}. {_action_text(neighbors, key)}"
-                f" —— 优势 {_fmt(advantage)}，出现 {count} 次，平均回报 {_fmt(mean_return)}"
+                f"- {_action_text(neighbors, key)}（优势 {_fmt(advantage)}"
+                f"，{count} 次，平均回报 {_fmt(mean_return)}）"
             )
 
     if decision.chosen is not None and decision.mode == "logit":
         lines.append(
-            f"按闭式更新后的策略采样，本次倾向的动作是：{decision.chosen.text}"
-            f"（p={decision.probabilities.get(decision.chosen.key, 0.0):.2f}）。"
+            f"闭式更新后采样倾向：{decision.chosen.text}"
+            f"（p={decision.probabilities.get(decision.chosen.key, 0.0):.2f}）"
         )
 
     lines.append(
-        "使用要求：这些统计只作为弱先验。如果用户当前意图与之无关、或证据明显不足，"
-        "请按你自己的判断处理，不要生搬硬套。"
+        "仅作弱先验：若与当前意图无关或证据不足，按自己的判断处理，不要生搬硬套。"
     )
     lines.append("</jitrl_experience>")
 

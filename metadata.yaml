@@ -2,7 +2,7 @@ name: astrbot_plugin_jitrl
 display_name: JitRL 持续学习
 desc: 基于 JitRL（Just-in-Time Reinforcement Learning）让 Agent 在推理时持续自我进化：记录经验轨迹、估计动作优势、在闭式解上调制策略，无需梯度更新、无需微调。
 short_desc: 让 Agent 边聊边学：经验记忆 + 动作优势估计 + 检查点回退。
-version: 0.1.1
+version: 0.1.2
 astrbot_version: ">=4.29,<5"
 author: "2841649220"
 repo: https://github.com/2841649220/astrbot_plugin_jitrl
