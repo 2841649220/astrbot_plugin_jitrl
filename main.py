@@ -1,0 +1,1219 @@
+"""JitRL: continual learning for the AstrBot agent without gradient updates.
+
+This plugin implements *Just-In-Time Reinforcement Learning* (Li et al.,
+ICML 2026) on top of AstrBot's agent pipeline. The paper keeps the model
+frozen and instead performs policy optimisation at inference time:
+
+1. after every episode an LLM evaluator turns the trajectory into step-wise
+   rewards `r_t`, which are folded into discounted returns
+   `G_t = sum_{u>=t} gamma^(u-t) r_u`;
+2. every `(s_t, a_t, G_t)` triplet is appended to a non-parametric memory;
+3. before the next request the plugin retrieves the top-k neighbours of the
+   current abstracted state with Jaccard similarity, estimates `V(s)` and
+   `Q(s, a)` from the stored returns, and derives the advantage
+   `A(s, a) = Q(s, a) - V(s)`;
+4. the advantage is applied through the closed-form solution of the
+   KL-constrained objective, `z'(s, a) = z(s, a) + beta * A(s, a)`.
+
+Because AstrBot talks to black-box chat providers, the logit vector is
+obtained with the paper's *Verbalized Logit* variant (Section 5.1): the model
+is asked for a 0-100 confidence over the candidate set, that confidence is
+turned into `z(s, a)`, and the updated distribution is re-sampled. The
+plugin never trains weights and never needs a GPU.
+
+Hook wiring:
+
+* `on_llm_request`  -> retrieve, estimate, decide, and bias the request;
+* `on_agent_done`   -> evaluate the finished trajectory and store it;
+* `/jitrl ...`      -> inspect, prune and steer the learned memory;
+* `jitrl_recall`    -> let the agent query its own memory mid-run.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import random
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.provider import ProviderRequest
+from astrbot.api.star import Context, Star
+from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+
+from .jitrl.config import JitRLConfig
+from .jitrl.estimator import estimate_values
+from .jitrl.evaluator import StepRewardEvaluator
+from .jitrl.hint import render_preference_block, render_recall_report
+from .jitrl.memory import MemoryBank
+from .jitrl.models import Neighbor, PolicyDecision, StateView
+from .jitrl.policy import build_candidates, select_action, verbalized_to_logit
+from .jitrl.reranker import VerbalizedReranker
+from .jitrl.state import abstract_state, redact
+from .jitrl.trajectory import build_episode, extract_transitions, infer_success
+
+_PLUGIN_DATA_DIR = "astrbot_plugin_jitrl"
+"""Subdirectory of AstrBot's plugin data root owned by this plugin."""
+
+_EVENT_EXTRA_KEY = "_jitrl_context"
+"""Key under which the decision context travels from request to agent done."""
+
+_INJECTED_KEY = "_jitrl_injected"
+"""Guards against injecting the evidence block twice for one event."""
+
+_STATE_CHAR_LIMIT = 800
+"""Character budget of the abstracted state used for retrieval."""
+
+_TASK_CHAR_LIMIT = 600
+"""Character budget of the redacted user request kept in memory."""
+
+_LAST_EPISODE_TTL = 1800.0
+"""Seconds before a cached `(episode_id, timestamp)` pair is dropped."""
+
+_FEEDBACK_DELTA = 2.0
+"""Reward delta applied when the user confirms or rejects the last reply."""
+
+
+class JitRLLearner(Star):
+    """Continuous, gradient-free learning layer for the AstrBot agent.
+
+    The class owns the memory bank, the evaluator and the reranker, and wires
+    them into AstrBot's event hooks. Every hook is defensive: a failure inside
+    the learning layer must never break a conversation, so all entry points
+    swallow and log their own exceptions.
+    """
+
+    def __init__(self, context: Context, config: dict | None = None) -> None:
+        """Initialise the plugin.
+
+        Args:
+            context: AstrBot plugin context.
+            config: Raw plugin configuration produced from `_conf_schema.json`.
+        """
+        super().__init__(context)
+        self.cfg = JitRLConfig.from_raw(config)
+        data_root = Path(get_astrbot_plugin_data_path()) / _PLUGIN_DATA_DIR
+        self._db_path = data_root / "memory.sqlite3"
+        self._bank: MemoryBank | None = None
+        self._ready_lock = asyncio.Lock()
+        self._background: set[asyncio.Task] = set()
+        self._rng = random.Random()
+        self._last_episode: dict[str, tuple[str, float]] = {}
+        self._last_decision: dict[str, tuple[float, PolicyDecision]] = {}
+        self._stats: dict[str, int] = {
+            "requests": 0,
+            "biased": 0,
+            "episodes": 0,
+            "experiences": 0,
+            "failures": 0,
+        }
+        self._register_web_apis()
+
+    # ------------------------------------------------------------------
+    # lifecycle
+    # ------------------------------------------------------------------
+    async def _ensure_ready(self) -> None:
+        """Open the memory bank on first use.
+
+        Raises:
+            Exception: Whatever `MemoryBank.initialize` raises, so the caller
+                can record the failure in its own try/except block.
+        """
+        if self._bank is not None:
+            return
+        async with self._ready_lock:
+            if self._bank is not None:
+                return
+            self._db_path.parent.mkdir(parents=True, exist_ok=True)
+            bank = MemoryBank(
+                self._db_path,
+                max_entries=self.cfg.memory.max_entries,
+                redact=self.cfg.memory.redact_secrets,
+                keep_episodes=self.cfg.memory.keep_episodes,
+                prune_strategy=self.cfg.memory.prune_strategy,
+            )
+            await bank.initialize()
+            self._bank = bank
+            logger.info("[JitRL] memory bank ready at %s", self._db_path)
+
+    async def terminate(self) -> None:
+        """Release background work and close the database on unload."""
+        for task in list(self._background):
+            task.cancel()
+        if self._background:
+            await asyncio.gather(*self._background, return_exceptions=True)
+        self._background.clear()
+        if self._bank is not None:
+            await self._bank.close()
+            self._bank = None
+        logger.info("[JitRL] plugin terminated")
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+    def _spawn(self, coroutine: Any) -> None:
+        """Run a coroutine in the background, logging failures.
+
+        Args:
+            coroutine: The coroutine to schedule.
+        """
+
+        async def _runner() -> None:
+            try:
+                await coroutine
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self._stats["failures"] += 1
+                logger.warning("[JitRL] background learning failed", exc_info=True)
+
+        task = asyncio.create_task(_runner())
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    async def _llm_text(
+        self,
+        *,
+        prompt: str,
+        system_prompt: str | None = None,
+        provider_id: str = "",
+        umo: str | None = None,
+    ) -> str:
+        """Run one auxiliary chat completion.
+
+        Args:
+            prompt: User prompt for the auxiliary call.
+            system_prompt: Optional system prompt.
+            provider_id: Explicit provider to use; falls back to the session
+                provider when empty or unresolvable.
+            umo: Unified message origin used to resolve the session provider.
+
+        Returns:
+            The completion text, stripped of surrounding whitespace.
+
+        Raises:
+            RuntimeError: When no chat provider could be resolved.
+        """
+        provider = None
+        if provider_id:
+            try:
+                provider = await self.context.provider_manager.get_provider_by_id(
+                    provider_id
+                )
+            except Exception:
+                logger.warning(
+                    "[JitRL] evaluator provider %s unavailable, falling back",
+                    provider_id,
+                    exc_info=True,
+                )
+        if provider is None:
+            provider = await self.context.get_using_provider_async(umo)
+        if provider is None:
+            raise RuntimeError("no chat provider is available for JitRL")
+
+        response = await provider.text_chat(
+            prompt=prompt,
+            system_prompt=system_prompt or "",
+        )
+        return (response.completion_text or "").strip()
+
+    def _surface(self, event: AstrMessageEvent) -> str:
+        """Return the coarse retrieval partition for an event.
+
+        Args:
+            event: The message event being processed.
+
+        Returns:
+            The platform name when the first-stage gate is enabled, otherwise
+            an empty string so retrieval stays fully cross-platform.
+        """
+        if not self.cfg.retrieval.surface_gate:
+            return ""
+        try:
+            return event.get_platform_name() or ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _action_kind(action_key: str) -> str:
+        """Extract the kind prefix of an action key.
+
+        Args:
+            action_key: Normalised action identity such as
+                `"tool:web_search(query=<str>)"`.
+
+        Returns:
+            The kind prefix, e.g. `"tool"`; empty when malformed.
+        """
+        return action_key.split(":", 1)[0] if ":" in action_key else ""
+
+    @staticmethod
+    def _action_name(action_key: str) -> str:
+        """Extract the bare tool name of an action key.
+
+        Args:
+            action_key: Normalised action identity.
+
+        Returns:
+            The tool name between the kind prefix and the first parenthesis.
+        """
+        body = action_key.split(":", 1)[1] if ":" in action_key else action_key
+        return body.split("(", 1)[0]
+
+    def _available_memory_actions(
+        self,
+        neighbors: list[Neighbor],
+        tool_names: set[str],
+    ) -> dict[str, tuple[str, int]]:
+        """Group neighbours into available candidate actions.
+
+        Actions learned in the past are only offered again when their tool is
+        still enabled for this request; otherwise the plugin would recommend
+        tools the deployment no longer exposes.
+
+        Args:
+            neighbors: Retrieved neighbours.
+            tool_names: Names of the tools available to the current request.
+
+        Returns:
+            A mapping `action_key -> (action_text, support_count)`.
+        """
+        grouped: dict[str, tuple[str, int]] = {}
+        for neighbor in neighbors:
+            key = neighbor.action_key
+            if not key:
+                continue
+            if (
+                self._action_kind(key) == "tool"
+                and self._action_name(key) not in tool_names
+            ):
+                continue
+            text, count = grouped.get(key, (neighbor.action_text or key, 0))
+            grouped[key] = (text, count + 1)
+        return grouped
+
+    def _apply_tool_gate(
+        self,
+        request: ProviderRequest,
+        decision: PolicyDecision,
+    ) -> None:
+        """Mask tools whose advantage is confidently negative.
+
+        Setting a tool's probability to zero is the `-inf` limit of the logit
+        update, so this is the plugin's only *hard* constraint on the action
+        space. It is applied only when there is enough evidence and at least
+        one tool would remain.
+
+        Args:
+            request: The outgoing provider request whose tool set is mutated.
+            decision: Policy decision carrying the advantage estimates.
+        """
+        tool_set = request.func_tool
+        if tool_set is None:
+            return
+        names = set(tool_set.names())
+        blocked: list[str] = []
+        for key, advantage in decision.estimate.advantage_norm.items():
+            if self._action_kind(key) != "tool":
+                continue
+            count = decision.estimate.action_counts.get(key, 0)
+            if count < self.cfg.policy.tool_gate_min_count:
+                continue
+            if advantage > self.cfg.policy.tool_gate_threshold:
+                continue
+            name = self._action_name(key)
+            if name in names:
+                blocked.append(name)
+        if not blocked or len(blocked) >= len(names):
+            return
+        for name in blocked:
+            tool_set.remove_tool(name)
+        logger.debug("[JitRL] tool gate masked %s", blocked)
+
+    async def _rerank(
+        self,
+        *,
+        umo: str,
+        state: StateView,
+        task: str,
+        options: list[tuple[str, str]],
+    ) -> dict[str, float]:
+        """Ask the model for a verbalised distribution over candidates.
+
+        Args:
+            umo: Unified message origin used to resolve the provider.
+            state: Abstracted state used for retrieval.
+            task: Redacted user request.
+            options: `(action_key, action_text)` pairs to score.
+
+        Returns:
+            A mapping `action_key -> confidence` in `[0, 1]`; empty when the
+            reranker failed, which degrades the update to a zero prior.
+        """
+        if not options or self.cfg.apply_mode != "logit":
+            return {}
+
+        async def _generate(*, prompt: str, system_prompt: str | None = None) -> str:
+            return await self._llm_text(
+                prompt=prompt, system_prompt=system_prompt, umo=umo
+            )
+
+        reranker = VerbalizedReranker(
+            _generate,
+            timeout=max(5.0, self.cfg.learning.evaluator_timeout),
+            max_candidates=max(2, self.cfg.policy.candidate_limit + 1),
+            logger=self.logger,
+        )
+        result = await reranker.score(
+            task=task,
+            state_text=state.text,
+            candidates=options,
+        )
+        if not result.ok:
+            logger.debug("[JitRL] reranker degraded: %s", result.error)
+        return result.scores if result.ok else {}
+
+    # ------------------------------------------------------------------
+    # user feedback
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalise_feedback(text: str) -> str:
+        """Strip punctuation and whitespace from a feedback reply.
+
+        Args:
+            text: Raw user message.
+
+        Returns:
+            A lowercase, punctuation-free form used for keyword matching.
+        """
+        cleaned = "".join(
+            char
+            for char in text.strip().lower()
+            if char.isalnum() or "\u4e00" <= char <= "\u9fff"
+        )
+        return cleaned
+
+    async def _maybe_apply_feedback(self, umo: str, user_text: str) -> None:
+        """Fold an explicit user verdict into the previous episode.
+
+        Args:
+            umo: Unified message origin of the current request.
+            user_text: Raw text of the current user message.
+        """
+        cfg = self.cfg.feedback
+        if not cfg.enabled or not user_text or len(user_text) > 16:
+            return
+        cached = self._last_episode.get(umo)
+        if not cached:
+            return
+        episode_id, created_at = cached
+        if time.time() - created_at > cfg.window_seconds:
+            self._last_episode.pop(umo, None)
+            return
+        normalised = self._normalise_feedback(user_text)
+        if not normalised:
+            return
+        delta = 0.0
+        if any(
+            normalised == word or normalised.startswith(word)
+            for word in cfg.negative_keywords
+        ):
+            delta = -_FEEDBACK_DELTA
+        elif any(
+            normalised == word or normalised.startswith(word)
+            for word in cfg.positive_keywords
+        ):
+            delta = _FEEDBACK_DELTA
+        if delta == 0.0:
+            return
+        if self._bank is None:
+            return
+        updated = await self._bank.apply_user_feedback(episode_id, delta)
+        self._last_episode.pop(umo, None)
+        logger.info(
+            "[JitRL] user feedback applied: episode=%s delta=%+.1f rows=%d",
+            episode_id,
+            delta,
+            updated,
+        )
+
+    # ------------------------------------------------------------------
+    # hooks
+    # ------------------------------------------------------------------
+    @filter.on_llm_request()
+    async def on_llm_request(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+    ) -> None:
+        """Retrieve relevant experience and bias the outgoing request.
+
+        This is Algorithm 1 steps 1-6 executed for the current state. The
+        resulting text block is advisory: the KL term of Eq. 8 keeps the
+        update close to the frozen reference policy, so the model is told to
+        ignore the block when the evidence does not match the request.
+
+        Args:
+            event: The message event that triggered the request.
+            req: The outgoing provider request, mutated in place.
+        """
+        if not self.cfg.enabled:
+            return
+        if event.get_extra(_INJECTED_KEY):
+            return
+        try:
+            await self._ensure_ready()
+        except Exception:
+            self._stats["failures"] += 1
+            logger.warning("[JitRL] memory bank unavailable", exc_info=True)
+            return
+
+        umo = event.unified_msg_origin
+        user_text = (event.get_message_str() or req.prompt or "").strip()
+
+        try:
+            await self._maybe_apply_feedback(umo, user_text)
+        except Exception:
+            logger.warning("[JitRL] feedback application failed", exc_info=True)
+
+        if self.cfg.apply_mode == "off" or not user_text:
+            return
+
+        try:
+            surface = self._surface(event)
+            task = redact(user_text)[:_TASK_CHAR_LIMIT]
+            state = abstract_state(task=task, surface=surface, limit=_STATE_CHAR_LIMIT)
+            neighbors = await self._bank.topk(
+                state,
+                scope=umo,
+                k=self.cfg.retrieval.k,
+                threshold=self.cfg.retrieval.similarity_threshold,
+                surface_gate=self.cfg.retrieval.surface_gate,
+                prefilter_limit=self.cfg.retrieval.prefilter_limit,
+                recency_half_life_days=self.cfg.retrieval.recency_half_life_days,
+                scope_mode=self.cfg.retrieval.scope_isolation,
+            )
+            if not neighbors:
+                return
+
+            tool_names = set(req.func_tool.names()) if req.func_tool else set()
+            memory_actions = self._available_memory_actions(neighbors, tool_names)
+            if not memory_actions:
+                return
+
+            llm_actions: list[tuple[str, str, float]] = []
+            if self.cfg.apply_mode == "logit":
+                options = list(memory_actions.items())
+                scores = await self._rerank(
+                    umo=umo,
+                    state=state,
+                    task=task,
+                    options=[(key, text) for key, (text, _count) in options],
+                )
+                if scores:
+                    llm_actions = [
+                        (key, text, verbalized_to_logit(scores.get(key, 0.5)))
+                        for key, (text, _count) in options
+                    ]
+
+            candidates = build_candidates(
+                llm_actions=tuple(llm_actions),
+                memory_actions=memory_actions,
+                limit=self.cfg.policy.candidate_limit,
+            )
+            if not candidates:
+                return
+            estimate = estimate_values(
+                neighbors,
+                [candidate.key for candidate in candidates],
+                k=self.cfg.retrieval.k,
+                ucb_alpha=self.cfg.policy.ucb_alpha,
+                exploration_rate=self.cfg.policy.exploration_rate,
+                normalize=self.cfg.policy.normalize_advantage,
+                min_count=self.cfg.retrieval.min_count,
+                rng=self._rng,
+            )
+            decision = select_action(
+                candidates,
+                estimate,
+                beta=self.cfg.policy.beta,
+                temperature=self.cfg.policy.sample_temperature,
+                normalize=self.cfg.policy.normalize_advantage,
+                mode=self.cfg.apply_mode,
+                rng=self._rng,
+            )
+            block = render_preference_block(
+                decision,
+                neighbors=neighbors,
+                max_chars=self.cfg.policy.max_hint_chars,
+            )
+            if block:
+                req.system_prompt = (
+                    f"{req.system_prompt}\n\n{block}" if req.system_prompt else block
+                )
+                event.set_extra(_INJECTED_KEY, True)
+            if self.cfg.policy.tool_gate:
+                self._apply_tool_gate(req, decision)
+
+            self._last_decision[umo] = (time.time(), decision)
+            if len(self._last_decision) > 512:
+                cutoff = time.time() - _LAST_EPISODE_TTL
+                self._last_decision = {
+                    key: value
+                    for key, value in self._last_decision.items()
+                    if value[0] >= cutoff
+                }
+            event.set_extra(
+                _EVENT_EXTRA_KEY,
+                {
+                    "state": state,
+                    "decision": decision,
+                    "surface": surface,
+                    "user_text": task,
+                },
+            )
+            self._stats["requests"] += 1
+            if decision.applied:
+                self._stats["biased"] += 1
+            if self.cfg.debug.log_decisions:
+                logger.info(
+                    "[JitRL] %s | neighbours=%d v=%+.3f",
+                    decision.reason,
+                    estimate.neighbor_count,
+                    estimate.v_hat,
+                )
+        except Exception:
+            self._stats["failures"] += 1
+            logger.warning("[JitRL] policy update skipped", exc_info=True)
+
+    @filter.on_agent_done()
+    async def on_agent_done(
+        self,
+        event: AstrMessageEvent,
+        run_context: Any,
+        response: Any,
+    ) -> None:
+        """Evaluate the finished trajectory and append it to memory.
+
+        This is Algorithm 1 step 7. Evaluation is dispatched to a background
+        task by default so the user never waits for the learning loop.
+
+        Args:
+            event: The message event that started the run.
+            run_context: Agent run context holding the message history.
+            response: Final LLM response of the run.
+        """
+        if not self.cfg.enabled or not self.cfg.learning.enabled:
+            return
+        try:
+            await self._ensure_ready()
+        except Exception:
+            self._stats["failures"] += 1
+            logger.warning("[JitRL] memory bank unavailable", exc_info=True)
+            return
+
+        try:
+            context = event.get_extra(_EVENT_EXTRA_KEY) or {}
+            umo = event.unified_msg_origin
+            user_text = context.get("user_text") or (event.get_message_str() or "")
+            surface = context.get("surface") or self._surface(event)
+            messages = getattr(run_context, "messages", None) or []
+            transitions = extract_transitions(
+                messages=messages,
+                user_text=user_text,
+                surface=surface,
+            )
+            if len(transitions) < max(1, self.cfg.learning.min_steps):
+                return
+            reply_text = (getattr(response, "completion_text", "") or "").strip()
+            payload = {
+                "umo": umo,
+                "user_text": user_text,
+                "surface": surface,
+                "transitions": transitions,
+                "reply_text": reply_text,
+            }
+            if self.cfg.learning.async_learn:
+                self._spawn(self._learn(**payload))
+            else:
+                await self._learn(**payload)
+        except Exception:
+            self._stats["failures"] += 1
+            logger.warning("[JitRL] episode capture skipped", exc_info=True)
+
+    async def _learn(
+        self,
+        *,
+        umo: str,
+        user_text: str,
+        surface: str,
+        transitions: list[Any],
+        reply_text: str,
+    ) -> None:
+        """Score a trajectory, build an episode and persist it.
+
+        Args:
+            umo: Unified message origin acting as the memory scope.
+            user_text: Redacted user request.
+            surface: Coarse retrieval partition.
+            transitions: Extracted `(state, action, observation)` sequence.
+            reply_text: Final assistant reply, used for success detection.
+        """
+        if self._bank is None:
+            return
+        actions = [transition.action.text for transition in transitions]
+        observations = [transition.observation for transition in transitions]
+        outcomes = [transition.outcome for transition in transitions]
+
+        success: bool | None = None
+        if self.cfg.learning.success_detection != "off":
+            success = infer_success(
+                transitions=transitions,
+                final_text=reply_text,
+                user_text=user_text,
+            )
+
+        async def _generate(*, prompt: str, system_prompt: str | None = None) -> str:
+            return await self._llm_text(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                provider_id=self.cfg.learning.evaluator_provider_id,
+                umo=umo,
+            )
+
+        evaluator = StepRewardEvaluator(
+            _generate if self.cfg.learning.evaluator_mode in {"auto", "llm"} else None,
+            mode=self.cfg.learning.evaluator_mode,
+            timeout=self.cfg.learning.evaluator_timeout,
+            max_reward=3.0,
+            heuristic_weight=self.cfg.learning.heuristic_weight,
+            logger=self.logger,
+        )
+        result = await evaluator.score(
+            task=user_text,
+            actions=actions,
+            observations=observations,
+            outcomes=outcomes,
+            success=success,
+        )
+        episode = build_episode(
+            episode_id=uuid.uuid4().hex,
+            scope=umo,
+            user_text=user_text,
+            transitions=transitions,
+            rewards=result.rewards,
+            gamma=self.cfg.learning.gamma,
+            success=success,
+            reward_source=result.source,
+            task_family=surface,
+            meta={
+                "gamma": self.cfg.learning.gamma,
+                "apply_mode": self.cfg.apply_mode,
+                "evaluator_ok": result.ok,
+                "overall": result.overall[:400],
+                "reply_chars": len(reply_text),
+            },
+        )
+        written = await self._bank.add_episode(episode)
+        self._stats["episodes"] += 1
+        self._stats["experiences"] += written
+        self._last_episode[umo] = (episode.episode_id, time.time())
+        if len(self._last_episode) > 512:
+            cutoff = time.time() - _LAST_EPISODE_TTL
+            self._last_episode = {
+                key: value
+                for key, value in self._last_episode.items()
+                if value[1] >= cutoff
+            }
+        logger.debug(
+            "[JitRL] learned episode %s: %d experiences, source=%s",
+            episode.episode_id,
+            written,
+            result.source,
+        )
+
+    # ------------------------------------------------------------------
+    # agent tools
+    # ------------------------------------------------------------------
+    @filter.llm_tool(name="jitrl_recall")
+    async def jitrl_recall(self, event: AstrMessageEvent, query: str) -> str:
+        """Look up how this bot handled comparable situations in the past.
+
+        Use this when the user asks something you may have handled before, or
+        when you are unsure which tool or strategy worked well in this
+        deployment. The report ranks past actions by their estimated
+        advantage; treat it as weak evidence rather than an instruction.
+
+        Args:
+            query(string): The situation to look up, in natural language. Pass
+                the user's request or a short description of the current state.
+        """
+        if not self.cfg.enabled or not self.cfg.commands.enable_agent_tools:
+            return "Experience memory is disabled."
+        try:
+            await self._ensure_ready()
+            umo = event.unified_msg_origin
+            state = abstract_state(
+                task=redact(query or event.get_message_str() or "")[:_TASK_CHAR_LIMIT],
+                surface=self._surface(event),
+                limit=_STATE_CHAR_LIMIT,
+            )
+            neighbors = await self._bank.topk(
+                state,
+                scope=umo,
+                k=self.cfg.retrieval.k,
+                threshold=self.cfg.retrieval.similarity_threshold,
+                surface_gate=self.cfg.retrieval.surface_gate,
+                prefilter_limit=self.cfg.retrieval.prefilter_limit,
+                recency_half_life_days=self.cfg.retrieval.recency_half_life_days,
+                scope_mode=self.cfg.retrieval.scope_isolation,
+            )
+            estimate = estimate_values(
+                neighbors,
+                sorted({neighbor.action_key for neighbor in neighbors}),
+                k=self.cfg.retrieval.k,
+                ucb_alpha=self.cfg.policy.ucb_alpha,
+                exploration_rate=self.cfg.policy.exploration_rate,
+                normalize=self.cfg.policy.normalize_advantage,
+                min_count=self.cfg.retrieval.min_count,
+                rng=self._rng,
+            )
+            return render_recall_report(state.text, estimate, neighbors=neighbors)
+        except Exception:
+            logger.warning("[JitRL] recall tool failed", exc_info=True)
+            return "Experience memory is temporarily unavailable."
+
+    # ------------------------------------------------------------------
+    # commands
+    # ------------------------------------------------------------------
+    def _command_denied(self, event: AstrMessageEvent) -> str | None:
+        """Return a refusal message when the sender may not use commands.
+
+        Args:
+            event: The command event.
+
+        Returns:
+            A user-facing refusal string, or `None` when access is granted.
+        """
+        if not self.cfg.commands.enabled:
+            return "JitRL 指令已被配置禁用。"
+        if self.cfg.commands.admin_only and not event.is_admin():
+            return "JitRL 指令仅管理员可用。"
+        return None
+
+    @filter.command_group("jitrl")
+    def jitrl_group(self) -> None:
+        """JitRL 持续学习：查看与管理 Agent 的经验记忆。"""
+        pass
+
+    @jitrl_group.command("status")
+    async def jitrl_status(self, event: AstrMessageEvent) -> Any:
+        """查看 JitRL 运行状态与记忆概况。"""
+        denied = self._command_denied(event)
+        if denied:
+            yield event.plain_result(denied)
+            return
+        try:
+            await self._ensure_ready()
+            umo = event.unified_msg_origin
+            total = await self._bank.count()
+            scoped = await self._bank.count(umo)
+            stats = self._stats
+            cached = self._last_decision.get(umo)
+            lines = [
+                "JitRL 持续学习状态",
+                f"· 开关：{('开' if self.cfg.enabled else '关')} / 应用模式：{self.cfg.apply_mode}",
+                f"· 记忆：全局 {total} 条，本会话 {scoped} 条",
+                f"· 学习：episodes={stats['episodes']}，experiences={stats['experiences']}",
+                f"· 干预：requests={stats['requests']}，biased={stats['biased']}，failures={stats['failures']}",
+                f"· 超参：k={self.cfg.retrieval.k} r={self.cfg.retrieval.similarity_threshold}"
+                f" gamma={self.cfg.learning.gamma} beta={self.cfg.policy.beta}"
+                f" lambda={self.cfg.policy.exploration_rate} alpha={self.cfg.policy.ucb_alpha}",
+            ]
+            if cached:
+                decision = cached[1]
+                lines.append(f"· 最近决策：{decision.reason or '（无）'}")
+            yield event.plain_result("\n".join(lines))
+        except Exception:
+            logger.warning("[JitRL] status command failed", exc_info=True)
+            yield event.plain_result("读取状态失败，请查看 AstrBot 日志。")
+
+    @jitrl_group.command("stats")
+    async def jitrl_stats(self, event: AstrMessageEvent, limit: int = 10) -> Any:
+        """查看各动作的平均回报与正回报比例。
+
+        Args:
+            limit(int): 展示条数，默认 10。
+        """
+        denied = self._command_denied(event)
+        if denied:
+            yield event.plain_result(denied)
+            return
+        try:
+            await self._ensure_ready()
+            limit = max(1, min(limit, 50))
+            rows = await self._bank.action_stats(limit=limit, min_count=1)
+            if not rows:
+                yield event.plain_result("还没有任何经验记录。先聊几轮吧。")
+                return
+            lines = ["JitRL 动作统计（按平均回报降序）"]
+            for row in rows:
+                lines.append(
+                    f"· {row['action_text'][:70]} | n={row['count']}"
+                    f" | 平均回报={row['mean_return']:+.2f}"
+                    f" | 正回报率={row['positive_rate'] * 100:.0f}%"
+                )
+            yield event.plain_result("\n".join(lines))
+        except Exception:
+            logger.warning("[JitRL] stats command failed", exc_info=True)
+            yield event.plain_result("读取统计失败，请查看 AstrBot 日志。")
+
+    @jitrl_group.command("curve")
+    async def jitrl_curve(self, event: AstrMessageEvent, buckets: int = 8) -> Any:
+        """查看学习曲线（按时间分桶的平均回报）。
+
+        Args:
+            buckets(int): 时间桶数量，默认 8。
+        """
+        denied = self._command_denied(event)
+        if denied:
+            yield event.plain_result(denied)
+            return
+        try:
+            await self._ensure_ready()
+            buckets = max(2, min(buckets, 30))
+            rows = await self._bank.learning_curve(buckets=buckets)
+            if not rows:
+                yield event.plain_result("还没有足够的经验绘制学习曲线。")
+                return
+            peak = max((abs(row["mean_return"]) for row in rows), default=1.0) or 1.0
+            lines = ["JitRL 学习曲线（平均回报，越往右越新）"]
+            for row in rows:
+                width = int(round(abs(row["mean_return"]) / peak * 20))
+                bar = ("+" if row["mean_return"] >= 0 else "-") * max(1, width)
+                lines.append(
+                    f"{row['bucket']:>3} | {bar:<20} {row['mean_return']:+.2f}"
+                )
+            yield event.plain_result("\n".join(lines))
+        except Exception:
+            logger.warning("[JitRL] curve command failed", exc_info=True)
+            yield event.plain_result("读取学习曲线失败，请查看 AstrBot 日志。")
+
+    @jitrl_group.command("recall")
+    async def jitrl_recall_cmd(self, event: AstrMessageEvent, query: str = "") -> Any:
+        """按当前（或指定）情景检索相关的历史经验。
+
+        Args:
+            query(string): 要检索的情景描述，留空则使用当前消息。
+        """
+        denied = self._command_denied(event)
+        if denied:
+            yield event.plain_result(denied)
+            return
+        try:
+            report = await self.jitrl_recall(event, query)
+            yield event.plain_result(report[:1800])
+        except Exception:
+            logger.warning("[JitRL] recall command failed", exc_info=True)
+            yield event.plain_result("检索失败，请查看 AstrBot 日志。")
+
+    @jitrl_group.command("forget")
+    async def jitrl_forget(
+        self, event: AstrMessageEvent, scope: str = "session"
+    ) -> Any:
+        """删除记忆。scope 可选 session（本会话）/ all（全部）。
+
+        Args:
+            scope(string): session 表示仅删除本会话记忆，all 表示清空全部。
+        """
+        denied = self._command_denied(event)
+        if denied:
+            yield event.plain_result(denied)
+            return
+        try:
+            await self._ensure_ready()
+            if scope.strip().lower() == "all":
+                removed = await self._bank.clear()
+            else:
+                removed = await self._bank.forget(scope=event.unified_msg_origin)
+            self._last_episode.pop(event.unified_msg_origin, None)
+            self._last_decision.pop(event.unified_msg_origin, None)
+            yield event.plain_result(f"已删除 {removed} 条经验。")
+        except Exception:
+            logger.warning("[JitRL] forget command failed", exc_info=True)
+            yield event.plain_result("删除失败，请查看 AstrBot 日志。")
+
+    @jitrl_group.command("feedback")
+    async def jitrl_feedback(
+        self, event: AstrMessageEvent, verdict: str = "good"
+    ) -> Any:
+        """手动回填对上一轮回复的评价：good 或 bad。
+
+        Args:
+            verdict(string): good 表示肯定，bad 表示否定。
+        """
+        denied = self._command_denied(event)
+        if denied:
+            yield event.plain_result(denied)
+            return
+        try:
+            await self._ensure_ready()
+            umo = event.unified_msg_origin
+            cached = self._last_episode.get(umo)
+            if not cached:
+                yield event.plain_result("没有可回填的上一轮经验。")
+                return
+            delta = (
+                _FEEDBACK_DELTA
+                if verdict.strip().lower() != "bad"
+                else -_FEEDBACK_DELTA
+            )
+            updated = await self._bank.apply_user_feedback(cached[0], delta)
+            self._last_episode.pop(umo, None)
+            yield event.plain_result(
+                f"已回填 {delta:+.1f} 奖励到上一轮经验的 {updated} 个步骤。"
+            )
+        except Exception:
+            logger.warning("[JitRL] feedback command failed", exc_info=True)
+            yield event.plain_result("回填失败，请查看 AstrBot 日志。")
+
+    @jitrl_group.command("export")
+    async def jitrl_export(self, event: AstrMessageEvent) -> Any:
+        """导出记忆为 JSON 文件（路径会回复给管理员）。"""
+        denied = self._command_denied(event)
+        if denied:
+            yield event.plain_result(denied)
+            return
+        try:
+            await self._ensure_ready()
+            import json
+
+            payload = await self._bank.export_json()
+            target = self._db_path.parent / f"export-{int(time.time())}.json"
+            target.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            yield event.plain_result(
+                f"已导出 {len(payload.get('experiences', []))} 条经验到：\n{target}"
+            )
+        except Exception:
+            logger.warning("[JitRL] export command failed", exc_info=True)
+            yield event.plain_result("导出失败，请查看 AstrBot 日志。")
+
+    @jitrl_group.command("episodes")
+    async def jitrl_episodes(self, event: AstrMessageEvent, limit: int = 5) -> Any:
+        """查看最近的 episode 摘要。
+
+        Args:
+            limit(int): 展示条数，默认 5。
+        """
+        denied = self._command_denied(event)
+        if denied:
+            yield event.plain_result(denied)
+            return
+        try:
+            await self._ensure_ready()
+            limit = max(1, min(limit, 20))
+            rows = await self._bank.recent_episodes(limit=limit)
+            if not rows:
+                yield event.plain_result("还没有 episode 记录。")
+                return
+            lines = ["最近的 JitRL episodes"]
+            for row in rows:
+                ts = time.strftime(
+                    "%m-%d %H:%M", time.localtime(row.get("created_at", 0))
+                )
+                lines.append(
+                    f"· {ts} | steps={row.get('step_count', 0)}"
+                    f" | 平均回报={row.get('mean_return', 0.0):+.2f}"
+                    f" | {str(row.get('user_text', ''))[:48]}"
+                )
+            yield event.plain_result("\n".join(lines))
+        except Exception:
+            logger.warning("[JitRL] episodes command failed", exc_info=True)
+            yield event.plain_result("读取 episode 失败，请查看 AstrBot 日志。")
+
+    # ------------------------------------------------------------------
+    # WebUI view API
+    # ------------------------------------------------------------------
+    def _register_web_apis(self) -> None:
+        """Expose the dashboard endpoints used by the plugin view.
+
+        Registration is best-effort: an older AstrBot build without plugin
+        web APIs must still load the plugin, so failures are only logged.
+        """
+        routes = (
+            ("/astrbot_plugin_jitrl/overview", self._web_overview, ["GET"], "overview"),
+            ("/astrbot_plugin_jitrl/curve", self._web_curve, ["GET"], "curve"),
+            ("/astrbot_plugin_jitrl/actions", self._web_actions, ["GET"], "actions"),
+            ("/astrbot_plugin_jitrl/episodes", self._web_episodes, ["GET"], "episodes"),
+            ("/astrbot_plugin_jitrl/forget", self._web_forget, ["POST"], "forget"),
+            ("/astrbot_plugin_jitrl/export", self._web_export, ["GET"], "export"),
+        )
+        register = getattr(self.context, "register_web_api", None)
+        if register is None:
+            logger.info("[JitRL] plugin web APIs are unsupported in this build")
+            return
+        for route, handler, methods, desc in routes:
+            try:
+                register(route, handler, methods, desc)
+            except Exception:
+                logger.warning("[JitRL] cannot register %s", route, exc_info=True)
+
+    async def _web_overview(self) -> Any:
+        """Return the dashboard overview payload.
+
+        Returns:
+            A JSON response with counters, hyperparameters and the last
+            decision taken by this process.
+        """
+        from astrbot.api.web import error_response, json_response
+
+        try:
+            await self._ensure_ready()
+            total = await self._bank.count()
+            last = None
+            if self._last_decision:
+                _, decision = max(
+                    self._last_decision.values(), key=lambda item: item[0]
+                )
+                last = {
+                    "reason": decision.reason,
+                    "chosen": decision.chosen.text if decision.chosen else "",
+                    "v_hat": decision.estimate.v_hat,
+                    "neighbors": decision.estimate.neighbor_count,
+                    "probabilities": decision.probabilities,
+                    "advantages": decision.estimate.advantage_norm,
+                }
+            return json_response(
+                {
+                    "enabled": self.cfg.enabled,
+                    "apply_mode": self.cfg.apply_mode,
+                    "total": total,
+                    "stats": dict(self._stats),
+                    "hyper": {
+                        "k": self.cfg.retrieval.k,
+                        "threshold": self.cfg.retrieval.similarity_threshold,
+                        "gamma": self.cfg.learning.gamma,
+                        "beta": self.cfg.policy.beta,
+                        "exploration_rate": self.cfg.policy.exploration_rate,
+                        "ucb_alpha": self.cfg.policy.ucb_alpha,
+                        "scope": self.cfg.retrieval.scope_isolation,
+                        "evaluator": self.cfg.learning.evaluator_mode,
+                    },
+                    "last_decision": last,
+                    "db_path": str(self._db_path),
+                }
+            )
+        except Exception:
+            logger.warning("[JitRL] overview endpoint failed", exc_info=True)
+            return error_response("JitRL overview unavailable", status_code=500)
+
+    async def _web_curve(self) -> Any:
+        """Return the learning-curve buckets.
+
+        Returns:
+            A JSON response whose "buckets" list holds time-ordered averages.
+        """
+        from astrbot.api.web import error_response, json_response, request
+
+        try:
+            await self._ensure_ready()
+            buckets = request.query.get("buckets", 12, type=int)
+            rows = await self._bank.learning_curve(
+                buckets=max(2, min(int(buckets), 60))
+            )
+            return json_response({"buckets": rows})
+        except Exception:
+            logger.warning("[JitRL] curve endpoint failed", exc_info=True)
+            return error_response("JitRL curve unavailable", status_code=500)
+
+    async def _web_actions(self) -> Any:
+        """Return per-action aggregates.
+
+        Returns:
+            A JSON response whose "actions" list holds action statistics.
+        """
+        from astrbot.api.web import error_response, json_response, request
+
+        try:
+            await self._ensure_ready()
+            limit = request.query.get("limit", 20, type=int)
+            rows = await self._bank.action_stats(limit=max(1, min(int(limit), 200)))
+            return json_response({"actions": rows})
+        except Exception:
+            logger.warning("[JitRL] actions endpoint failed", exc_info=True)
+            return error_response("JitRL actions unavailable", status_code=500)
+
+    async def _web_episodes(self) -> Any:
+        """Return recent episode headers.
+
+        Returns:
+            A JSON response whose "episodes" list holds episode summaries.
+        """
+        from astrbot.api.web import error_response, json_response, request
+
+        try:
+            await self._ensure_ready()
+            limit = request.query.get("limit", 10, type=int)
+            rows = await self._bank.recent_episodes(limit=max(1, min(int(limit), 100)))
+            return json_response({"episodes": rows})
+        except Exception:
+            logger.warning("[JitRL] episodes endpoint failed", exc_info=True)
+            return error_response("JitRL episodes unavailable", status_code=500)
+
+    async def _web_forget(self) -> Any:
+        """Delete memory from the dashboard.
+
+        Returns:
+            A JSON response reporting how many experiences were removed.
+        """
+        from astrbot.api.web import error_response, json_response, request
+
+        try:
+            await self._ensure_ready()
+            payload = await request.json(default={})
+            scope = str(payload.get("scope", "all")).strip().lower()
+            if scope == "all":
+                removed = await self._bank.clear()
+                self._last_episode.clear()
+                self._last_decision.clear()
+            elif scope == "session" and payload.get("umo"):
+                removed = await self._bank.forget(scope=str(payload["umo"]))
+            else:
+                return error_response("scope must be all, or session with umo")
+            return json_response({"removed": removed})
+        except Exception:
+            logger.warning("[JitRL] forget endpoint failed", exc_info=True)
+            return error_response("JitRL forget failed", status_code=500)
+
+    async def _web_export(self) -> Any:
+        """Export the memory bank as a downloadable JSON file.
+
+        Returns:
+            A file response holding the serialized memory bank.
+        """
+        import json
+
+        from astrbot.api.web import error_response, file_response
+
+        try:
+            await self._ensure_ready()
+            payload = await self._bank.export_json()
+            target = self._db_path.parent / "jitrl-export.json"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            return file_response(
+                target,
+                filename="jitrl-export.json",
+                content_type="application/json",
+            )
+        except Exception:
+            logger.warning("[JitRL] export endpoint failed", exc_info=True)
+            return error_response("JitRL export failed", status_code=500)

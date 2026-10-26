@@ -1,0 +1,2 @@
+# astrbot_plugin_jitrl uses the Python standard library only.
+# No third-party runtime dependencies are required.

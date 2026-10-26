@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>JitRL 持续学习</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header class="head">
+      <div class="head-title">
+        <h1>JitRL 持续学习</h1>
+        <p>推理时策略优化 · 无梯度更新 · 无微调</p>
+      </div>
+      <div class="head-meta">
+        <span id="chip-mode" class="chip">--</span>
+        <span id="chip-state" class="chip chip-muted">--</span>
+        <button id="btn-refresh" class="btn" type="button">刷新</button>
+        <button id="btn-export" class="btn" type="button">导出</button>
+        <button id="btn-forget" class="btn btn-danger" type="button">清空记忆</button>
+      </div>
+    </header>
+
+    <main class="grid">
+      <section class="card kpis">
+        <div class="kpi"><span id="kpi-total" class="kpi-value">--</span><span class="kpi-label">记忆条数</span></div>
+        <div class="kpi"><span id="kpi-episodes" class="kpi-value">--</span><span class="kpi-label">Episodes</span></div>
+        <div class="kpi"><span id="kpi-biased" class="kpi-value">--</span><span class="kpi-label">策略干预</span></div>
+        <div class="kpi"><span id="kpi-failures" class="kpi-value">--</span><span class="kpi-label">失败次数</span></div>
+      </section>
+
+      <section class="card span-2">
+        <h2>学习曲线 <small>按时间分桶的平均折扣回报 G</small></h2>
+        <div id="curve" class="curve"></div>
+        <div class="curve-axis"><span>更早</span><span>更新</span></div>
+      </section>
+
+      <section class="card span-2">
+        <h2>动作排行 <small>平均回报高、正回报率高的动作值得优先复用</small></h2>
+        <div id="actions" class="actions"></div>
+      </section>
+
+      <section class="card">
+        <h2>最近 Episode</h2>
+        <ul id="episodes" class="episodes"></ul>
+      </section>
+
+      <section class="card">
+        <h2>当前超参数</h2>
+        <dl id="hyper" class="hyper"></dl>
+        <div id="last-decision" class="decision"></div>
+      </section>
+    </main>
+
+    <p id="hint" class="hint"></p>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
