@@ -1,9 +1,13 @@
-"""Independent SQLite snapshots, published atomically outside the live bank."""
+"""Independent SQLite snapshots, published atomically outside the live bank.
+
+Diagnostics go through ``astrbot.api.logger``. AstrBot's plugin review requires
+every log line to come from the host logger, so the standard library ``logging``
+module is deliberately not imported anywhere in this package.
+"""
 
 from __future__ import annotations
 
 import json
-import logging
 import re
 import sqlite3
 import time
@@ -12,7 +16,8 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
-_LOG = logging.getLogger(__name__)
+from astrbot.api import logger
+
 _FORMAT_VERSION = 1
 _KINDS = {"manual", "auto", "startup", "before_forget", "before_restore"}
 _ID_PATTERN = re.compile(r"[0-9a-f]{32}")
@@ -78,7 +83,7 @@ class CheckpointStore:
                 with closing(self._open(path)) as conn:
                     result.append(self._info(conn, path))
             except (OSError, sqlite3.Error, ValueError, TypeError):
-                _LOG.warning("[JitRL] unreadable checkpoint: %s", path, exc_info=True)
+                logger.warning("[JitRL] unreadable checkpoint: %s", path, exc_info=True)
         return sorted(
             result, key=lambda row: (row["created_at"], row["id"]), reverse=True
         )
@@ -146,7 +151,7 @@ class CheckpointStore:
                         self.path(row["id"]).unlink()
         except (OSError, sqlite3.Error, ValueError):
             # A rotation failure must not invalidate an already published backup.
-            _LOG.warning("[JitRL] checkpoint rotation failed", exc_info=True)
+            logger.warning("[JitRL] checkpoint rotation failed", exc_info=True)
 
     def delete(self, checkpoint_id: str) -> None:
         """Delete exactly one selected snapshot, including a damaged file."""

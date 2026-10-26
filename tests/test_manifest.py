@@ -10,6 +10,7 @@ to ``unknown/unknown``. These tests make the contract executable.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import sys
@@ -51,6 +52,12 @@ SCHEMA_TYPES = {
     "dict",
 }
 """Node types AstrBot's configuration renderer understands."""
+
+SHIPPED_SOURCES = (
+    PLUGIN_ROOT / "main.py",
+    *sorted((PLUGIN_ROOT / "jitrl").glob("*.py")),
+)
+"""Modules inside the published package (tests and tooling are not shipped)."""
 
 
 @pytest.fixture(scope="module")
@@ -158,6 +165,34 @@ def test_installable_layout_exists() -> None:
     )
     missing = [path for path in required if not (PLUGIN_ROOT / path).is_file()]
     assert not missing, f"missing release files: {missing}"
+
+
+def test_plugin_sources_log_through_astrbot_only() -> None:
+    """The market safety review rejects stdlib logging inside a plugin.
+
+    Two rules are enforced: no shipped module may import the standard library
+    ``logging`` package, and every module that logs must take the host logger
+    from ``astrbot.api``.
+    """
+    offenders: list[str] = []
+    missing_host_logger: list[str] = []
+    for path in SHIPPED_SOURCES:
+        relative = path.relative_to(PLUGIN_ROOT).as_posix()
+        source = path.read_text(encoding="utf-8")
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                names = {alias.name.split(".")[0] for alias in node.names}
+                if "logging" in names:
+                    offenders.append(f"{relative}:{node.lineno}")
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                if node.module.split(".")[0] == "logging":
+                    offenders.append(f"{relative}:{node.lineno}")
+        if "logger." in source and "from astrbot.api import logger" not in source:
+            missing_host_logger.append(relative)
+    assert not offenders, f"stdlib logging is not allowed in the plugin: {offenders}"
+    assert not missing_host_logger, (
+        f"these modules log without importing astrbot.api.logger: {missing_host_logger}"
+    )
 
 
 def test_metadata_file_is_plain_utf8() -> None:

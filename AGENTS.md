@@ -3,6 +3,10 @@
 - For routine features and fixes, increment only the patch (last) version number.
 - Increment the middle version number only for large architectural improvements.
 - The current release is `0.1.1` (re-released with the market fixes); `0.1.0` was the first public version.
+- Market review rules to keep satisfying: log only through `from astrbot.api import logger`
+  (never the standard library `logging`), and never rewrite `req.system_prompt` per request —
+  injected context goes to `req.extra_user_content_parts` and is marked `mark_as_temp()` so it
+  is not persisted and the prompt-cache prefix stays stable.
 - Keep `metadata.yaml`, `jitrl/__init__.py`, the README version badge, changelog
   and release tag consistent.
 - Build installable ZIPs with a single `astrbot_plugin_jitrl/` root directory.

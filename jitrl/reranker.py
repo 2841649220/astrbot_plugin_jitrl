@@ -6,9 +6,9 @@ no base logit to shift. Section 5.1 solves this by asking the model for a 0-100
 confidence per candidate and treating its logarithm as a verbalised logit.
 
 This module only builds the prompt, calls the injected coroutine and parses the
-answer. It deliberately imports no AstrBot modules, so it is unit-testable with
-a fake generator; the loading of the real provider is the caller's job. The
-generator is awaited with keyword arguments only:
+answer. It imports no AstrBot *runtime* services beyond the host logger, so it
+is unit-testable with a fake generator; the loading of the real provider is the
+caller's job. The generator is awaited with keyword arguments only:
 
     raw = await generate(prompt=..., system_prompt=...)
 """
@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import math
 import re
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
+
+from astrbot.api import logger
 
 GenerateFn = Callable[..., Awaitable[str]]
 """Injected model call, awaited as generate(prompt=..., system_prompt=...)."""
@@ -67,7 +68,6 @@ class VerbalizedReranker:
         *,
         timeout: float = 20.0,
         max_candidates: int = 4,
-        logger: logging.Logger | None = None,
     ) -> None:
         """Store the generator and the call budget.
 
@@ -77,13 +77,10 @@ class VerbalizedReranker:
             timeout: Hard timeout in seconds for a single scoring call.
             max_candidates: Maximum number of candidates sent to the model; the
                 rest are filled with the neutral 0.5 prior.
-            logger: Logger used for failure diagnostics; module logger by
-                default.
         """
         self._generate = generate
         self._timeout = timeout
         self._max_candidates = max(int(max_candidates), 1)
-        self._logger = logger if logger is not None else logging.getLogger(__name__)
 
     async def score(
         self,
@@ -123,11 +120,11 @@ class VerbalizedReranker:
             )
         except asyncio.TimeoutError:
             error = f"timeout after {self._timeout:g}s"
-            self._logger.warning("verbalized reranker timeout: %s", error)
+            logger.warning("verbalized reranker timeout: %s", error)
             return RerankResult(ok=False, error=error)
         except Exception as exc:  # noqa: BLE001 - a helper must never break a chat
             error = f"{type(exc).__name__}: {exc}"
-            self._logger.warning("verbalized reranker call failed: %s", error)
+            logger.warning("verbalized reranker call failed: %s", error)
             return RerankResult(ok=False, error=error)
 
         if not isinstance(raw, str) or not raw.strip():

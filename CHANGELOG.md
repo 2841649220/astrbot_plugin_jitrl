@@ -14,7 +14,7 @@
 - 自动历史和操作前备份分别轮换，默认各 20 份；手动检查点保留到主动删除。
 - 管理员指令 `checkpoint`、`checkpoints`、`rollback`、`checkpoint_delete`，以及面板创建、回退和删除快照入口。
 - 配置 `memory.checkpoint_interval`（默认 50，0 关闭定期保存/初始基线）和 `memory.keep_checkpoints`（默认 20）。
-- 30 项恢复测试、23 项插件行为测试、7 项 Node.js 面板交互测试；CI 自动验证面板交互。
+- 30 项恢复测试、24 项插件行为测试、7 项 Node.js 面板交互测试；CI 自动验证面板交互。
 
 ### 修复与优化
 
@@ -27,6 +27,9 @@
 - 新增 `scripts/build_release.py`：校验版本链后生成单根目录发布 ZIP，拒绝超过 16 MB 的包。
 - 配置 schema 清理：修正 `jitrl_note` 描述，移除未实现的 `debug.expose_decision` 与宿主不渲染的 `apply_mode.subtitles`，`float` 默认值统一为浮点字面量。
 - README 更新安装要求（AstrBot `>=4.29`）、测试说明与「独立实现、未移植论文官方代码」许可声明；`.gitignore` 补充 `*.db` 家族。
+- 市场复审修复（日志）：`jitrl/memory.py`、`jitrl/evaluator.py`、`jitrl/checkpoints.py`、`jitrl/reranker.py` 全部改用 `from astrbot.api import logger`，删除 `import logging` 与 `logging.getLogger()` 兜底；`StepRewardEvaluator` / `VerbalizedReranker` 不再接收外部 logger。新增契约测试禁止插件源码再引入标准库 `logging`。
+- 市场复审修复（缓存）：经验证据块不再改写 `req.system_prompt`，改为 `req.extra_user_content_parts.append(TextPart(...).mark_as_temp())`，附加到当前用户消息且不写入会话历史；system prompt 作为上下文前缀逐字节不变，provider 的 prompt 缓存命中率不再被按请求改写破坏。
+- 集成测试新增断言：注入落在用户消息的临时内容块中、`system_prompt` 保持原值、`_no_save` 已置位；另加一项不依赖宿主的注入路径测试。
 - 版本号保持 `0.1.1`（本次为修订重发），维持零第三方运行时依赖。
 
 ## [0.1.0] - 2026-10-26

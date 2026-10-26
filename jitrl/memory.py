@@ -8,19 +8,23 @@ and a mild recency weighting.
 
 Every SQLite call is pushed onto a worker thread so the AstrBot event loop is
 never blocked, and each multi-row write runs inside one transaction.
+
+Diagnostics go through ``astrbot.api.logger``; the standard library ``logging``
+module is not used anywhere in this package.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import sqlite3
 import threading
 import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+
+from astrbot.api import logger
 
 from .checkpoints import CheckpointStore
 from .models import Episode, Neighbor, StateView
@@ -485,7 +489,7 @@ class MemoryBank:
                     self._checkpoints.create(conn, kind="auto")
                     self._episodes_since_checkpoint = 0
                 except (OSError, sqlite3.Error, ValueError):
-                    logging.getLogger(__name__).warning(
+                    logger.warning(
                         "[JitRL] automatic checkpoint failed; will retry next episode",
                         exc_info=True,
                     )

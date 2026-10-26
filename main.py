@@ -42,6 +42,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
+from astrbot.core.agent.message import TextPart
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from .jitrl.config import JitRLConfig
@@ -371,7 +372,6 @@ class JitRLLearner(Star):
             _generate,
             timeout=max(5.0, self.cfg.learning.evaluator_timeout),
             max_candidates=max(2, self.cfg.policy.candidate_limit + 1),
-            logger=self.logger,
         )
         result = await reranker.score(
             task=task,
@@ -463,6 +463,11 @@ class JitRLLearner(Star):
         resulting text block is advisory: the KL term of Eq. 8 keeps the
         update close to the frozen reference policy, so the model is told to
         ignore the block when the evidence does not match the request.
+
+        The block is attached to the current user message as a temporary
+        content part (`req.extra_user_content_parts`) instead of the system
+        prompt. The system prompt is the cached context prefix, so rewriting it
+        on every request would destroy the provider's prompt-cache hit rate.
 
         Args:
             event: The message event that triggered the request.
@@ -563,9 +568,13 @@ class JitRLLearner(Star):
             if generation != self._bank.generation:
                 return
             if block:
-                req.system_prompt = (
-                    f"{req.system_prompt}\n\n{block}" if req.system_prompt else block
-                )
+                # The block is appended to the *user* message as a temporary
+                # content part, never to `system_prompt`: the system prompt is
+                # the cached context prefix, so rewriting it on every request
+                # would wipe out prompt-cache hits. `mark_as_temp` keeps the
+                # part out of persisted history - it is valid for this turn only.
+                part = TextPart(text=block).mark_as_temp()
+                req.extra_user_content_parts.append(part)
                 event.set_extra(_INJECTED_KEY, True)
             if self.cfg.policy.tool_gate:
                 self._apply_tool_gate(req, decision)
@@ -712,7 +721,6 @@ class JitRLLearner(Star):
             timeout=self.cfg.learning.evaluator_timeout,
             max_reward=3.0,
             heuristic_weight=self.cfg.learning.heuristic_weight,
-            logger=self.logger,
         )
         result = await evaluator.score(
             task=user_text,

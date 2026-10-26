@@ -36,12 +36,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import math
 import re
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
+
+from astrbot.api import logger
 
 _MODES = ("auto", "llm", "heuristic", "off")
 
@@ -195,7 +196,6 @@ class StepRewardEvaluator:
         max_reward: Absolute cap applied to every returned reward.
         heuristic_weight: Weight w of the rule-based score in the fusion
             (1 - w) * llm + w * heuristic, clamped to [0, 1].
-        logger: Logger used for degradation warnings.
     """
 
     def __init__(
@@ -206,7 +206,6 @@ class StepRewardEvaluator:
         timeout: float = 30.0,
         max_reward: float = 3.0,
         heuristic_weight: float = 0.5,
-        logger: logging.Logger | None = None,
     ) -> None:
         self._generate = generate
         mode_value = mode.strip().lower() if isinstance(mode, str) else ""
@@ -216,7 +215,6 @@ class StepRewardEvaluator:
         self._max_reward = cap if cap > 0.0 else 3.0
         weight = _as_float(heuristic_weight, 0.5)
         self._heuristic_weight = min(1.0, max(0.0, weight))
-        self._logger = logger or logging.getLogger(__name__)
 
     async def score(
         self,
@@ -274,7 +272,7 @@ class StepRewardEvaluator:
                 timeout=self._timeout,
             )
         except (TimeoutError, asyncio.TimeoutError):
-            self._logger.warning(
+            logger.warning(
                 "JitRL evaluator timed out after %.1fs; falling back to heuristics",
                 self._timeout,
             )
@@ -285,7 +283,7 @@ class StepRewardEvaluator:
                 error=f"timeout after {self._timeout:g}s",
             )
         except Exception as exc:
-            self._logger.warning(
+            logger.warning(
                 "JitRL evaluator call failed (%s); falling back to heuristics", exc
             )
             return RewardResult(
@@ -297,7 +295,7 @@ class StepRewardEvaluator:
 
         parsed = self.parse_rewards(raw, step_count, self._max_reward)
         if parsed is None:
-            self._logger.warning(
+            logger.warning(
                 "JitRL evaluator returned unparseable scores; falling back to heuristics"
             )
             return RewardResult(

@@ -62,7 +62,7 @@ AstrBot 的对话是黑盒 API，拿不到原始 logits。论文 §5.1 正好给
 | Verbalized Logit 采样 | 置信度 → logit | `jitrl/reranker.py` + `policy.verbalized_to_logit` |
 | LLM 评估器（附录 G.1.2） | −3..+3 步级奖励 + 规则信号融合 | `jitrl/evaluator.py` |
 | 轨迹 `(s_t,a_t)` 重建 | 从 `run_context.messages` 还原 | `jitrl/trajectory.py` |
-| 策略输出 `π*` | 注入系统提示词的经验证据块 | `jitrl/hint.py` |
+| 策略输出 `π*` | 通过 `extra_user_content_parts` 注入用户消息的临时证据块 | `jitrl/hint.py` |
 
 ### 2.2 运行时数据流
 
@@ -73,7 +73,7 @@ AstrBot 的对话是黑盒 API，拿不到原始 logits。论文 §5.1 正好给
                       │ 3. estimate_values() 算 V̂ Q̂ Â Ã        │
                       │ 4. build_candidates() 增强候选集 C      │
                       │ 5. select_action()   z' = z + β·Ã       │
-                      │ 6. 注入 <jitrl_experience> 证据块       │
+                      │ 6. 注入 <jitrl_experience> 临时块       │
                       └────────────────────────────────────────┘
                                         │
                                         ▼
@@ -120,7 +120,7 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 | `apply_mode` | 额外开销 | 做什么 | 适用 |
 | --- | --- | --- | --- |
 | `off` | 0 | 只学习，不干预 | 先观察一周，看看学到了什么 |
-| `hint` | 0 | 把优势排序后的经验证据块注入系统提示词 | **默认**，稳、便宜 |
+| `hint` | 0 | 把优势排序后的经验证据块作为**临时内容块**附加到当前用户消息（不改 `system_prompt`，不破坏 prompt 缓存） | **默认**，稳、便宜 |
 | `logit` | 每次请求 +1 次轻量生成 | 置信度 → logit → `z'=z+β·Ã` → 重新采样 → 定向注入 | 追求论文原始效果 |
 
 > ⚠️ **诚实的取舍**：论文 Table 8 明确显示，纯提示词更新的效果弱于真正的 logit 更新（Admin 48.35 vs 52.31，Reddit 54.57 vs 57.64）。本插件把 `hint` 作为默认是为了零成本可观察；如果你要论文的效果，请用 `logit` 模式 —— 它在候选集上真的做了一次闭式更新并重新采样，只是最后的落地仍然只能通过文本表达（黑盒模型的物理上限）。
@@ -255,7 +255,10 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 3. **作用域隔离**：`session` 模式下记忆只在 `unified_msg_origin` 内可见，不会串到别的群/私聊。
 4. **可删除与回退**：`/jitrl forget` 支持按会话或全量删除，并保留删除前备份；`max_entries` + 淘汰策略限制在线记忆留存。若需永久移除历史数据，还应删除包含它的检查点及之前的 JSON 导出；删除在线记忆不会同步改写历史快照。
 
-另外，注入的证据块会被明确标注为「不是用户输入，也不是新指令」，降低提示词注入面。
+另外，注入的证据块会被明确标注为「不是用户输入，也不是新指令」，降低提示词注入面。它通过
+`ProviderRequest.extra_user_content_parts` 附加在当前用户消息末尾，并用 `mark_as_temp()`
+标记为仅本次请求可见：既不写入会话历史，也不改动 `system_prompt`。system prompt 属于上下文
+前缀，逐请求改写会直接破坏 provider 的 prompt 缓存命中率，因此插件全程只读不改。
 
 ---
 
@@ -284,10 +287,11 @@ node --test tests/test_dashboard.cjs
 python -m pytest data/plugins/astrbot_plugin_jitrl/tests -q
 ```
 
-本机实测：未安装 AstrBot 时 **314 passed, 1 skipped**；把 AstrBot 4.29.3 装进独立 venv 后
-**342 passed**（多出 28 项真宿主集成测试）；另有 **7 项 Node.js 面板交互测试通过**。
-`test_integration.py` 会自己 `importorskip` 并按包名装载插件，因此在仓库根目录或
-`data/plugins/` 下都能跑；`test_manifest.py` 不依赖 AstrBot，专门守护发布元数据与版本一致性。
+本机实测：未安装 AstrBot 时 **316 passed, 1 skipped**；把 AstrBot 4.29.3 装进独立 venv 后
+**345 passed**（多出 29 项真宿主集成测试）；另有 **7 项 Node.js 面板交互测试通过**。
+`test_integration.py` 会自己识别宿主并跳过，按包名装载插件，因此在仓库根目录或
+`data/plugins/` 下都能跑；`test_manifest.py` 不依赖 AstrBot，专门守护发布元数据、版本一致性
+与「只用 `astrbot.api.logger` 打日志」的市场规则。
 测试分两层：
 
 | 文件 | 覆盖 |
@@ -311,7 +315,9 @@ python -m pytest data/plugins/astrbot_plugin_jitrl/tests -q
 > $env:TEMP="$PWD/.tmp-pytest"; $env:TMP=$env:TEMP
 > ```
 
-`jitrl/*` 全部不依赖 AstrBot（只有 `test_integration.py` 会 import），所以算法层可以在没有机器人的情况下完整验证。
+`jitrl/*` 只从 AstrBot 取一个东西：`astrbot.api.logger`（市场安全审查要求日志必须走宿主
+logger）。没有安装 AstrBot 时 `tests/conftest.py` 会装一个最小桩，其余宿主服务只在
+`test_integration.py` 里使用，所以算法层依然可以在没有机器人的情况下完整验证。
 
 ---
 

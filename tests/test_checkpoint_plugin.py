@@ -10,6 +10,7 @@ import asyncio
 import importlib.util
 import logging
 import sys
+import uuid
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -17,7 +18,12 @@ import pytest
 import pytest_asyncio
 
 from jitrl.evaluator import RewardResult
-from jitrl.trajectory import extract_transitions
+from jitrl.state import abstract_state, normalize_action
+from jitrl.trajectory import (
+    Transition,
+    build_episode,
+    extract_transitions,
+)
 
 pytestmark = pytest.mark.asyncio
 ROOT = Path(__file__).resolve().parents[1]
@@ -73,6 +79,8 @@ def host(monkeypatch, tmp_path):
         "astrbot.api.star",
         "astrbot.api.web",
         "astrbot.core",
+        "astrbot.core.agent",
+        "astrbot.core.agent.message",
         "astrbot.core.utils",
         "astrbot.core.utils.astrbot_path",
     )
@@ -95,7 +103,19 @@ def host(monkeypatch, tmp_path):
             self.context = context
             self.logger = logging.getLogger("checkpoint-test")
 
+    class TextPart:
+        """Minimal stand-in for ``astrbot.core.agent.message.TextPart``."""
+
+        def __init__(self, *, text):
+            self.text = text
+            self.temporary = False
+
+        def mark_as_temp(self):
+            self.temporary = True
+            return self
+
     modules["astrbot.api"].logger = logging.getLogger("checkpoint-test")
+    modules["astrbot.core.agent.message"].TextPart = TextPart
     modules["astrbot.api.event"].AstrMessageEvent = Event
     modules["astrbot.api.event"].filter = SimpleNamespace(
         on_llm_request=decorator,
@@ -169,6 +189,26 @@ async def learn(plugin, scope="s1"):
             messages=MESSAGES, user_text="trusted task", surface="test"
         ),
         reply_text="ok",
+    )
+
+
+async def _seed(bank, task, tool, reward, scope="s1"):
+    """Store one single-step episode with a known reward."""
+    transition = Transition(
+        state=abstract_state(task=task),
+        action=normalize_action(kind="tool", name=tool, args={"q": "x"}),
+        observation="ok",
+        outcome="ok",
+    )
+    await bank.add_episode(
+        build_episode(
+            episode_id=uuid.uuid4().hex,
+            scope=scope,
+            user_text=task,
+            transitions=[transition],
+            rewards=[reward],
+            gamma=0.5,
+        )
     )
 
 
@@ -352,6 +392,7 @@ async def test_rerank_in_flight_cannot_inject_old_policy_after_restore(
         prompt="trusted task",
         system_prompt="base",
         func_tool=SimpleNamespace(names=lambda: ["search"]),
+        extra_user_content_parts=[],
     )
     pending = asyncio.create_task(plugin.on_llm_request(event, request))
     await asyncio.wait_for(started.wait(), 3)
@@ -363,3 +404,22 @@ async def test_rerank_in_flight_cannot_inject_old_policy_after_restore(
     await asyncio.wait_for(pending, 3)
     assert request.system_prompt == "base"
     assert not plugin._last_decision
+
+
+async def test_experience_block_rides_on_the_user_message(plugin):
+    await plugin._ensure_ready()
+    for tool, reward in (("web_search", 2.0), ("bad_tool", -2.0)):
+        await _seed(plugin._bank, "trusted task", tool, reward)
+    event = Event()
+    request = SimpleNamespace(
+        prompt="trusted task",
+        system_prompt="base",
+        func_tool=SimpleNamespace(names=lambda: ["web_search", "bad_tool"]),
+        extra_user_content_parts=[],
+    )
+    await plugin.on_llm_request(event, request)
+    assert request.system_prompt == "base"
+    assert len(request.extra_user_content_parts) == 1
+    part = request.extra_user_content_parts[0]
+    assert "<jitrl_experience>" in part.text
+    assert part.temporary, "the injected part must never be persisted"

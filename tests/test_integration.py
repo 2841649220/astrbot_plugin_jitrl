@@ -26,7 +26,12 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
-pytest.importorskip("astrbot")
+astrbot = pytest.importorskip("astrbot")
+if getattr(astrbot, "__jitrl_stub__", False):
+    pytest.skip(
+        "AstrBot is not installed; the integration suite needs the real host",
+        allow_module_level=True,
+    )
 
 from astrbot.core.agent.tool import FunctionTool, ToolSet  # noqa: E402
 from astrbot.core.provider.entities import ProviderRequest  # noqa: E402
@@ -269,6 +274,25 @@ def _request(system_prompt: str = "你是一个乐于助人的助手。") -> Pro
     )
 
 
+def _injected_text(request: ProviderRequest) -> str:
+    """Return the text of the temporary parts the plugin appended to the user message.
+
+    The plugin is not allowed to rewrite ``system_prompt`` (that would break
+    prompt caching), so the experience block arrives as an extra user content
+    part. AstrBot accepts both ``ContentPart`` objects and the equivalent dict.
+
+    Args:
+        request: The outgoing provider request.
+
+    Returns:
+        The concatenated text of every injected content part.
+    """
+    return "\n".join(
+        part["text"] if isinstance(part, dict) else part.text
+        for part in request.extra_user_content_parts
+    )
+
+
 @pytest.fixture
 def plugin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
     """Create a plugin instance backed by a throwaway database.
@@ -355,6 +379,7 @@ async def test_request_without_memory_does_not_touch_prompt(plugin: Any) -> None
     original = request.system_prompt
     await plugin.on_llm_request(event, request)
     assert request.system_prompt == original
+    assert request.extra_user_content_parts == []
     assert request.func_tool is not None
     assert set(request.func_tool.names()) == {"web_search", "bad_tool"}
     assert plugin._stats["requests"] == 0
@@ -368,16 +393,17 @@ async def test_request_injects_advantage_ranked_block(plugin: Any) -> None:
 
     event = FakeEvent()
     request = _request()
+    original = request.system_prompt
     await plugin.on_llm_request(event, request)
 
-    prompt = request.system_prompt
-    assert "<jitrl_experience>" in prompt
-    assert "</jitrl_experience>" in prompt
-    assert "web_search" in prompt
-    assert "bad_tool" in prompt
-    assert "优势" in prompt
-    assert "不要生搬硬套" in prompt
-    assert prompt.startswith("你是一个乐于助人的助手。")
+    block = _injected_text(request)
+    assert "<jitrl_experience>" in block
+    assert "</jitrl_experience>" in block
+    assert "web_search" in block
+    assert "bad_tool" in block
+    assert "优势" in block
+    assert "不要生搬硬套" in block
+    assert request.system_prompt == original
 
     context = event.get_extra("_jitrl_context")
     assert context is not None
@@ -388,6 +414,32 @@ async def test_request_injects_advantage_ranked_block(plugin: Any) -> None:
     assert plugin._stats["biased"] == 1
 
 
+async def test_injected_block_is_temporary_and_keeps_the_cache_prefix(
+    plugin: Any,
+) -> None:
+    """The block must ride on the user message, not on the cached system prompt.
+
+    AstrBot's plugin review rejects per-request ``system_prompt`` rewrites: the
+    system prompt is the cached context prefix, so changing it lowers the prompt
+    cache hit rate. The injected part must also be marked provider-only so it is
+    never written into the persisted conversation history.
+    """
+    await plugin._ensure_ready()
+    await _seed(plugin._bank, TASK, "web_search", 2.0)
+    await _seed(plugin._bank, TASK, "bad_tool", -2.0)
+
+    request = _request()
+    original = request.system_prompt
+    await plugin.on_llm_request(FakeEvent(), request)
+
+    assert request.system_prompt == original
+    assert len(request.extra_user_content_parts) == 1
+    part = request.extra_user_content_parts[0]
+    assert part.type == "text"
+    assert part._no_save is True
+    assert "<jitrl_experience>" in part.text
+
+
 async def test_request_is_injected_at_most_once(plugin: Any) -> None:
     """A second hook call on the same event must not duplicate the block."""
     await plugin._ensure_ready()
@@ -395,10 +447,10 @@ async def test_request_is_injected_at_most_once(plugin: Any) -> None:
     event = FakeEvent()
     request = _request()
     await plugin.on_llm_request(event, request)
-    first = request.system_prompt
+    first = _injected_text(request)
     await plugin.on_llm_request(event, request)
-    assert request.system_prompt == first
-    assert request.system_prompt.count("<jitrl_experience>") == 1
+    assert _injected_text(request) == first
+    assert _injected_text(request).count("<jitrl_experience>") == 1
 
 
 async def test_tool_gate_masks_confidently_negative_tool(plugin: Any) -> None:
@@ -449,7 +501,7 @@ async def test_captured_experience_biases_the_next_request(plugin: Any) -> None:
     next_event = FakeEvent()
     next_request = _request()
     await plugin.on_llm_request(next_event, next_request)
-    assert "<jitrl_experience>" in next_request.system_prompt
+    assert "<jitrl_experience>" in _injected_text(next_request)
 
 
 async def test_user_feedback_updates_returns(plugin: Any) -> None:
@@ -738,7 +790,7 @@ async def test_learning_prefers_the_rewarding_action(plugin: Any) -> None:
     assert advantages[good] > 0.9
     assert advantages[bad] < -0.9
     assert decision.probabilities[good] > decision.probabilities[bad]
-    assert "<jitrl_experience>" in request.system_prompt
+    assert "<jitrl_experience>" in _injected_text(request)
 
 
 async def test_advantage_normalisation_bounds_the_update(plugin: Any) -> None:
@@ -811,7 +863,7 @@ async def test_logit_mode_uses_verbalized_confidences(plugin: Any) -> None:
     assert logits[0] == pytest.approx(math.log(0.5), abs=1e-6)
     assert logits[1] == pytest.approx(0.0, abs=1e-6)
     assert decision.chosen is not None
-    assert "按闭式更新后的策略采样" in request.system_prompt
+    assert "按闭式更新后的策略采样" in _injected_text(request)
 
 
 async def test_logit_mode_survives_a_broken_reranker(plugin: Any) -> None:
@@ -834,7 +886,7 @@ async def test_logit_mode_survives_a_broken_reranker(plugin: Any) -> None:
     assert decision.chosen is not None
     for value in decision.logits_before.values():
         assert value == pytest.approx(_neutral(0.5), abs=1e-6)
-    assert "<jitrl_experience>" in request.system_prompt
+    assert "<jitrl_experience>" in _injected_text(request)
 
 
 async def test_logit_mode_without_provider_keeps_zero_prior(plugin: Any) -> None:
