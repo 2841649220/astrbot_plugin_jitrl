@@ -1,6 +1,7 @@
 # JitRL 持续学习 · astrbot_plugin_jitrl
 
 [![CI](https://github.com/2841649220/astrbot_plugin_jitrl/actions/workflows/ci.yml/badge.svg)](https://github.com/2841649220/astrbot_plugin_jitrl/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/version-0.1.0-blue)](CHANGELOG.md)
 
 > 让 AstrBot 的 Agent 在对话中**持续自我进化**——不微调、不训练、不占 GPU。
 >
@@ -230,9 +231,9 @@ cd AstrBot
 python -m pytest data/plugins/astrbot_plugin_jitrl/tests -q
 ```
 
-在 AstrBot 仓库内本地跑：**273 passed**（含 `test_integration.py`）。
-CI 上没安装 AstrBot 时：**245 passed, 1 skipped** —— `test_integration.py` 会自己 `importorskip`，
-算法层依然全覆盖。测试分两层：
+本机（未安装 AstrBot）实测：**252 passed, 1 skipped** —— `test_integration.py` 会自己 `importorskip`，
+算法层与面板契约依然全覆盖；在 AstrBot 仓库内还会额外执行该文件的 28 项集成测试。
+测试分两层：
 
 | 文件 | 覆盖 |
 | --- | --- |
@@ -243,6 +244,7 @@ CI 上没安装 AstrBot 时：**245 passed, 1 skipped** —— `test_integration
 | `test_evaluator.py` | 折扣回报、启发式规则、JSON 解析回退、`auto` 短路、LLM/规则融合、超时降级 |
 | `test_trajectory.py` | dict 与 pydantic 两种消息形态、tool_call_id 匹配、坏 arguments、状态口径一致性 |
 | `test_integration.py` | **真实插件类**跑完整回路：Hook 注入 → 轨迹采集 → 落库 → 下轮生效、工具门控、用户反馈、指令、Web API |
+| `test_view.py` | 面板契约：沙箱内禁用 `alert/confirm/prompt`、清空记忆的页内两步确认、`bridge.download` 参数签名、`app.js` 与 `index.html` 的 id 一致性、静态资源入口 |
 
 > Windows 提示：如果 `%TEMP%\pytest-of-ASUS` 的 ACL 被别的账户占用导致 `tmp_path` 报 `PermissionError`，把 TEMP 指到别处再跑：
 >
@@ -265,6 +267,7 @@ astrbot_plugin_jitrl/
 ├── requirements.txt       # 空（零第三方依赖）
 ├── pyproject.toml         # 仅 lint / 测试配置（本仓库不是 pip 包）
 ├── LICENSE                # AGPL-3.0
+├── CHANGELOG.md           # 版本变更记录
 ├── .gitignore             # 排除 __pycache__ / *.sqlite3 / 导出文件
 ├── .github/workflows/     # CI：ruff + pytest（3.10 / 3.12）
 ├── jitrl/
@@ -302,6 +305,12 @@ astrbot_plugin_jitrl/
 
 ---
 
-## 12. 许可证
+## 12. 版本
+
+当前版本 **0.1.0**（首个公开版本）。完整的版本变更记录见 [CHANGELOG.md](CHANGELOG.md)。
+
+---
+
+## 13. 许可证
 
 AGPL-3.0（与 AstrBot 主仓库保持一致）。
