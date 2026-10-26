@@ -1,4 +1,4 @@
-"""Conservative async serving, isolated learning and atomic local checkpoints."""
+"""Versioned async serving, isolated learning and atomic local checkpoints."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ from .contracts import (
 from .encoding import digest, safe_name
 from .store import SOURCE_RELIABILITY, LensStore, retained_snapshot, validate_snapshot
 
-_ARCHITECTURE = (
+_LEGACY_ARCHITECTURE = (
     "hidden_dim",
     "embedding_dim",
     "summary_dim",
@@ -47,6 +47,18 @@ _ARCHITECTURE = (
     "return_scale",
     "seed",
 )
+_ARCHITECTURE = (
+    *_LEGACY_ARCHITECTURE,
+    "attention_backend",
+    "mita_landmarks",
+    "mita_topk",
+    "mita_query_chunk",
+    "memory_tokens",
+)
+
+
+class IncompatibleArchitecture(ValueError):
+    """Facts remain usable, but these parameters belong to another backbone."""
 
 
 def render_evidence(
@@ -83,7 +95,7 @@ class LensRuntime:
         self.root = Path(root)
         self.cfg = cfg
         self.store = LensStore(self.root / "neural.sqlite3")
-        self._models: OrderedDict[tuple[str, str], Any] = OrderedDict()
+        self._models: OrderedDict[tuple[str, str, str], Any] = OrderedDict()
         self._model_lock = threading.Lock()
         self._training_lock = asyncio.Lock()
         self._workers: set[asyncio.Task] = set()
@@ -120,6 +132,16 @@ class LensRuntime:
             raise ValueError("invalid checkpoint path")
         return path
 
+    def _device(self) -> Any:
+        import torch
+
+        name = self.cfg.device
+        if name == "auto":
+            name = "cuda" if torch.cuda.is_available() else "cpu"
+        if name == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("requested CUDA device is unavailable")
+        return torch.device(name)
+
     def _load_model(
         self,
         scope: str,
@@ -140,7 +162,8 @@ class LensRuntime:
             record["created_at"] > decision_time or training_cutoff > decision_time
         ):
             raise ValueError("checkpoint was published after this decision")
-        key = (scope, record["checkpoint_id"])
+        architecture = {name: getattr(self.cfg, name) for name in _ARCHITECTURE}
+        key = (scope, record["checkpoint_id"], digest((architecture, self.cfg.device)))
         with self._model_lock:
             if key in self._models:
                 self._models.move_to_end(key)
@@ -153,22 +176,30 @@ class LensRuntime:
         if hashlib.sha256(path.read_bytes()).hexdigest() != record["sha256"]:
             raise ValueError("neural checkpoint checksum mismatch")
         payload = torch.load(path, map_location="cpu", weights_only=True)
-        architecture = {name: getattr(self.cfg, name) for name in _ARCHITECTURE}
         if (
             payload.get("versions") != list(VERSIONS)
             or payload.get("scope_hash") != digest(scope)
-            or payload.get("architecture") != architecture
             or payload.get("checkpoint_id") != key[1]
             or payload.get("trained_before") != training_cutoff
         ):
             raise ValueError("incompatible neural checkpoint")
+        old_architecture = {
+            name: getattr(self.cfg, name) for name in _LEGACY_ARCHITECTURE
+        }
+        if payload.get("architecture") != architecture and not (
+            self.cfg.attention_backend == "legacy"
+            and payload.get("architecture") == old_architecture
+        ):
+            raise IncompatibleArchitecture(
+                "incompatible local backbone; retrain from saved causal snapshots"
+            )
         model = create_model(self.cfg)
         model.load_state_dict(payload["state_dict"], strict=True)
         if any(
             not torch.isfinite(tensor).all() for tensor in model.state_dict().values()
         ):
             raise ValueError("nonfinite neural checkpoint")
-        model.eval()
+        model.to(self._device()).eval()
         with self._model_lock:
             self._models[key] = model
             while len(self._models) > 8:
@@ -188,7 +219,9 @@ class LensRuntime:
         from .model import make_batch
 
         with torch.inference_mode():
-            outputs = model(make_batch([state], [snapshot], [actions], [pre], self.cfg))
+            batch = make_batch([state], [snapshot], [actions], [pre], self.cfg)
+            device = next(model.parameters()).device
+            outputs = model({name: tensor.to(device) for name, tensor in batch.items()})
         if any(not torch.isfinite(v).all() for v in outputs.values()):
             raise ValueError("nonfinite Lens output")
         return outputs
@@ -202,6 +235,11 @@ class LensRuntime:
         snapshot = self.store.retrieve(state, self.cfg)
         pre = Intervention()
         checkpoint_id = "untrained"
+        token_budget = (
+            self.cfg.max_memory
+            if self.cfg.attention_backend == "legacy"
+            else self.cfg.memory_tokens
+        )
         try:
             model, checkpoint_id = self._load_model(
                 state.scope, decision_time=state.observed_at
@@ -212,16 +250,26 @@ class LensRuntime:
                 ranking = (
                     coarse["relevance"][0].sigmoid().tolist()[: len(snapshot.memories)]
                 )
-                indices = sorted(
-                    range(len(ranking)),
-                    key=lambda i: (-ranking[i], snapshot.memories[i].experience_id),
-                )[: self.cfg.max_memory]
-                snapshot = retained_snapshot(snapshot, indices)
-                output = self._forward(model, state, snapshot, [])
+                if len(snapshot.memories) > token_budget:
+                    # Keep the historical sequence order within the learned
+                    # shortlist; masked landmark windows then stay meaningful.
+                    indices = sorted(
+                        sorted(
+                            range(len(ranking)),
+                            key=lambda i: (
+                                -ranking[i],
+                                snapshot.memories[i].experience_id,
+                            ),
+                        )[:token_budget]
+                    )
+                    snapshot = retained_snapshot(snapshot, indices)
+                    output = self._forward(model, state, snapshot, [])
+                else:
+                    output = coarse
             else:
                 snapshot = retained_snapshot(
                     snapshot,
-                    list(range(min(self.cfg.max_memory, len(snapshot.memories)))),
+                    list(range(min(token_budget, len(snapshot.memories)))),
                 )
             if self.cfg.mode == "off":
                 pre = Intervention(reason="DISABLED_PURE_NO_OP")
@@ -236,11 +284,15 @@ class LensRuntime:
             elif output is not None:
                 uncertainty = output["pre_uncertainty"][0].item()
                 relevance = output["relevance"][0].sigmoid().tolist()
+                order = sorted(
+                    range(len(snapshot.memories)),
+                    key=lambda i: (-relevance[i], snapshot.memories[i].experience_id),
+                )
                 selected = tuple(
-                    m.experience_id
-                    for i, m in enumerate(snapshot.memories)
+                    snapshot.memories[i].experience_id
+                    for i in order
                     if relevance[i] >= self.cfg.relevance_threshold
-                    and m.reliability > 0
+                    and snapshot.memories[i].reliability > 0
                 )[:2]
                 if selected and uncertainty <= self.cfg.max_uncertainty:
                     pre = Intervention(
@@ -260,7 +312,7 @@ class LensRuntime:
             # Keep the original causal snapshot for later audit/training, but a
             # broken local model never changes the base request or tool set.
             snapshot = retained_snapshot(
-                snapshot, list(range(min(self.cfg.max_memory, len(snapshot.memories))))
+                snapshot, list(range(min(token_budget, len(snapshot.memories))))
             )
             return LensDecision(
                 state, snapshot, Intervention(reason="LOCAL_FAILURE")
@@ -432,9 +484,14 @@ class LensRuntime:
             from .learner import train_model
             from .model import create_model
 
-            model, _ = self._load_model(scope)
+            initialization = "checkpoint"
+            try:
+                model, _ = self._load_model(scope)
+            except IncompatibleArchitecture:
+                model = None
             if model is None:
-                model = create_model(self.cfg)
+                model = create_model(self.cfg).to(self._device())
+                initialization = "fresh_architecture"
             trained, metrics = train_model(model, self.cfg, samples)
             if not all(
                 math.isfinite(float(value))
@@ -488,6 +545,9 @@ class LensRuntime:
                 "checkpoint_id": checkpoint_id,
                 **metrics,
                 "parameters": trained.parameter_counts(),
+                "attention": trained.attention_inventory(),
+                "initialization": initialization,
+                "device": str(next(trained.parameters()).device),
             }
         except ImportError:
             self.last_error = "PYTORCH_UNAVAILABLE"
@@ -541,6 +601,16 @@ class LensRuntime:
         )
         return {
             "mode": self.cfg.mode,
+            "attention_backend": self.cfg.attention_backend,
+            "device": self.cfg.device,
+            "mita_layers": (
+                0
+                if self.cfg.attention_backend in {"legacy", "gqa"}
+                else self.cfg.blocks - int(self.cfg.attention_backend == "hybrid")
+            ),
+            "attention_layers": 1
+            if self.cfg.attention_backend == "legacy"
+            else self.cfg.blocks,
             "pre_enabled": self.cfg.pre_enabled,
             "post_api_enabled": self.cfg.post_enabled,
             "astrbot_post_connected": False,

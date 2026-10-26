@@ -1,4 +1,4 @@
-# V0.2.0 Neural Lens 使用与 API 兼容约定
+# V0.2.1 Neural Lens 使用与 API 兼容约定
 
 本分支在 V0.1.2 上增量搭建，分支为 `codex/v0.2.0-neural-lens`。原来的插件名、`JitRLLearner` 入口、AstrBot 版本范围、两个事件钩子、`jitrl_recall` 工具、配置键和 Web 路由均保留。`neural.mode` 默认 `off`，旧配置无需修改，也不要求安装 PyTorch；其行为继续由 V0.1 的 `apply_mode`、`learning`、`retrieval`、`policy` 等控制。
 
@@ -22,6 +22,11 @@
 {
   "neural": {
     "mode": "shadow",
+    "attention_backend": "mita",
+    "mita_landmarks": 8,
+    "mita_topk": 16,
+    "mita_query_chunk": 64,
+    "memory_tokens": 128,
     "pre_enabled": true,
     "post_enabled": false,
     "auto_train": false,
@@ -39,6 +44,8 @@
 
 切回 `neural.mode: off` 并重载，即恢复 V0.1 路径。缺少 PyTorch、空库、未训练模型、损坏或不匹配的 checkpoint 都不会阻断合法基础请求；训练命令报告未发布原因。插件不会自动安装依赖或下载模型权重。
 
+`neural.device` 可设 `cpu`（默认）、`cuda` 或 `auto`。显式 `cuda` 在无可用 GPU 时会报告错误，不偷偷更换设备；`auto` 按可用设备选择。训练与推理都使用选择的设备，权重可在 CPU/CUDA 间加载，设备不改变 checkpoint 架构身份。设置修改后重载插件；模型初始化不重设宿主 CUDA 随机数，插件不修改宿主全局线程数。
+
 ## 2. 已实现的模型和数据链路
 
 ```mermaid
@@ -46,9 +53,10 @@ flowchart LR
   S[当前请求与已观察工具结果] --> C[版本化状态与事件]
   C --> E[冻结词法检索 + 结构召回]
   E --> R[同会话已结算经验快照]
-  C --> N[Engram 表 + 四层 MLP]
+  C --> N[状态 + Engram 事件 + 经验 tokens]
   R --> N
-  N --> F[经验编译器 + 动态低秩层 + GQA]
+  N --> M[四层 MiTA + SwiGLU]
+  M --> F[经验编译器 + 动态低秩层]
   F --> P[PRE 受控历史提示]
   P --> L[冻结远端 LLM]
   L --> A[宿主执行与权限校验]
@@ -58,9 +66,13 @@ flowchart LR
   T --> N
 ```
 
-默认本地骨架为 384 hidden、4 个 RMSNorm/SwiGLU 模块、128 维经验概况、8 个 rank-8 动态基底、单 query 的 6Q/2KV memory GQA。Engram 使用结构事件 suffix 2/3-gram、多头确定性哈希、上下文门控与因果深度卷积。参数表是慢权重，SQLite 经验是事实，fast coefficients 是每次请求重新计算的临时条件值，三者分开。
+默认本地骨架为 384 hidden、四层 MiTA attention + RMSNorm/SwiGLU、128 维经验概况和 8 个 rank-8 动态基底。状态、最多 32 个事件和最多 128 条经验组成 token 序列；MiTA 逐层以 8 个 landmarks 压缩全体有效 KV、构造每组至多 16 个原始 KV 的可复用 experts，并让每个 query 路由到一个 expert，与全部共享压缩 KV 做一次联合 softmax。6Q/2KV 投影是分组 KV 扩展，默认不再保留旧的单 query GQA 层。完整公式与实现差异见 [MiTA 研究说明](mita-backbone-research.md)。
 
-检索基线使用冻结的带符号字符 N-gram 特征和结构重合度，在最近至多 2048 条有效经验中作有界精确扫描，合并最多 128 条粗选，再按学习到的结构相关性代理保留最多 32 条。这里没有部署语义 embedding 服务或 ANN 索引。实际参数规模会在训练结果和 smoke 报告中分别列出 active neural parameters、Engram 表和冻结编码器参数；SQLite 与 checkpoint 文件占用独立存在。
+Engram 继续使用结构事件 suffix 2/3-gram、多头确定性哈希、上下文门控与因果深度卷积。参数表是慢权重，SQLite 经验是事实，fast coefficients 是每次请求重新计算的临时条件值，三者分开；低秩 adapter 与真正的 MiTA 注意力是不同模块。
+
+检索基线使用冻结的带符号字符 N-gram 特征和结构重合度，在最近至多 2048 条有效经验中作有界精确扫描，合并最多 128 条粗选；神经主干保留至多 `memory_tokens` 条，默认 128，证据渲染仍最多两条且有独立文本预算。`legacy` 仍保留原 32 条上限。这里没有部署语义 embedding 服务或 ANN 索引。默认 MiTA 模型约 735 万参数（其中 Engram 表约 26 万），SQLite 与 checkpoint 文件占用独立存在。
+
+后端选项：`mita` 为默认四层 MiTA；`hybrid` 为前三层 MiTA、末层完整 GQA；`gqa` 为同样 token、深度和投影参数的四层完整 GQA；`legacy` 保留 V0.2.0 单 query GQA + 四个向量 MLP。只有前三者是可直接比较的等深 token 主干，不能把相对 legacy 增加容量的变化写成 MiTA 提速。
 
 本地训练使用已执行动作的条件回报 Huber loss、实际 PRE 的条件回报 loss、结构动作匹配相关性代理、已观察残差的不确定性代理和正则项。未执行候选没有 return 标签。shadow 的 PRE 只有 NO_OP 数据，active 的首次证据选择依靠受限的相关性规则；它不意味着已经学会某个干预的因果增益。
 
@@ -125,6 +137,8 @@ settlement 追加历史事件，读取按截止时间可见的最新有效事件
 - `/jitrl lens train`：管理员训练当前会话的本地模型。
 - `/jitrl lens reset confirm`：管理员删除当前会话神经事实、快照和全部已登记权重，并使旧后台写入失效。
 
+V0.2.0 升级时无需清空神经库或重建历史快照。默认 MiTA 检测到旧主干权重时拒绝误加载，`/jitrl lens train` 会用既有因果快照训练新的 MiTA 权重，保留旧 checkpoint。若要继续旧模型，显式设 `neural.attention_backend: legacy`；只有旧参数布局匹配时才可加载。切换 MiTA/hybrid/GQA 的 checkpoint 也需要严格匹配，不使用 `strict=False` 静默补权重。
+
 **旧 `forget`、`checkpoint`、`rollback`、`export` 与对应面板操作只管理 V0.1 经验库。** 它们不会被改成隐式删除新模型；也不构成神经模型的备份或恢复。要删除神经知识，请显式执行 `lens reset confirm`。旧检查点可继续在 V0.1 数据上使用。本版本尚无神经 checkpoint 回滚 UI、神经库导入导出和自动磁盘轮换；长期运行需管理数据目录容量。reset 是逻辑删除，不承诺数据库空闲页、备份介质或已发送远端提示的物理擦除。
 
 ## 5. 验证与复现
@@ -137,12 +151,15 @@ python -m ruff check .
 python -m ruff format --check .
 node --test tests/test_dashboard.cjs
 python scripts/neural_lens.py smoke --steps 20 --json benchmarks/neural-smoke.json
+python scripts/neural_lens.py smoke --steps 20 --device cuda --json benchmarks/neural-smoke-cuda.json
+python scripts/bench_mita.py --model --json benchmarks/mita-attention.json
+python scripts/ablate_mita.py --json benchmarks/mita-memory-ablation.json
 python scripts/build_release.py
 ```
 
 Windows 上若 pytest 的系统临时目录不可用，先创建 `.tmp-pytest`，再使用 `--basetemp=.tmp-pytest/run`。未安装 PyTorch 的环境会跳过张量/训练测试，其余核心与存储/钩子检查继续运行；真实 AstrBot 集成测试需要实际安装宿主。
 
-smoke 使用正式 384d/4-block 模型、一次性 SQLite 与明确标为 synthetic 的回报，验证采集→历史快照→真实梯度更新→保存/重载→未来时点候选评分；不会发起 LLM 调用或修改真实插件数据。演示使用宽松门控覆盖路径，不能作为部署阈值建议或真实成功率证据。`benchmarks/neural-smoke.json` 只记录合成验证结果。
+smoke 默认使用正式 384d/4-block MiTA 模型、一次性 SQLite 与明确标为 synthetic 的回报，验证采集→历史快照→真实梯度更新→保存/重载→未来时点候选评分；`--backend legacy|gqa|hybrid` 可选择对照。不会发起 LLM 调用或修改真实插件数据。演示使用宽松门控覆盖路径，不能作为部署阈值建议或真实成功率证据。`benchmarks/neural-smoke.json` 只记录合成验证结果。
 
 离线训练真实采集数据时必须停止对同一数据目录的宿主写入，显式指定神经目录和 scope：
 
@@ -150,5 +167,7 @@ smoke 使用正式 384d/4-block 模型、一次性 SQLite 与明确标为 synthe
 python scripts/neural_lens.py status --data-dir <path-to-neural-directory> --scope <private-scope>
 python scripts/neural_lens.py train --data-dir <path-to-neural-directory> --scope <private-scope> --steps 20
 ```
+
+离线命令可追加 `--backend mita|hybrid|gqa|legacy` 与 `--device cpu|cuda|auto`；CPU/CUDA 测试报告是独立的运行记录。
 
 禁止把几个私有 scope 合并成一次训练。比较 V0.1、shadow 与 active 的真实效果时，按时间/任务分割、固定 provider 与评估协议，并记录决策时确实已发布的模型版本；建议消融见研究说明。

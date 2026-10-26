@@ -1,8 +1,9 @@
-"""Local neural controller inspired by Engram and fast-weight memory designs.
+"""Local token backbone with genuine MiTA compression and sparse expert routing.
 
 No tensor is sent into the remote model. This is a short-input discriminator,
-not an implementation of MiTA attention or a remote LoRA adapter. Boolean masks
-in this module use ``True`` for valid positions.
+with a four-layer MiTA backbone by default. The legacy one-query GQA model
+remains available for weight compatibility and ablation. Boolean masks use
+``True`` for valid positions.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from .attention import GroupedSelfAttention, MiTAAttention
 from .config import LensConfig
 from .contracts import VERSIONS, RetrievalSnapshot, StateRecord
 from .encoding import engram_addresses, frozen_embedding, state_embedding
@@ -164,8 +166,25 @@ class FastAdapter(nn.Module):
         return residual, alpha
 
 
+class LensTokenBlock(nn.Module):
+    """Pre-norm token interaction followed by a SwiGLU residual block."""
+
+    def __init__(self, cfg: LensConfig, backend: str) -> None:
+        super().__init__()
+        self.backend = backend
+        self.norm = RMSNorm(cfg.hidden_dim)
+        self.attention = (
+            MiTAAttention(cfg) if backend == "mita" else GroupedSelfAttention(cfg)
+        )
+        self.mlp = SwiGLUBlock(cfg.hidden_dim)
+
+    def forward(self, tokens: Tensor, valid: Tensor) -> Tensor:
+        tokens = tokens + self.attention(self.norm(tokens), valid) * 0.5
+        return self.mlp(tokens).masked_fill(~valid.unsqueeze(-1), 0.0)
+
+
 class LensModel(nn.Module):
-    """Mostly-MLP local Lens with explicit PRE and candidate-conditioned POST."""
+    """Local MiTA backbone with explicit PRE and candidate-conditioned POST."""
 
     def __init__(self, cfg: LensConfig) -> None:
         super().__init__()
@@ -185,8 +204,25 @@ class LensModel(nn.Module):
         self.summary = nn.Linear(d, cfg.summary_dim)
         self.empty_summary = nn.Parameter(torch.zeros(cfg.summary_dim))
         self.adapter = FastAdapter(cfg)
-        self.attention = GroupedMemoryAttention(cfg)
-        self.blocks = nn.ModuleList(SwiGLUBlock(d) for _ in range(cfg.blocks))
+        if cfg.attention_backend == "legacy":
+            # Exact v0.2.0 parameter names and tensor path are retained.
+            self.attention = GroupedMemoryAttention(cfg)
+            self.blocks = nn.ModuleList(SwiGLUBlock(d) for _ in range(cfg.blocks))
+        else:
+            self.event_encoder = nn.Sequential(
+                nn.Linear(cfg.embedding_dim, d), RMSNorm(d)
+            )
+            self.token_types = nn.Embedding(3, d)
+            self.event_positions = nn.Embedding(cfg.max_events, d)
+            backends = ["mita"] * cfg.blocks
+            if cfg.attention_backend == "gqa":
+                backends = ["gqa"] * cfg.blocks
+            elif cfg.attention_backend == "hybrid":
+                # One global GQA anchor, all remaining interactions use MiTA.
+                backends[-1] = "gqa"
+            self.blocks = nn.ModuleList(
+                LensTokenBlock(cfg, backend) for backend in backends
+            )
         self.output_norm = RMSNorm(d)
         self.pre_embedding = nn.Embedding(len(_PRE_INDEX), 16)
         self.pre_head = nn.Sequential(
@@ -208,16 +244,47 @@ class LensModel(nn.Module):
             1, keepdim=True
         ).clamp_min(1)
         valid = batch["memory_mask"]
+        memory_states = batch["memory_states"].masked_fill(~valid.unsqueeze(-1), 0.0)
+        memory_actions = batch["memory_actions"].masked_fill(~valid.unsqueeze(-1), 0.0)
+        memory_meta = batch["memory_meta"].masked_fill(~valid.unsqueeze(-1), 0.0)
         memory = self.memory_encoder(
             torch.cat(
-                (batch["memory_states"], batch["memory_actions"], batch["memory_meta"]),
+                (memory_states, memory_actions, memory_meta),
                 -1,
             )
         )
         memory = memory * valid.unsqueeze(-1)
+        if self.cfg.attention_backend != "legacy":
+            event_count = events.shape[1]
+            position = torch.arange(event_count, device=state.device)
+            event_features = batch["event_features"].masked_fill(
+                ~batch["event_mask"].unsqueeze(-1), 0.0
+            )
+            event_tokens = self.event_encoder(event_features) + events
+            event_tokens = (
+                event_tokens
+                + self.event_positions(position).unsqueeze(0)
+                + self.token_types.weight[1]
+            )
+            tokens = torch.cat(
+                (
+                    state.unsqueeze(1) + self.token_types.weight[0],
+                    event_tokens,
+                    memory + self.token_types.weight[2],
+                ),
+                dim=1,
+            )
+            token_mask = torch.cat(
+                (torch.ones_like(valid[:, :1]), batch["event_mask"], valid), dim=1
+            )
+            tokens = tokens.masked_fill(~token_mask.unsqueeze(-1), 0.0)
+            for block in self.blocks:
+                tokens = block(tokens, token_mask)
+            state = tokens[:, 0]
+            memory = tokens[:, 1 + event_count :].masked_fill(~valid.unsqueeze(-1), 0.0)
         query = state.unsqueeze(1).expand_as(memory)
         compiled = self.compiler(
-            torch.cat((query, memory, query * memory, batch["memory_meta"]), -1)
+            torch.cat((query, memory, query * memory, memory_meta), -1)
         )
         relevance = self.relevance(compiled).squeeze(-1)
         weights = masked_softmax(relevance, valid)
@@ -226,13 +293,17 @@ class LensModel(nn.Module):
         summary = torch.where(has_memory.unsqueeze(-1), summary, self.empty_summary)
         residual, alpha = self.adapter(state, summary, has_memory)
         state = state + residual
-        state = state + self.attention(state, memory, valid)
-        for block in self.blocks:
-            state = block(state)
+        if self.cfg.attention_backend == "legacy":
+            state = state + self.attention(state, memory, valid)
+            for block in self.blocks:
+                state = block(state)
         state = self.output_norm(state)
         pre = self.pre_embedding(batch["pre_index"])
         pre_output = self.pre_head(torch.cat((state, summary, pre), -1))
-        candidates = self.candidate_encoder(batch["candidates"])
+        candidate_features = batch["candidates"].masked_fill(
+            ~batch["candidate_mask"].unsqueeze(-1), 0.0
+        )
+        candidates = self.candidate_encoder(candidate_features)
         count = candidates.shape[1]
         expanded = state.unsqueeze(1).expand(-1, count, -1)
         candidate_output = self.candidate_head(
@@ -257,6 +328,22 @@ class LensModel(nn.Module):
             "alpha": alpha,
             "adapter_residual": residual,
             "hidden": state,
+        }
+
+    def attention_inventory(self) -> dict[str, int | str]:
+        if self.cfg.attention_backend == "legacy":
+            return {
+                "backend": "legacy",
+                "mita_layers": 0,
+                "gqa_layers": 1,
+                "total_attention_layers": 1,
+            }
+        mita = sum(isinstance(block.attention, MiTAAttention) for block in self.blocks)
+        return {
+            "backend": self.cfg.attention_backend,
+            "mita_layers": mita,
+            "gqa_layers": len(self.blocks) - mita,
+            "total_attention_layers": len(self.blocks),
         }
 
     def parameter_counts(self) -> dict[str, int]:
@@ -368,6 +455,7 @@ def make_batch(
             size, event_count, cfg.engram_heads * 2, dtype=torch.long
         ),
         "event_mask": torch.zeros(size, event_count, dtype=torch.bool),
+        "event_features": torch.zeros(size, event_count, cfg.embedding_dim),
         "memory_states": torch.zeros(size, memory_count, cfg.embedding_dim),
         "memory_actions": torch.zeros(size, memory_count, cfg.embedding_dim),
         "memory_meta": torch.zeros(size, memory_count, _META_DIM),
@@ -379,6 +467,10 @@ def make_batch(
     for row, (state, snapshot) in enumerate(zip(states, snapshots)):
         batch["events"][row, : len(addresses[row])] = torch.tensor(addresses[row])
         batch["event_mask"][row, : min(len(state.events), cfg.max_events)] = True
+        for column, event in enumerate(state.events[-cfg.max_events :]):
+            batch["event_features"][row, column] = torch.tensor(
+                frozen_embedding(event, cfg.embedding_dim)
+            )
         for column, memory in enumerate(snapshot.memories):
             batch["memory_states"][row, column] = torch.tensor(
                 state_embedding(memory.state, cfg.embedding_dim)

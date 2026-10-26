@@ -5,6 +5,20 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本规则：常规功能和修复递增末位补丁号；大规模架构改进才递增中间版本号。
 
+## [0.2.1] - 2026-10-27
+
+### 真正的 MiTA 神经主干
+
+- 把初版单 state query GQA + 四个向量 MLP 升级为状态、事件与经验 token 的多层交互主干；默认四层 attention 全部使用 MiTA，保留四层 GQA、3 MiTA + 1 GQA 和原 `legacy` 主干作明确对照。
+- 独立实现论文式 (5)-(12) 的 landmark 压缩、可复用 Top-k KV experts、s=1 query 路由和共享/路由 KV 的联合 softmax。使用 mask-aware 一维 pooling、6Q/2KV 投影与 query 分块 gather，不依赖 FlashAttention；不把普通检索或低秩 adapter 当作 MiTA。
+- 默认内部记忆 token 预算扩至 128，证据文本预算独立；mask 在编码前清理无效槽，避免 NaN padding 污染输出和梯度。增加公式 oracle、gradcheck、路由复用、无 N×N QK、各层实际执行/梯度与 API 回归。
+- 新增后端、landmark/top-k/chunk/记忆预算配置和状态展示。架构参数纳入 checkpoint/cache 身份，旧经验与精确历史快照保持原样；旧权重可在 legacy 严格加载，升级 MiTA 从历史快照重训。
+- 增加显式 CPU/CUDA/auto 设备选择，默认 CPU；训练和服务在选择设备上进行，checkpoint 可跨设备加载，不重设宿主随机状态或线程设置。
+- 完成正式 384d、四层 MiTA 的 CPU/CUDA 训练闭环。新增匹配权重的算子/主干延迟与内存基准，以及独立规则绑定记忆任务消融；区分算术稀疏、实际运行速度、训练降损与留出集任务效果，保存负面结果。
+- 保留原插件 API、旧配置默认值、临时用户上下文注入和独立分支；以补丁版迭代 V0.2 神经主干，不改动 V0.1 分支或 `v0.2.0` 标签。
+
+[0.2.1]: https://github.com/2841649220/astrbot_plugin_jitrl/releases/tag/v0.2.1
+
 ## [0.2.0] - 2026-10-27
 
 ### 可选神经架构

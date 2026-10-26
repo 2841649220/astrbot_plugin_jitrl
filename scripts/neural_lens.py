@@ -34,7 +34,7 @@ def bootstrap() -> None:
     sys.modules["astrbot.api"] = api
 
 
-async def smoke(steps: int) -> dict:
+async def smoke(steps: int, backend: str = "mita", device: str = "cpu") -> dict:
     import torch
 
     from jitrl.neural.config import LensConfig
@@ -55,6 +55,8 @@ async def smoke(steps: int) -> dict:
         max_uncertainty=2.0,
         relevance_threshold=0.0,
         evidence_tokens=256,
+        attention_backend=backend,
+        device=device,
     )
     scope = "synthetic-private-scope"
     with tempfile.TemporaryDirectory(prefix="jitrl-neural-smoke-") as folder:
@@ -135,9 +137,13 @@ async def smoke(steps: int) -> dict:
                     "kv_heads": cfg.kv_heads,
                     "bases": cfg.bases,
                     "rank": cfg.rank,
+                    "attention_backend": cfg.attention_backend,
+                    "mita_landmarks": cfg.mita_landmarks,
+                    "mita_topk": cfg.mita_topk,
+                    "memory_tokens": cfg.memory_tokens,
                 },
                 "torch_version": str(torch.__version__),
-                "device": "cpu",
+                "device": trained["device"],
                 "training": {k: v for k, v in trained.items() if k != "checkpoint_id"},
                 "future_synthetic_candidate_mse": sum(squared_errors)
                 / len(squared_errors),
@@ -152,7 +158,7 @@ async def smoke(steps: int) -> dict:
 
 async def run(args: argparse.Namespace) -> dict:
     if args.command == "smoke":
-        return await smoke(args.steps)
+        return await smoke(args.steps, args.backend, args.device)
     from jitrl.neural.config import LensConfig
     from jitrl.neural.runtime import LensRuntime
 
@@ -161,7 +167,12 @@ async def run(args: argparse.Namespace) -> dict:
         raise ValueError(
             "--data-dir must contain an existing neural.sqlite3; legacy databases are not imported"
         )
-    cfg = replace(LensConfig(), train_steps=args.steps)
+    cfg = replace(
+        LensConfig(),
+        train_steps=args.steps,
+        attention_backend=args.backend,
+        device=args.device,
+    )
     runtime = LensRuntime(root, cfg)
     try:
         return (
@@ -181,11 +192,19 @@ def main() -> int:
     )
     demo.add_argument("--steps", type=int, default=20)
     demo.add_argument("--json", type=Path)
+    demo.add_argument(
+        "--backend", choices=("mita", "hybrid", "gqa", "legacy"), default="mita"
+    )
+    demo.add_argument("--device", choices=("cpu", "cuda", "auto"), default="cpu")
     for name in ("train", "status"):
         command = sub.add_parser(name)
         command.add_argument("--data-dir", required=True)
         command.add_argument("--scope", required=True)
         command.add_argument("--steps", type=int, default=20)
+        command.add_argument(
+            "--backend", choices=("mita", "hybrid", "gqa", "legacy"), default="mita"
+        )
+        command.add_argument("--device", choices=("cpu", "cuda", "auto"), default="cpu")
     args = parser.parse_args()
     if not 1 <= args.steps <= 1000:
         parser.error("--steps must be in [1,1000]")

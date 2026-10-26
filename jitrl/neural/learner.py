@@ -103,8 +103,19 @@ def train_model(
         samples[start : start + cfg.batch_size]
         for start in range(0, len(samples), cfg.batch_size)
     ]
-    encoded = [_batch(chunk, cfg) for chunk in chunks]
-    updated = copy.deepcopy(model).cpu()
+    device = next(model.parameters()).device
+    encoded = []
+    for chunk in chunks:
+        batch, targets, reliability, relevance = _batch(chunk, cfg)
+        encoded.append(
+            (
+                {name: tensor.to(device) for name, tensor in batch.items()},
+                targets.to(device),
+                reliability.to(device),
+                relevance.to(device),
+            )
+        )
+    updated = copy.deepcopy(model).to(device)
     anchor = [parameter.detach().clone() for parameter in updated.parameters()]
     parameter_count = sum(p.numel() for p in updated.parameters())
 

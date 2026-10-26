@@ -1,24 +1,29 @@
 # JitRL 持续学习 · astrbot_plugin_jitrl
 
 [![CI](https://github.com/2841649220/astrbot_plugin_jitrl/actions/workflows/ci.yml/badge.svg)](https://github.com/2841649220/astrbot_plugin_jitrl/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.2.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.2.1-blue)](CHANGELOG.md)
 
 > 在 V0.1.2 经验学习基础上，增加可选的本地 Neural Lens。远端大模型始终冻结；神经扩展默认关闭，旧配置与旧 API 保持兼容。
 >
-> V0.1 路径无需训练；V0.2 神经路径使用可选 PyTorch 训练会话隔离的小模型。方案借鉴 JitRL、Engram 和 MiTA，属于独立研究实现，尚无真实任务性能提升结论。
+> V0.1 路径无需训练；V0.2 神经路径使用可选 PyTorch 训练会话隔离的小模型。当前默认四层 token 注意力全部使用真正的 MiTA 压缩与路由机制，结合 JitRL 经验回报和 Engram 条件模式记忆。
 
-## V0.2.0 快速入口
+## V0.2.1 快速入口
 
 开发分支：`codex/v0.2.0-neural-lens`，基于 V0.1.2；没有合入 V0.1 分支。现有插件入口、配置键、指令、经验库、检查点及面板路由继续保留。`neural.mode: off` 为默认值，使用原来的行为，无需安装额外依赖。
 
 - [神经架构的研究依据与论文边界](docs/neural-lens-research.md)
+- [MiTA 主干：公式落地、4/4 层替换与研究实验](docs/mita-backbone-research.md)
 - [启用方法、API 合同、数据与权重管理](docs/neural-lens.md)
 - 开启采集：显式安装 `requirements-neural.txt`，配置 `neural.mode: shadow`；管理员用 `/jitrl lens train` 训练，再切为 `active`。
-- 模型：384 hidden、4 个 MLP 模块、事件 Engram 条件表、经验编译器、rank-8 动态低秩基底和 6Q/2KV memory GQA；冻结检索特征、回报经验库和神经参数分开管理。
+- 模型：384 hidden、4 层 MiTA + SwiGLU、事件 Engram 条件表、经验编译器和 rank-8 动态低秩基底；状态、事件和最多 128 条历史经验形成 token 序列。MiTA 真正构造 landmark 压缩 KV、可复用 Top-k KV experts 和每个 query 的路由，并对拼接分支共同归一化。
+- `neural.attention_backend` 默认 `mita`（4/4 层）；可显式选择 `hybrid`（3/4）、`gqa`（匹配的四层完整注意力对照）或 `legacy`（V0.2.0 原单 query 主干）。V0.2.0 经验与快照继续使用，升级 MiTA 需重训本地权重。
+- `neural.device` 支持 CPU、CUDA 或 auto，默认 CPU。正式 384d/四层 MiTA 已分别完成 CPU 与 CUDA 的训练、保存重载和候选评分闭环。
 - 已接入 AstrBot 的 PRE 临时提示与完成后采集；POST 为独立的候选评分 API，仍需上游候选生成和执行前硬校验。
 - 保留 `/jitrl feedback` 与原反馈关键词入口；神经模式将反馈作为追加结算，保留旧奖励历史。旧面板的备份、删除、导出和回退只管理 V0.1 经验；神经事实和模型使用 `/jitrl lens reset confirm` 独立重置。
 
 开发仓库可运行 `python scripts/neural_lens.py smoke --steps 20` 验证正式尺寸模型的采集、训练、原子检查点与候选评分闭环。此演示为合成数据，不代表真实任务收益；结果见 [smoke 报告](benchmarks/neural-smoke.json)。
+
+CPU 算子与完整主干对照见 [MiTA 基准](benchmarks/mita-attention.json)，复现命令 `python scripts/bench_mita.py --model`。当前纯 PyTorch CPU 路径尚未取得相对优化 GQA 的提速，稀疏交互数量与实际延迟分开报告。
 
 以下原有算法与配置说明描述 `neural.mode: off` 的 V0.1 兼容路径。其中“无梯度更新”指该路径及冻结的远端模型，不适用于新增本地神经训练器。
 

@@ -136,7 +136,6 @@ def test_candidate_conditioning_and_all_major_modules_receive_gradient(cfg):
         model.memory_encoder,
         model.compiler,
         model.adapter,
-        model.attention,
         model.blocks,
         model.candidate_encoder,
         model.candidate_head,

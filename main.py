@@ -3,6 +3,7 @@
 V0.2.0 adds a scope-isolated neural controller in jitrl.neural. The remote
 LLM remains frozen; only the local optional PyTorch model is trained. The
 legacy path described below is selected when neural.mode is off.
+V0.2.1 makes all four local token-attention blocks genuine MiTA by default.
 
 This plugin implements *Just-In-Time Reinforcement Learning* (Li et al.,
 ICML 2026) on top of AstrBot's agent pipeline. The paper keeps the model
@@ -1388,6 +1389,7 @@ class JitRLLearner(Star):
                 status = await runtime.status(scope)
                 yield event.plain_result(
                     f"Neural Lens：{status['mode']}；PyTorch：{status['torch_installed']}\n"
+                    f"主干配置：{status.get('attention_backend', self.cfg.neural.attention_backend)}；MiTA {status.get('mita_layers', 0)}/{status.get('attention_layers', 0)} 层；设备 {status.get('device', self.cfg.neural.device)}\n"
                     f"决策 {status['decisions']} / 执行事实 {status['executions']} / 回报事件 {status['settlements']}\n"
                     f"检查点：{status['checkpoint_id']}；错误：{status['last_error'] or '无'}\n"
                     "AstrBot 已接入 PRE；POST 为独立候选评分 API。\n"
@@ -1856,7 +1858,20 @@ class JitRLLearner(Star):
                     "enabled": self.cfg.enabled,
                     "neural": await self._neural.status()
                     if self._neural is not None
-                    else {"mode": self.cfg.neural.mode},
+                    else {"mode": "off"}
+                    if self.cfg.neural.mode == "off"
+                    else {
+                        "mode": self.cfg.neural.mode,
+                        "attention_backend": self.cfg.neural.attention_backend,
+                        "device": self.cfg.neural.device,
+                        "mita_layers": 0
+                        if self.cfg.neural.attention_backend in {"legacy", "gqa"}
+                        else self.cfg.neural.blocks
+                        - int(self.cfg.neural.attention_backend == "hybrid"),
+                        "attention_layers": 1
+                        if self.cfg.neural.attention_backend == "legacy"
+                        else self.cfg.neural.blocks,
+                    },
                     "apply_mode": self.cfg.apply_mode,
                     "total": total,
                     "stats": dict(self._stats),

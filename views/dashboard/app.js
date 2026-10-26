@@ -80,6 +80,7 @@ function renderOverview(data) {
     : "模式 " + neural.mode + " · 决策 " + (neural.decisions || 0)
       + " / 执行事实 " + (neural.executions || 0) + " / 回报事件 " + (neural.settlements || 0)
       + " · PyTorch " + (neural.torch_installed === undefined ? "尚未检查" : (neural.torch_installed ? "已安装" : "未安装"))
+      + " · 主干配置 " + (neural.attention_backend || "mita") + "，MiTA " + (neural.mita_layers || 0) + "/" + (neural.attention_layers || 0) + " 层，设备 " + (neural.device || "cpu")
       + " · AstrBot PRE 已接入，POST 为独立评分 API。";
   const state = document.getElementById("chip-state");
   state.textContent = data.enabled ? "运行中" : "已停用";

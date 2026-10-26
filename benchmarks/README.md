@@ -63,3 +63,16 @@ python .tmp-baseline/src/scripts/bench_jitrl.py --no-checkpoints \
 - r=0.8 是插件默认值，也是论文 WebArena 的取值；r=0.5 属于放宽检索，成本更高是预期行为。
 - 复现前请保证没有其它重进程在跑；`benchmarks/baseline.json` 与 `after.json` 都保留了
   完整的分场景数据（含 p95、命中率、每次查询的邻居数）。
+# Neural Lens / MiTA 实验（V0.2.1）
+
+本目录同时保存原有 V0.1 检索基准和新增神经研究记录。新增结果均为本地合成工作负载，不能当作真实 Agent 成功率。
+
+| 记录 | 内容与复现 |
+|---|---|
+| `neural-smoke.json` / `neural-smoke-cuda.json` | 正式 384d、四层 MiTA、40 条合成经验、20 步训练；`python scripts/neural_lens.py smoke --device cpu` 或 `--device cuda` |
+| `mita-attention.json` | CPU fp32 算子和四种主干对照；`python scripts/bench_mita.py --lengths 32,128,512,1024 --model --json benchmarks/mita-attention.json` |
+| `mita-attention-cuda.json` | RTX 3050 Ti CUDA fp32，同步计时与分配器峰值；上一命令追加 `--device cuda` 并指定对应 JSON |
+| `mita-attention-cuda-fp16.json` | CUDA fp16 对照；追加 `--device cuda --dtype float16` |
+| `mita-memory-ablation.json` | 两个种子、三种等参数主干、独立规则绑定留出集，保留逐样本预测；`python scripts/ablate_mita.py --json benchmarks/mita-memory-ablation.json` |
+
+当前结果：正式 MiTA 模型可训练并能跨 CPU/CUDA 保存重载；纯 PyTorch MiTA 尚未在测量范围内优于优化 GQA 的运行时或显存表现。小型规则绑定实验在 100 步设置下未展示留出泛化。训练降损、机制正确性、稀疏交互数量和真实任务收益分开解释，完整协议与负面结果见 [MiTA 研究说明](../docs/mita-backbone-research.md)。

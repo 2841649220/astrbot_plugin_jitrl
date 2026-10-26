@@ -41,10 +41,20 @@ class LensConfig:
     max_events: int = 32
     return_scale: float = 6.0
     seed: int = 1729
+    attention_backend: str = "mita"
+    mita_landmarks: int = 8
+    mita_topk: int = 16
+    mita_query_chunk: int = 64
+    memory_tokens: int = 128
+    device: str = "cpu"
 
     def __post_init__(self) -> None:
         if self.mode not in {"off", "shadow", "active"}:
             raise ValueError("unknown neural mode")
+        if self.attention_backend not in {"mita", "hybrid", "gqa", "legacy"}:
+            raise ValueError("unknown attention backend")
+        if self.device not in {"cpu", "cuda", "auto"}:
+            raise ValueError("unknown neural device")
         for item in fields(self):
             value = getattr(self, item.name)
             if isinstance(value, float) and not math.isfinite(value):
@@ -61,6 +71,8 @@ class LensConfig:
                 raise ValueError(f"{name} must be in [0, 1]")
         if self.max_adjustment < 0 or self.max_memory > self.coarse_limit:
             raise ValueError("invalid memory/adjustment budget")
+        if self.memory_tokens > self.coarse_limit:
+            raise ValueError("memory token budget exceeds coarse retrieval limit")
 
     @classmethod
     def from_raw(cls, raw: Any) -> LensConfig:
@@ -70,6 +82,12 @@ class LensConfig:
         values: dict[str, Any] = {}
         mode = str(raw.get("mode", "off")).lower()
         values["mode"] = mode if mode in {"off", "shadow", "active"} else "off"
+        backend = str(raw.get("attention_backend", "mita")).lower()
+        values["attention_backend"] = (
+            backend if backend in {"mita", "hybrid", "gqa", "legacy"} else "mita"
+        )
+        device = str(raw.get("device", "cpu")).lower()
+        values["device"] = device if device in {"cpu", "cuda", "auto"} else "cpu"
         for name in ("pre_enabled", "post_enabled", "auto_train"):
             value = raw.get(name, getattr(base, name))
             values[name] = (
@@ -85,6 +103,10 @@ class LensConfig:
             "min_support": (1, 32),
             "evidence_tokens": (32, 256),
             "replay_limit": (32, 20000),
+            "mita_landmarks": (1, 32),
+            "mita_topk": (1, 64),
+            "mita_query_chunk": (1, 256),
+            "memory_tokens": (32, 128),
         }
         for name, (lo, hi) in ranges.items():
             try:
