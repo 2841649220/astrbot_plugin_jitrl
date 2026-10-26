@@ -1,12 +1,28 @@
 // JitRL dashboard view. Runs inside AstrBot's restricted plugin iframe and
 // talks to the plugin backend only through the AstrBotPluginView bridge.
+//
+// The host frame is sandboxed with `allow-scripts allow-forms allow-downloads`
+// and *without* `allow-modals`, so window.alert/confirm/prompt are silently
+// suppressed there (confirm() returns false). Destructive actions therefore use
+// an in-page two-step confirmation instead of a modal.
 
 const bridge = window.AstrBotPluginView || window.AstrBotPluginPage;
 const hint = document.getElementById("hint");
+const actionHint = document.getElementById("action-hint");
+const forgetButton = document.getElementById("btn-forget");
 
-function say(message, isError) {
+const FORGET_ARM_MS = 6000;
+let forgetArmed = false;
+let forgetTimer = null;
+
+function setHint(message, isError) {
   hint.textContent = message || "";
   hint.classList.toggle("err", Boolean(isError));
+}
+
+function sayAction(message, isError) {
+  actionHint.textContent = message || "";
+  actionHint.classList.toggle("err", Boolean(isError));
 }
 
 function num(value, digits) {
@@ -15,7 +31,8 @@ function num(value, digits) {
 }
 
 function signClass(value) {
-  if (typeof value !== "number" || !Number.isFinite(value) || value === 0) return "";
+  if (typeof value !== "number" || !Number.isFinite(value)) return "";
+  if (value === 0) return "";
   return value > 0 ? "pos" : "neg";
 }
 
@@ -23,7 +40,7 @@ async function apiGet(endpoint, params, fallback) {
   try {
     return await bridge.apiGet(endpoint, params);
   } catch (error) {
-    say(String((error && error.message) || error), true);
+    setHint(String((error && error.message) || error), true);
     return fallback;
   }
 }
@@ -179,10 +196,10 @@ function renderEpisodes(payload) {
 }
 
 async function refresh() {
-  say("正在加载…");
+  setHint("正在加载…");
   const overview = await apiGet("overview", {}, null);
   if (!overview) {
-    say("无法读取 JitRL 状态，请确认插件已加载且后端可用。", true);
+    setHint("无法读取 JitRL 状态，请确认插件已加载且后端可用。", true);
     return;
   }
   renderOverview(overview);
@@ -192,46 +209,65 @@ async function refresh() {
   renderCurve(curve);
   renderActions(actions);
   renderEpisodes(episodes);
-  say("数据库：" + (overview.db_path || "--"));
+  setHint("数据库：" + (overview.db_path || "--"));
 }
 
 async function downloadExport() {
   const button = document.getElementById("btn-export");
   button.disabled = true;
   try {
-    await bridge.download("export", "jitrl-export.json");
-    say("已开始下载导出文件。");
+    await bridge.download("export", {}, "jitrl-export.json");
+    sayAction("已开始下载导出文件。");
   } catch (error) {
-    say("导出失败：" + String((error && error.message) || error), true);
+    sayAction("导出失败：" + String((error && error.message) || error), true);
   } finally {
     button.disabled = false;
   }
 }
 
+function disarmForget() {
+  forgetArmed = false;
+  if (forgetTimer) clearTimeout(forgetTimer);
+  forgetTimer = null;
+  forgetButton.textContent = "清空记忆";
+  forgetButton.classList.remove("btn-armed");
+}
+
 async function forgetAll() {
-  if (!window.confirm("确定清空全部 JitRL 记忆？此操作不可撤销。")) return;
-  const button = document.getElementById("btn-forget");
-  button.disabled = true;
+  if (!forgetArmed) {
+    // Two-step confirmation: the iframe sandbox blocks modal dialogs, so the
+    // destructive action is guarded in-page and auto-disarms after a timeout.
+    forgetArmed = true;
+    forgetButton.textContent = "再次点击确认清空";
+    forgetButton.classList.add("btn-armed");
+    sayAction("清空全部记忆不可撤销，请再点一次确认（6 秒后自动取消）。");
+    if (forgetTimer) clearTimeout(forgetTimer);
+    forgetTimer = setTimeout(disarmForget, FORGET_ARM_MS);
+    return;
+  }
+  disarmForget();
+  forgetButton.disabled = true;
   try {
     const result = await bridge.apiPost("forget", { scope: "all" });
-    say("已删除 " + (result && result.removed ? result.removed : 0) + " 条经验。");
+    const removed = result && typeof result.removed === "number" ? result.removed : 0;
+    sayAction("已删除 " + removed + " 条经验。");
     await refresh();
   } catch (error) {
-    say("清空失败：" + String((error && error.message) || error), true);
+    sayAction("清空失败：" + String((error && error.message) || error), true);
   } finally {
-    button.disabled = false;
+    forgetButton.disabled = false;
   }
 }
 
 async function main() {
   if (!bridge) {
-    say("未检测到 AstrBot 插件视图桥接，无法加载数据。", true);
+    setHint("未检测到 AstrBot 插件视图桥接，无法加载数据。", true);
     return;
   }
   await bridge.ready();
   document.getElementById("btn-refresh").addEventListener("click", refresh);
   document.getElementById("btn-export").addEventListener("click", downloadExport);
-  document.getElementById("btn-forget").addEventListener("click", forgetAll);
+  forgetButton.addEventListener("click", forgetAll);
   await refresh();
 }
 
