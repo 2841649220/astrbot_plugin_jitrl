@@ -38,3 +38,11 @@ jobs:
         # The AstrBot integration tests skip themselves when AstrBot is not
         # installed, so the pure algorithm suite still runs on a bare runner.
         run: python -m pytest -q
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Test dashboard interactions
+        run: node --test tests/test_dashboard.cjs

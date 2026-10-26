@@ -64,6 +64,9 @@ _EVENT_EXTRA_KEY = "_jitrl_context"
 _INJECTED_KEY = "_jitrl_injected"
 """Guards against injecting the evidence block twice for one event."""
 
+_GENERATION_KEY = "_jitrl_memory_generation"
+"""Memory epoch in which an agent request started."""
+
 _STATE_CHAR_LIMIT = 800
 """Character budget of the abstracted state used for retrieval."""
 
@@ -134,6 +137,9 @@ class JitRLLearner(Star):
                 redact=self.cfg.memory.redact_secrets,
                 keep_episodes=self.cfg.memory.keep_episodes,
                 prune_strategy=self.cfg.memory.prune_strategy,
+                checkpoint_dir=self._db_path.parent / "checkpoints",
+                checkpoint_interval=self.cfg.memory.checkpoint_interval,
+                keep_checkpoints=self.cfg.memory.keep_checkpoints,
             )
             await bank.initialize()
             self._bank = bank
@@ -431,7 +437,9 @@ class JitRLLearner(Star):
             return
         if self._bank is None:
             return
-        updated = await self._bank.apply_user_feedback(episode_id, delta)
+        updated = await self._bank.apply_user_feedback(
+            episode_id, delta, expected_generation=self._bank.generation
+        )
         self._last_episode.pop(umo, None)
         logger.info(
             "[JitRL] user feedback applied: episode=%s delta=%+.1f rows=%d",
@@ -472,6 +480,8 @@ class JitRLLearner(Star):
             return
 
         umo = event.unified_msg_origin
+        generation = self._bank.generation
+        event.set_extra(_GENERATION_KEY, generation)
         user_text = (event.get_message_str() or req.prompt or "").strip()
 
         try:
@@ -550,6 +560,8 @@ class JitRLLearner(Star):
                 neighbors=neighbors,
                 max_chars=self.cfg.policy.max_hint_chars,
             )
+            if generation != self._bank.generation:
+                return
             if block:
                 req.system_prompt = (
                     f"{req.system_prompt}\n\n{block}" if req.system_prompt else block
@@ -629,12 +641,16 @@ class JitRLLearner(Star):
             if len(transitions) < max(1, self.cfg.learning.min_steps):
                 return
             reply_text = (getattr(response, "completion_text", "") or "").strip()
+            generation = event.get_extra(_GENERATION_KEY)
             payload = {
                 "umo": umo,
                 "user_text": user_text,
                 "surface": surface,
                 "transitions": transitions,
                 "reply_text": reply_text,
+                "generation": self._bank.generation
+                if generation is None
+                else generation,
             }
             if self.cfg.learning.async_learn:
                 self._spawn(self._learn(**payload))
@@ -652,6 +668,7 @@ class JitRLLearner(Star):
         surface: str,
         transitions: list[Any],
         reply_text: str,
+        generation: int | None = None,
     ) -> None:
         """Score a trajectory, build an episode and persist it.
 
@@ -661,8 +678,13 @@ class JitRLLearner(Star):
             surface: Coarse retrieval partition.
             transitions: Extracted `(state, action, observation)` sequence.
             reply_text: Final assistant reply, used for success detection.
+            generation: Memory epoch in which the request started.
         """
         if self._bank is None:
+            return
+        if generation is None:
+            generation = self._bank.generation
+        if generation != self._bank.generation:
             return
         actions = [transition.action.text for transition in transitions]
         observations = [transition.observation for transition in transitions]
@@ -717,7 +739,9 @@ class JitRLLearner(Star):
                 "reply_chars": len(reply_text),
             },
         )
-        written = await self._bank.add_episode(episode)
+        written = await self._bank.add_episode(episode, expected_generation=generation)
+        if not written or generation != self._bank.generation:
+            return
         self._stats["episodes"] += 1
         self._stats["experiences"] += written
         self._last_episode[umo] = (episode.episode_id, time.time())
@@ -935,13 +959,20 @@ class JitRLLearner(Star):
             return
         try:
             await self._ensure_ready()
-            if scope.strip().lower() == "all":
+            scope = scope.strip().lower()
+            if scope not in {"all", "session"}:
+                yield event.plain_result(
+                    "scope 必须是 session 或 all，未删除任何记忆。"
+                )
+                return
+            if scope == "all":
                 removed = await self._bank.clear()
             else:
                 removed = await self._bank.forget(scope=event.unified_msg_origin)
-            self._last_episode.pop(event.unified_msg_origin, None)
-            self._last_decision.pop(event.unified_msg_origin, None)
-            yield event.plain_result(f"已删除 {removed} 条经验。")
+            self._invalidate_memory_cache()
+            yield event.plain_result(
+                f"已删除 {removed} 条经验。删除前已自动备份，可用 /jitrl checkpoints 查看并回退。"
+            )
         except Exception:
             logger.warning("[JitRL] forget command failed", exc_info=True)
             yield event.plain_result("删除失败，请查看 AstrBot 日志。")
@@ -971,7 +1002,9 @@ class JitRLLearner(Star):
                 if verdict.strip().lower() != "bad"
                 else -_FEEDBACK_DELTA
             )
-            updated = await self._bank.apply_user_feedback(cached[0], delta)
+            updated = await self._bank.apply_user_feedback(
+                cached[0], delta, expected_generation=self._bank.generation
+            )
             self._last_episode.pop(umo, None)
             yield event.plain_result(
                 f"已回填 {delta:+.1f} 奖励到上一轮经验的 {updated} 个步骤。"
@@ -1038,6 +1071,131 @@ class JitRLLearner(Star):
             yield event.plain_result("读取 episode 失败，请查看 AstrBot 日志。")
 
     # ------------------------------------------------------------------
+    # checkpoints
+    # ------------------------------------------------------------------
+    def _invalidate_memory_cache(self) -> None:
+        self._last_episode.clear()
+        self._last_decision.clear()
+
+    def _checkpoint_denied(self, event: AstrMessageEvent) -> str | None:
+        denied = self._command_denied(event)
+        if denied:
+            return denied
+        # A snapshot contains every session, even when rolling back one scope.
+        return None if event.is_admin() else "检查点管理仅管理员可用。"
+
+    @jitrl_group.command("checkpoint")
+    async def jitrl_checkpoint(self, event: AstrMessageEvent, name: str = "") -> Any:
+        """创建手动检查点（可选名称，最多 80 字），不会被自动轮换。"""
+        denied = self._checkpoint_denied(event)
+        if denied:
+            yield event.plain_result(denied)
+            return
+        try:
+            await self._ensure_ready()
+            info = await self._bank.create_checkpoint(name)
+            yield event.plain_result(
+                f"已创建检查点：{info['id']}\n"
+                f"名称：{info['name'] or '未命名'} · {info['experiences']} 条经验 / {info['episodes']} 个 episode"
+            )
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+        except Exception:
+            logger.warning("[JitRL] checkpoint command failed", exc_info=True)
+            yield event.plain_result("创建检查点失败，请查看 AstrBot 日志。")
+
+    @jitrl_group.command("checkpoints")
+    async def jitrl_checkpoints(self, event: AstrMessageEvent, limit: int = 10) -> Any:
+        """查看最近的检查点及其完整 ID。"""
+        denied = self._checkpoint_denied(event)
+        if denied:
+            yield event.plain_result(denied)
+            return
+        try:
+            await self._ensure_ready()
+            rows = await self._bank.list_checkpoints()
+            lines = ["JitRL 检查点（从新到旧；回退前会自动备份当前数据）"]
+            for row in rows[: max(1, min(limit, 50))]:
+                ts = time.strftime("%m-%d %H:%M", time.localtime(row["created_at"]))
+                lines.append(
+                    f"· {row['id']}\n  {ts} | {row['kind']} | {row['name'] or '未命名'} | {row['experiences']} 条经验"
+                )
+            if not rows:
+                lines.append("还没有检查点，可用 /jitrl checkpoint 名称 创建。")
+            yield event.plain_result("\n".join(lines))
+        except Exception:
+            logger.warning("[JitRL] checkpoints command failed", exc_info=True)
+            yield event.plain_result("读取检查点失败，请查看 AstrBot 日志。")
+
+    @jitrl_group.command("rollback")
+    async def jitrl_rollback(
+        self,
+        event: AstrMessageEvent,
+        checkpoint_id: str = "",
+        scope: str = "session",
+        confirm: str = "",
+    ) -> Any:
+        """回退检查点：ID、session/all、confirm；默认只回退当前会话。"""
+        denied = self._checkpoint_denied(event)
+        if denied:
+            yield event.plain_result(denied)
+            return
+        scope = scope.strip().lower()
+        if not checkpoint_id or scope not in {"session", "all"}:
+            yield event.plain_result(
+                "用法：/jitrl rollback <完整检查点ID> <session|all> confirm"
+            )
+            return
+        if confirm.strip().lower() != "confirm":
+            yield event.plain_result(
+                f"将替换{'全部会话' if scope == 'all' else '当前会话'}的记忆，回退前会自动备份。确认请发送：\n"
+                f"/jitrl rollback {checkpoint_id} {scope} confirm"
+            )
+            return
+        try:
+            await self._ensure_ready()
+            result = await self._bank.restore_checkpoint(
+                checkpoint_id,
+                scope=None if scope == "all" else event.unified_msg_origin,
+            )
+            self._invalidate_memory_cache()
+            yield event.plain_result(
+                f"已回退{'全部会话' if scope == 'all' else '当前会话'}：{result['experiences']} 条经验。\n"
+                f"撤销本次回退可恢复检查点：{result['safety_checkpoint']['id']}"
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            yield event.plain_result(str(exc))
+        except Exception:
+            logger.warning("[JitRL] rollback command failed", exc_info=True)
+            yield event.plain_result(
+                "回退失败，当前记忆保持不变，请查看 AstrBot 日志。"
+            )
+
+    @jitrl_group.command("checkpoint_delete")
+    async def jitrl_checkpoint_delete(
+        self, event: AstrMessageEvent, checkpoint_id: str = "", confirm: str = ""
+    ) -> Any:
+        """永久删除指定检查点：完整 ID、confirm。"""
+        denied = self._checkpoint_denied(event)
+        if denied:
+            yield event.plain_result(denied)
+            return
+        if not checkpoint_id or confirm.strip().lower() != "confirm":
+            yield event.plain_result(
+                "删除检查点不可撤销。用法：/jitrl checkpoint_delete <完整检查点ID> confirm"
+            )
+            return
+        try:
+            await self._ensure_ready()
+            await self._bank.delete_checkpoint(checkpoint_id)
+            yield event.plain_result("已删除指定检查点，当前记忆不受影响。")
+        except (ValueError, FileNotFoundError) as exc:
+            yield event.plain_result(str(exc))
+        except Exception:
+            logger.warning("[JitRL] checkpoint delete failed", exc_info=True)
+            yield event.plain_result("删除检查点失败，请查看 AstrBot 日志。")
+
+    # ------------------------------------------------------------------
     # WebUI view API
     # ------------------------------------------------------------------
     def _register_web_apis(self) -> None:
@@ -1053,6 +1211,30 @@ class JitRLLearner(Star):
             ("/astrbot_plugin_jitrl/episodes", self._web_episodes, ["GET"], "episodes"),
             ("/astrbot_plugin_jitrl/forget", self._web_forget, ["POST"], "forget"),
             ("/astrbot_plugin_jitrl/export", self._web_export, ["GET"], "export"),
+            (
+                "/astrbot_plugin_jitrl/checkpoints",
+                self._web_checkpoints,
+                ["GET"],
+                "checkpoints",
+            ),
+            (
+                "/astrbot_plugin_jitrl/checkpoint",
+                self._web_checkpoint,
+                ["POST"],
+                "checkpoint",
+            ),
+            (
+                "/astrbot_plugin_jitrl/rollback",
+                self._web_rollback,
+                ["POST"],
+                "rollback",
+            ),
+            (
+                "/astrbot_plugin_jitrl/checkpoint_delete",
+                self._web_checkpoint_delete,
+                ["POST"],
+                "checkpoint_delete",
+            ),
         )
         register = getattr(self.context, "register_web_api", None)
         if register is None:
@@ -1166,6 +1348,79 @@ class JitRLLearner(Star):
             logger.warning("[JitRL] episodes endpoint failed", exc_info=True)
             return error_response("JitRL episodes unavailable", status_code=500)
 
+    async def _web_checkpoints(self) -> Any:
+        """Return snapshot inventory and rotation settings for the dashboard."""
+        from astrbot.api.web import error_response, json_response
+
+        try:
+            await self._ensure_ready()
+            return json_response(
+                {
+                    "checkpoints": await self._bank.list_checkpoints(),
+                    "interval": self.cfg.memory.checkpoint_interval,
+                    "keep": self.cfg.memory.keep_checkpoints,
+                }
+            )
+        except Exception:
+            logger.warning("[JitRL] checkpoints endpoint failed", exc_info=True)
+            return error_response("读取检查点失败。", status_code=500)
+
+    async def _web_checkpoint(self) -> Any:
+        return await self._web_checkpoint_action("create")
+
+    async def _web_rollback(self) -> Any:
+        return await self._web_checkpoint_action("restore")
+
+    async def _web_checkpoint_delete(self) -> Any:
+        return await self._web_checkpoint_action("delete")
+
+    async def _web_checkpoint_action(self, action: str) -> Any:
+        """Handle checkpoint mutations behind AstrBot's authenticated WebUI."""
+        from astrbot.api.web import error_response, json_response, request
+
+        try:
+            payload = await request.json(default={})
+            if not isinstance(payload, dict):
+                return error_response("请求体必须是 JSON 对象。")
+            if action != "create" and payload.get("confirm") is not True:
+                return error_response("回退或删除检查点需要 confirm: true。")
+            scope = payload.get("scope", "all")
+            if action == "restore":
+                if scope not in ("all", "session"):
+                    return error_response("scope 必须是 all 或 session。")
+                if scope == "session" and (
+                    not isinstance(payload.get("umo"), str)
+                    or not payload["umo"].strip()
+                ):
+                    return error_response("会话回退必须提供非空的 umo。")
+            await self._ensure_ready()
+            if action == "create":
+                return json_response(
+                    {
+                        "checkpoint": await self._bank.create_checkpoint(
+                            payload.get("name", "")
+                        )
+                    }
+                )
+            checkpoint_id = payload.get("id", "")
+            if action == "restore":
+                result = await self._bank.restore_checkpoint(
+                    checkpoint_id, scope=None if scope == "all" else payload["umo"]
+                )
+                self._invalidate_memory_cache()
+                return json_response(result)
+            await self._bank.delete_checkpoint(checkpoint_id)
+            return json_response({"deleted": checkpoint_id})
+        except FileNotFoundError as exc:
+            return error_response(str(exc), status_code=404)
+        except ValueError as exc:
+            return error_response(str(exc))
+        except Exception:
+            logger.warning("[JitRL] checkpoint %s failed", action, exc_info=True)
+            return error_response(
+                "检查点操作失败，请查看 AstrBot 日志。", status_code=500
+            )
+
     async def _web_forget(self) -> Any:
         """Delete memory from the dashboard.
 
@@ -1177,15 +1432,16 @@ class JitRLLearner(Star):
         try:
             await self._ensure_ready()
             payload = await request.json(default={})
+            if not isinstance(payload, dict):
+                return error_response("请求体必须是 JSON 对象。")
             scope = str(payload.get("scope", "all")).strip().lower()
             if scope == "all":
                 removed = await self._bank.clear()
-                self._last_episode.clear()
-                self._last_decision.clear()
             elif scope == "session" and payload.get("umo"):
                 removed = await self._bank.forget(scope=str(payload["umo"]))
             else:
                 return error_response("scope must be all, or session with umo")
+            self._invalidate_memory_cache()
             return json_response({"removed": removed})
         except Exception:
             logger.warning("[JitRL] forget endpoint failed", exc_info=True)

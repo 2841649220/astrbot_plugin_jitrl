@@ -215,12 +215,16 @@ class MemoryConfig:
         redact_secrets: Scrub credentials and personal data before storage.
         prune_strategy: `low_value`, `oldest` or `none`.
         keep_episodes: Number of episode headers retained.
+        checkpoint_interval: Episodes between automatic checkpoints; 0 disables.
+        keep_checkpoints: Automatic/safety snapshots retained per history.
     """
 
     max_entries: int = 20000
     redact_secrets: bool = True
     prune_strategy: str = "low_value"
     keep_episodes: int = 500
+    checkpoint_interval: int = 50
+    keep_checkpoints: int = 20
 
 
 @dataclass(slots=True)
@@ -437,6 +441,12 @@ class JitRLConfig:
                 ),
                 keep_episodes=_as_int(
                     memory.get("keep_episodes"), 500, low=10, high=100000
+                ),
+                checkpoint_interval=_as_int(
+                    memory.get("checkpoint_interval"), 50, low=0, high=10000
+                ),
+                keep_checkpoints=_as_int(
+                    memory.get("keep_checkpoints"), 20, low=1, high=200
                 ),
             ),
             feedback=FeedbackConfig(

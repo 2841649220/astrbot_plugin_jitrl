@@ -5,6 +5,25 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0] - 2026-10-26
+
+### 新增
+
+- 独立 SQLite 检查点：手动命名、首次基线、按 Episode 数自动保存；快照包含已提交的 WAL 数据，校验后原子发布。
+- 全库或指定会话事务回退；回退、清空和定向删除前自动备份，支持恢复备份以撤销操作。
+- 自动历史和操作前备份分别轮换，默认各 20 份；手动检查点保留到主动删除。
+- 管理员指令 `checkpoint`、`checkpoints`、`rollback`、`checkpoint_delete`，以及面板创建、回退和删除快照入口。
+- 配置 `memory.checkpoint_interval`（默认 50，0 关闭定期保存/初始基线）和 `memory.keep_checkpoints`（默认 20）。
+- 30 项恢复测试、23 项插件行为测试、7 项 Node.js 面板交互测试；CI 自动验证面板交互。
+
+### 修复与优化
+
+- 删除和回退后，拒绝旧 Agent 请求、后台评估和排队反馈的写入，清理反馈和策略缓存，防止恢复后的记忆再次被旧结果污染。
+- 拒绝错误的删除作用域、非法检查点 ID、缺少明确确认的 Web 请求及损坏/不兼容的快照。
+- 备份失败时中止删除和回退；回退写入失败时整体回滚，不留下半恢复数据。
+- 面板并行加载统计，忽略过期刷新响应；变更处理中禁用重复操作，回退和删除使用沙箱兼容的页内两步确认。
+- 版本号更新为 `0.2.0`，维持零第三方运行时依赖。
+
 ## [0.1.0] - 2026-10-26
 
 首个公开版本：把论文 *Just-In-Time Reinforcement Learning: Continual Learning in
@@ -43,3 +62,4 @@ LLM Agents Without Gradient Updates*（Li et al., ICML 2026）的推理时策略
   `metadata.yaml` 与 `jitrl/__init__.py` 的 `__version__` 现在保持一致。
 
 [0.1.0]: https://github.com/2841649220/astrbot_plugin_jitrl/releases/tag/v0.1.0
+[0.2.0]: https://github.com/2841649220/astrbot_plugin_jitrl/compare/v0.1.0...main

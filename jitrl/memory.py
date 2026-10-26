@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -21,6 +22,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from .checkpoints import CheckpointStore
 from .models import Episode, Neighbor, StateView
 from .state import jaccard, redact
 
@@ -168,6 +170,9 @@ class MemoryBank:
         redact: bool = True,
         keep_episodes: int = 500,
         prune_strategy: str = "low_value",
+        checkpoint_dir: Path | str | None = None,
+        checkpoint_interval: int = 50,
+        keep_checkpoints: int = 20,
     ) -> None:
         """Initialize the bank without touching the filesystem.
 
@@ -177,6 +182,11 @@ class MemoryBank:
             redact: Scrub secrets from free text before storing it.
             keep_episodes: Number of episode headers retained during pruning.
             prune_strategy: Eviction policy: "low_value", "oldest" or "none".
+            checkpoint_dir: Snapshot directory; defaults to a sibling directory.
+                Transient banks require an explicit directory for snapshots.
+            checkpoint_interval: Episodes between automatic snapshots; 0 disables
+                automatic snapshots. Safety backups still protect deletion.
+            keep_checkpoints: Retained snapshots per automatic/safety history.
         """
         self.db_path = Path(db_path)
         self.max_entries = _as_int(max_entries, 20000)
@@ -188,6 +198,21 @@ class MemoryBank:
         )
         self._conn: sqlite3.Connection | None = None
         self._lock = threading.Lock()
+        self._generation = 0
+        self._episodes_since_checkpoint = 0
+        self.checkpoint_interval = max(0, _as_int(checkpoint_interval, 50))
+        directory = (
+            Path(checkpoint_dir)
+            if checkpoint_dir is not None
+            else self.db_path.parent / f"{self.db_path.stem}-checkpoints"
+            if str(self.db_path) != ":memory:"
+            else None
+        )
+        self._checkpoints = (
+            CheckpointStore(directory, keep=keep_checkpoints)
+            if directory is not None
+            else None
+        )
 
     # -- lifecycle -----------------------------------------------------------
     async def initialize(self) -> None:
@@ -208,13 +233,23 @@ class MemoryBank:
             if target != ":memory:":
                 self.db_path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(target, check_same_thread=False, timeout=10.0)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA busy_timeout=5000")
-            for statement in _SCHEMA_STATEMENTS:
-                conn.execute(statement)
-            conn.commit()
+            try:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA busy_timeout=5000")
+                for statement in _SCHEMA_STATEMENTS:
+                    conn.execute(statement)
+                conn.commit()
+                if (
+                    self._checkpoints is not None
+                    and self.checkpoint_interval > 0
+                    and not self._checkpoints.list()
+                ):
+                    self._checkpoints.create(conn, kind="startup")
+            except BaseException:
+                conn.close()
+                raise
             self._conn = conn
 
     async def close(self) -> None:
@@ -249,13 +284,80 @@ class MemoryBank:
             )
         return conn
 
+    @property
+    def generation(self) -> int:
+        """Epoch captured by requests to reject writes after a reset/restore."""
+        return self._generation
+
+    def _require_checkpoints(self) -> CheckpointStore:
+        if self._checkpoints is None:
+            raise ValueError("内存数据库需要设置 checkpoint_dir 才能使用检查点。")
+        return self._checkpoints
+
+    async def create_checkpoint(self, name: str = "") -> dict[str, Any]:
+        """Save a manual checkpoint, retained until explicitly deleted."""
+        return await asyncio.to_thread(self._create_checkpoint_sync, name)
+
+    def _create_checkpoint_sync(self, name: str) -> dict[str, Any]:
+        with self._lock:
+            conn = self._require_conn()
+            if not isinstance(name, str) or len(name) > 80:
+                raise ValueError("检查点名称必须是最多 80 个字符的文本。")
+            if self.redact_secrets:
+                name = redact(name)
+            return self._require_checkpoints().create(conn, name=name)
+
+    async def list_checkpoints(self) -> list[dict[str, Any]]:
+        """List durable snapshots from newest to oldest."""
+        return await asyncio.to_thread(self._list_checkpoints_sync)
+
+    def _list_checkpoints_sync(self) -> list[dict[str, Any]]:
+        with self._lock:
+            self._require_conn()
+            return self._require_checkpoints().list()
+
+    async def delete_checkpoint(self, checkpoint_id: str) -> None:
+        """Permanently remove one snapshot by its complete opaque ID."""
+        await asyncio.to_thread(self._delete_checkpoint_sync, checkpoint_id)
+
+    def _delete_checkpoint_sync(self, checkpoint_id: str) -> None:
+        with self._lock:
+            self._require_conn()
+            self._require_checkpoints().delete(checkpoint_id)
+
+    async def restore_checkpoint(
+        self, checkpoint_id: str, *, scope: str | None = None
+    ) -> dict[str, Any]:
+        """Restore all memory or one session, saving an undo snapshot first."""
+        return await asyncio.to_thread(
+            self._restore_checkpoint_sync, checkpoint_id, scope
+        )
+
+    def _restore_checkpoint_sync(
+        self, checkpoint_id: str, scope: str | None
+    ) -> dict[str, Any]:
+        with self._lock:
+            result = self._require_checkpoints().restore(
+                self._require_conn(), checkpoint_id, scope=scope
+            )
+            self._generation += 1
+            self._episodes_since_checkpoint = 0
+            return result
+
+    def _backup_before_forget_locked(self) -> None:
+        if self._checkpoints is not None:
+            self._checkpoints.create(self._require_conn(), kind="before_forget")
+
     # -- writes --------------------------------------------------------------
-    async def add_episode(self, episode: Episode) -> int:
+    async def add_episode(
+        self, episode: Episode, *, expected_generation: int | None = None
+    ) -> int:
         """Store one finished episode and its transitions atomically.
 
         Args:
             episode: Episode to persist. Re-adding the same episode_id replaces
                 the previous rows.
+            expected_generation: Reject results from before a reset/restore.
 
         Returns:
             The number of experience rows written.
@@ -264,9 +366,13 @@ class MemoryBank:
             RuntimeError: When the bank is not initialized.
             sqlite3.Error: When the transaction fails; it is rolled back first.
         """
-        return await asyncio.to_thread(self._add_episode_sync, episode)
+        return await asyncio.to_thread(
+            self._add_episode_sync, episode, expected_generation
+        )
 
-    def _add_episode_sync(self, episode: Episode) -> int:
+    def _add_episode_sync(
+        self, episode: Episode, expected_generation: int | None = None
+    ) -> int:
         """Persist one episode inside a single transaction (worker thread).
 
         Args:
@@ -330,6 +436,11 @@ class MemoryBank:
 
         with self._lock:
             conn = self._require_conn()
+            if (
+                expected_generation is not None
+                and expected_generation != self._generation
+            ):
+                return 0
             try:
                 conn.execute("DELETE FROM episodes WHERE episode_id = ?", (episode_id,))
                 conn.execute(
@@ -360,10 +471,24 @@ class MemoryBank:
                 except sqlite3.Error:
                     pass
                 raise
+            self._episodes_since_checkpoint += 1
             if self.max_entries > 0:
                 total = self._count_locked(scope=None)
                 if total > self.max_entries:
                     self._prune_locked()
+            if (
+                self._checkpoints is not None
+                and self.checkpoint_interval > 0
+                and self._episodes_since_checkpoint >= self.checkpoint_interval
+            ):
+                try:
+                    self._checkpoints.create(conn, kind="auto")
+                    self._episodes_since_checkpoint = 0
+                except (OSError, sqlite3.Error, ValueError):
+                    logging.getLogger(__name__).warning(
+                        "[JitRL] automatic checkpoint failed; will retry next episode",
+                        exc_info=True,
+                    )
         return len(rows)
 
     async def forget(
@@ -418,6 +543,7 @@ class MemoryBank:
         sql = "DELETE FROM experiences WHERE " + " AND ".join(conditions)
         with self._lock:
             conn = self._require_conn()
+            self._backup_before_forget_locked()
             try:
                 cursor = conn.execute(sql, params)
                 removed = max(0, int(cursor.rowcount or 0))
@@ -429,6 +555,7 @@ class MemoryBank:
                 except sqlite3.Error:
                     pass
                 raise
+            self._generation += 1
         return removed
 
     async def clear(self) -> int:
@@ -450,6 +577,7 @@ class MemoryBank:
         """
         with self._lock:
             conn = self._require_conn()
+            self._backup_before_forget_locked()
             try:
                 cursor = conn.execute("DELETE FROM experiences")
                 removed = max(0, int(cursor.rowcount or 0))
@@ -461,6 +589,7 @@ class MemoryBank:
                 except sqlite3.Error:
                     pass
                 raise
+            self._generation += 1
         return removed
 
     async def prune(self) -> int:
@@ -543,7 +672,9 @@ class MemoryBank:
         )
         return max(0, int(cursor.rowcount or 0))
 
-    async def apply_user_feedback(self, episode_id: str, delta: float) -> int:
+    async def apply_user_feedback(
+        self, episode_id: str, delta: float, *, expected_generation: int | None = None
+    ) -> int:
         """Shift one episode's rewards and recompute its discounted returns.
 
         Args:
@@ -556,9 +687,13 @@ class MemoryBank:
         Raises:
             RuntimeError: When the bank is not initialized.
         """
-        return await asyncio.to_thread(self._apply_feedback_sync, episode_id, delta)
+        return await asyncio.to_thread(
+            self._apply_feedback_sync, episode_id, delta, expected_generation
+        )
 
-    def _apply_feedback_sync(self, episode_id: str, delta: float) -> int:
+    def _apply_feedback_sync(
+        self, episode_id: str, delta: float, expected_generation: int | None = None
+    ) -> int:
         """Apply a reward delta and rebuild G_t (worker thread).
 
         The discount factor is read back from the stored episode header, so
@@ -576,6 +711,11 @@ class MemoryBank:
         shift = _as_float(delta)
         with self._lock:
             conn = self._require_conn()
+            if (
+                expected_generation is not None
+                and expected_generation != self._generation
+            ):
+                return 0
             header = conn.execute(
                 "SELECT gamma FROM episodes WHERE episode_id = ?", (identifier,)
             ).fetchone()

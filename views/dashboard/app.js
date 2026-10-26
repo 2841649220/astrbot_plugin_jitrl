@@ -14,6 +14,25 @@ const forgetButton = document.getElementById("btn-forget");
 const FORGET_ARM_MS = 6000;
 let forgetArmed = false;
 let forgetTimer = null;
+let checkpointArmed = null;
+let mutationBusy = false;
+let refreshVersion = 0;
+
+function setMutationBusy(busy) {
+  mutationBusy = busy;
+  for (const button of document.querySelectorAll("[data-memory-mutation]")) {
+    button.disabled = busy;
+  }
+  document.getElementById("checkpoint-name").disabled = busy;
+}
+
+function disarmCheckpoint() {
+  if (!checkpointArmed) return;
+  clearTimeout(checkpointArmed.timer);
+  checkpointArmed.button.textContent = checkpointArmed.label;
+  checkpointArmed.button.classList.remove("btn-armed");
+  checkpointArmed = null;
+}
 
 function setHint(message, isError) {
   hint.textContent = message || "";
@@ -195,20 +214,136 @@ function renderEpisodes(payload) {
   }
 }
 
+function renderCheckpoints(payload) {
+  disarmCheckpoint();
+  const host = document.getElementById("checkpoints");
+  host.textContent = "";
+  const policy = document.getElementById("checkpoint-policy");
+  if (!payload) {
+    policy.textContent = "检查点列表加载失败，请刷新重试。";
+    return;
+  }
+  policy.textContent =
+    (payload.interval > 0
+      ? "每 " + payload.interval + " 个 Episode 自动保存（重载后重新计数）"
+      : "定期自动保存已关闭") +
+    "；自动快照和操作前备份各保留 " + payload.keep + " 份。手动检查点保留到主动删除。";
+  const rows = payload.checkpoints || [];
+  if (!rows.length) {
+    const empty = document.createElement("li");
+    empty.className = "empty";
+    empty.textContent = "还没有检查点。在确认记忆可信时创建一个，即可随时回退。";
+    host.append(empty);
+    return;
+  }
+  const kinds = {
+    manual: "手动 · 持久保留", auto: "定期自动", startup: "初始基线",
+    before_forget: "删除前备份", before_restore: "回退前备份",
+  };
+  for (const row of rows) {
+    const item = document.createElement("li");
+    item.className = "checkpoint";
+    const details = document.createElement("div");
+    details.className = "checkpoint-details";
+    const title = document.createElement("div");
+    title.textContent = row.name || kinds[row.kind] || row.kind;
+    const meta = document.createElement("div");
+    meta.className = "checkpoint-meta";
+    meta.textContent = new Date(row.created_at * 1000).toLocaleString() +
+      " · " + (kinds[row.kind] || row.kind) +
+      " · " + row.experiences + " 条经验 / " + row.episodes + " 个 Episode" +
+      " · " + num(row.size_bytes / 1024, 1) + " KB";
+    const id = document.createElement("code");
+    id.className = "checkpoint-id";
+    id.textContent = row.id;
+    details.append(title, meta, id);
+    const controls = document.createElement("div");
+    controls.className = "checkpoint-controls";
+    for (const action of ["rollback", "checkpoint_delete"]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "btn btn-danger";
+      button.textContent = action === "rollback" ? "回退全库" : "删除快照";
+      button.setAttribute("data-memory-mutation", "");
+      button.disabled = mutationBusy;
+      button.addEventListener("click", function () { checkpointAction(row, action, button); });
+      controls.append(button);
+    }
+    item.append(details, controls);
+    host.append(item);
+  }
+}
+
+async function createCheckpoint(event) {
+  event.preventDefault();
+  if (mutationBusy) return;
+  disarmCheckpoint();
+  disarmForget();
+  setMutationBusy(true);
+  const input = document.getElementById("checkpoint-name");
+  try {
+    const result = await bridge.apiPost("checkpoint", { name: input.value.trim() });
+    const row = result.checkpoint;
+    sayAction("已保存检查点 " + row.id + "（" + row.experiences + " 条经验）。");
+    input.value = "";
+    await refresh();
+  } catch (error) {
+    sayAction("创建失败：" + String((error && error.message) || error), true);
+  } finally {
+    setMutationBusy(false);
+  }
+}
+
+async function checkpointAction(row, action, button) {
+  if (mutationBusy) return;
+  if (!checkpointArmed || checkpointArmed.id !== row.id || checkpointArmed.action !== action) {
+    disarmCheckpoint();
+    disarmForget();
+    const label = button.textContent;
+    button.textContent = action === "rollback" ? "再次点击确认回退" : "再次点击确认删除";
+    button.classList.add("btn-armed");
+    checkpointArmed = { id: row.id, action, button, label, timer: setTimeout(disarmCheckpoint, FORGET_ARM_MS) };
+    sayAction(action === "rollback"
+      ? "将用此检查点替换全部会话记忆，当前数据会自动备份。请在 6 秒内再次点击确认。"
+      : "删除此快照不可撤销。请在 6 秒内再次点击确认。");
+    return;
+  }
+  disarmCheckpoint();
+  setMutationBusy(true);
+  try {
+    const result = await bridge.apiPost(action, { id: row.id, scope: "all", confirm: true });
+    sayAction(action === "rollback"
+      ? "已回退 " + result.experiences + " 条经验。撤销本次回退可恢复备份 " + result.safety_checkpoint.id + "。"
+      : "已删除指定快照。");
+    await refresh();
+  } catch (error) {
+    sayAction("操作失败：" + String((error && error.message) || error), true);
+  } finally {
+    setMutationBusy(false);
+  }
+}
+
 async function refresh() {
+  const version = ++refreshVersion;
   setHint("正在加载…");
   const overview = await apiGet("overview", {}, null);
+  if (version !== refreshVersion) return;
   if (!overview) {
     setHint("无法读取 JitRL 状态，请确认插件已加载且后端可用。", true);
     return;
   }
   renderOverview(overview);
-  const curve = await apiGet("curve", { buckets: 14 }, null);
-  const actions = await apiGet("actions", { limit: 20 }, null);
-  const episodes = await apiGet("episodes", { limit: 8 }, null);
+  const [curve, actions, episodes, checkpoints] = await Promise.all([
+    apiGet("curve", { buckets: 14 }, null),
+    apiGet("actions", { limit: 20 }, null),
+    apiGet("episodes", { limit: 8 }, null),
+    apiGet("checkpoints", {}, null),
+  ]);
+  if (version !== refreshVersion) return;
   renderCurve(curve);
   renderActions(actions);
   renderEpisodes(episodes);
+  renderCheckpoints(checkpoints);
   setHint("数据库：" + (overview.db_path || "--"));
 }
 
@@ -234,28 +369,30 @@ function disarmForget() {
 }
 
 async function forgetAll() {
+  if (mutationBusy) return;
   if (!forgetArmed) {
+    disarmCheckpoint();
     // Two-step confirmation: the iframe sandbox blocks modal dialogs, so the
     // destructive action is guarded in-page and auto-disarms after a timeout.
     forgetArmed = true;
     forgetButton.textContent = "再次点击确认清空";
     forgetButton.classList.add("btn-armed");
-    sayAction("清空全部记忆不可撤销，请再点一次确认（6 秒后自动取消）。");
+    sayAction("将清空全部记忆，清空前会自动保存检查点。请再点一次确认（6 秒后自动取消）。");
     if (forgetTimer) clearTimeout(forgetTimer);
     forgetTimer = setTimeout(disarmForget, FORGET_ARM_MS);
     return;
   }
   disarmForget();
-  forgetButton.disabled = true;
+  setMutationBusy(true);
   try {
     const result = await bridge.apiPost("forget", { scope: "all" });
     const removed = result && typeof result.removed === "number" ? result.removed : 0;
-    sayAction("已删除 " + removed + " 条经验。");
+    sayAction("已删除 " + removed + " 条经验，可从删除前备份回退。");
     await refresh();
   } catch (error) {
     sayAction("清空失败：" + String((error && error.message) || error), true);
   } finally {
-    forgetButton.disabled = false;
+    setMutationBusy(false);
   }
 }
 
@@ -268,6 +405,7 @@ async function main() {
   document.getElementById("btn-refresh").addEventListener("click", refresh);
   document.getElementById("btn-export").addEventListener("click", downloadExport);
   forgetButton.addEventListener("click", forgetAll);
+  document.getElementById("checkpoint-form").addEventListener("submit", createCheckpoint);
   await refresh();
 }
 

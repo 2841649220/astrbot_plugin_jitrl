@@ -351,6 +351,20 @@
           "max": 5000,
           "step": 50
         }
+      },
+      "checkpoint_interval": {
+        "description": "自动检查点间隔（Episode 数）",
+        "type": "int",
+        "default": 50,
+        "slider": { "min": 0, "max": 10000, "step": 1 },
+        "hint": "首次使用时保存基线，之后每累计指定数量的 Episode 保存快照。0 关闭自动检查点，清空/回退前的安全备份仍保留。计数在插件重载后重新开始。"
+      },
+      "keep_checkpoints": {
+        "description": "自动/安全检查点各自保留数量",
+        "type": "int",
+        "default": 20,
+        "slider": { "min": 1, "max": 200, "step": 1 },
+        "hint": "自动检查点和操作前备份分别轮换。手动检查点不会自动删除，需要在面板或指令中主动删除。"
       }
     }
   },

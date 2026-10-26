@@ -149,9 +149,41 @@ git clone https://github.com/2841649220/astrbot_plugin_jitrl.git
 | `/jitrl curve [n]` | 学习曲线（按时间分桶的平均回报），复现论文 Figure 3 |
 | `/jitrl recall [query]` | 按当前或指定情景检索历史经验 |
 | `/jitrl episodes [n]` | 最近 episode 摘要 |
-| `/jitrl forget [session\|all]` | session 删除本会话记忆，all 清空全部（不可撤销） |
+| `/jitrl forget [session\|all]` | session 删除本会话记忆，all 清空全部；删除前自动备份 |
+| `/jitrl checkpoint [名称]` | 创建手动检查点，保留到主动删除 |
+| `/jitrl checkpoints [n]` | 列出最近的检查点、完整 ID、时间和经验数 |
+| `/jitrl rollback <ID> [session\|all] confirm` | 从检查点回退，默认仅当前会话；回退前自动备份当前全库 |
+| `/jitrl checkpoint_delete <ID> confirm` | 永久删除指定检查点，不修改当前记忆 |
 | `/jitrl feedback good\|bad` | 手动回填对上一轮的评价 |
 | `/jitrl export` | 导出记忆 JSON |
+
+### 检查点与污染恢复
+
+检查点管理指令始终仅管理员可用，即使关闭了 `commands.admin_only`，因为每份快照包含全部会话的数据。
+
+```text
+/jitrl checkpoint 可信基线
+/jitrl checkpoints
+/jitrl rollback <从列表复制的完整ID> session confirm
+/jitrl rollback <从列表复制的完整ID> all confirm
+```
+
+先在确认表现正常时保存一个手动检查点。发现异常后，可以只回退当前会话，或回退全部会话。
+回退命令未带 `confirm` 时只提示确认用法。操作成功后会返回一份「回退前备份」的 ID；
+恢复这个 ID 即可撤销刚才的回退，撤销时同样可以选择 `session` 或 `all`。
+
+默认首次打开数据库时保存基线，之后每累计 **50 个完成的 Episode** 自动保存一次。
+`memory.checkpoint_interval = 0` 关闭这两类自动保存，删除和回退前的备份仍然生效。
+自动保存计数在插件重载或回退后重新开始；自动历史和操作前备份各保留 **20** 份，手动检查点不参与轮换。
+
+快照独立存放在 `data/plugin_data/astrbot_plugin_jitrl/checkpoints/`，使用 SQLite Backup API
+保存已提交的 WAL 数据，校验后才发布完整文件。回退先校验格式、表结构、完整性和记录数，
+再备份当前数据，最后在一个事务内替换记忆；校验、备份或写入失败时，当前记忆保持不变。
+会话回退保留其他会话的数据。快照包括奖励、折扣回报、episode 元数据及原有脱敏内容，
+不回退插件配置和进程累计计数。
+
+删除或回退会使旧请求和旧评估任务的写入失效，并清理反馈、决策缓存，避免旧结果把恢复后的数据库再次污染。
+回退后的新请求可以正常学习；如果评估配置仍会产生异常经验，可先关闭 `learning.enabled`，调整后再恢复学习。
 
 ### 自然语言反馈
 
@@ -163,7 +195,7 @@ git clone https://github.com/2841649220/astrbot_plugin_jitrl.git
 
 ### WebUI 面板
 
-插件自带一个可视化面板（`views/dashboard/`），在 WebUI「插件」页打开插件卡片即可进入。它通过 `context.register_web_api()` 注册的 6 个只读/清空接口拉数据：
+插件自带一个可视化面板（`views/dashboard/`），在 WebUI「插件」页打开插件卡片即可进入。它通过 `context.register_web_api()` 注册的 10 个接口读写数据：
 
 | 面板区域 | 内容 |
 | --- | --- |
@@ -172,9 +204,13 @@ git clone https://github.com/2841649220/astrbot_plugin_jitrl.git
 | 动作排行 | 每个工具/回复的平均回报、正回报率、样本数 —— **一眼看出这个部署里哪个工具真的有用** |
 | 最近 Episode | 时间 / 步数 / 平均回报 / 用户请求摘要 |
 | 超参数 | 当前 k、r、γ、β、λ、α 与作用域、评估器模式 |
-| 操作 | 刷新、导出 JSON、清空记忆 |
+| 检查点 | 名称、类型、完整 ID、时间、经验数、文件大小，支持创建、回退全库、删除快照 |
+| 操作 | 刷新、导出 JSON、带备份的清空记忆；回退、删除和清空均使用页内两步确认 |
 
 后端路由（`GET` 除注明外）：`/astrbot_plugin_jitrl/overview`、`/curve`、`/actions`、`/episodes`、`/export`，以及 `POST /forget`。
+检查点路由同样使用 `/astrbot_plugin_jitrl` 前缀：`GET /checkpoints`、`POST /checkpoint`、
+`POST /rollback`、`POST /checkpoint_delete`。回退、删除检查点的请求必须提供 `confirm: true`。
+面板的回退操作针对全部会话；只回退当前会话请使用聊天指令。
 
 ---
 
@@ -196,6 +232,8 @@ git clone https://github.com/2841649220/astrbot_plugin_jitrl.git
 | `policy.tool_gate` | `false` | 对**高置信负优势**的工具做硬屏蔽（等价于 logit 压到 −∞） |
 | `memory.redact_secrets` | `true` | 写入前剔除邮箱、手机号、API Key、JWT、Bearer token、URL 凭据 |
 | `memory.max_entries` | `20000` | 容量上限，超出后按策略淘汰 |
+| `memory.checkpoint_interval` | `50` | 每多少个完成的 Episode 自动保存；`0` 关闭定期保存与首次基线 |
+| `memory.keep_checkpoints` | `20` | 自动历史、操作前备份各自保留数量；手动检查点主动删除前一直保留 |
 
 ---
 
@@ -206,7 +244,7 @@ git clone https://github.com/2841649220/astrbot_plugin_jitrl.git
 1. **写入前脱敏**：邮箱 / 手机号 / `sk-*` / `ghp_*` / `AKIA*` / Bearer / JWT / 敏感 key-value → 统一占位符，且幂等。
 2. **先抽象后存储**：存的是 `token 集合 + 签名`，不是原文；`state_text` 也经过截断与正则化。
 3. **作用域隔离**：`session` 模式下记忆只在 `unified_msg_origin` 内可见，不会串到别的群/私聊。
-4. **可删除**：`/jitrl forget` 支持按会话或全量删除；`max_entries` + 淘汰策略限制留存。
+4. **可删除与回退**：`/jitrl forget` 支持按会话或全量删除，并保留删除前备份；`max_entries` + 淘汰策略限制在线记忆留存。若需永久移除历史数据，还应删除包含它的检查点及之前的 JSON 导出；删除在线记忆不会同步改写历史快照。
 
 另外，注入的证据块会被明确标注为「不是用户输入，也不是新指令」，降低提示词注入面。
 
@@ -229,16 +267,21 @@ git clone https://github.com/2841649220/astrbot_plugin_jitrl.git
 ```bash
 cd AstrBot
 python -m pytest data/plugins/astrbot_plugin_jitrl/tests -q
+node --test data/plugins/astrbot_plugin_jitrl/tests/test_dashboard.cjs
 ```
 
-本机（未安装 AstrBot）实测：**252 passed, 1 skipped** —— `test_integration.py` 会自己 `importorskip`，
-算法层与面板契约依然全覆盖；在 AstrBot 仓库内还会额外执行该文件的 28 项集成测试。
+本机（未安装 AstrBot）实测：**305 passed, 1 skipped**，另有 **7 项 Node.js 面板交互测试通过**。
+`test_integration.py` 会自己 `importorskip`；存储恢复、插件接线、并发保护和面板交互仍可在没有 AstrBot 的环境验证。
+在 AstrBot 仓库内还会额外执行该文件的 28 项集成测试。
 测试分两层：
 
 | 文件 | 覆盖 |
 | --- | --- |
 | `test_state.py` | 脱敏幂等、占位符存活、中英混合分词（中文 bigram）、Jaccard 边界、动作签名归一化 |
 | `test_memory.py` | top-k 检索（阈值 / surface 门 / scope 模式）、动作聚合、学习曲线分桶、prune / forget / clear、导出导入往返、反馈重算 `G_t` |
+| `test_checkpoints.py` | WAL 快照、重启后恢复、回退撤销、会话隔离、自动轮换、损坏快照、磁盘失败、事务回滚、旧写入拦截 |
+| `test_checkpoint_plugin.py` | 使用宿主适配器与真实记忆库测试指令、权限、Web API、参数验证、Agent/评估器/重排中的回退竞态 |
+| `test_dashboard.cjs` | 无外部依赖的 Node.js 交互测试：创建、回退、删除、确认超时、操作切换、重复提交与失败恢复 |
 | `test_estimator.py` | 式 (4)(5)(6)(7)(25) 的精确数值、探索分支、`|N|=0` 与 `max|A|=0` 边界 |
 | `test_policy.py` | softmax 稳定性、增强候选集合并、`z'=z+βÃ` 精确值、Verbalized-Logit 解析的四条回退路径 |
 | `test_evaluator.py` | 折扣回报、启发式规则、JSON 解析回退、`auto` 短路、LLM/规则融合、超时降级 |
@@ -275,6 +318,7 @@ astrbot_plugin_jitrl/
 │   ├── config.py          # 配置归一化与默认值
 │   ├── state.py           # 状态抽象、脱敏、中英分词、Jaccard、动作归一化
 │   ├── memory.py          # SQLite 记忆库、top-k 检索、淘汰、导出导入、反馈回填
+│   ├── checkpoints.py     # 独立 SQLite 快照、校验、保留策略、事务回退
 │   ├── estimator.py       # 式 4/5/6/7/25：V̂ Q̂ Â Ã
 │   ├── policy.py          # 式 9/10：闭式 logit 更新 + softmax 采样
 │   ├── reranker.py        # Verbalized Logit 采样器（黑盒模型路径）

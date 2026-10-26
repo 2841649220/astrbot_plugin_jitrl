@@ -17,7 +17,7 @@
         <span id="chip-state" class="chip chip-muted">--</span>
         <button id="btn-refresh" class="btn" type="button">刷新</button>
         <button id="btn-export" class="btn" type="button">导出</button>
-        <button id="btn-forget" class="btn btn-danger" type="button">清空记忆</button>
+        <button id="btn-forget" class="btn btn-danger" type="button" data-memory-mutation>清空记忆</button>
       </div>
     </header>
 
@@ -27,6 +27,18 @@
         <div class="kpi"><span id="kpi-episodes" class="kpi-value">--</span><span class="kpi-label">Episodes</span></div>
         <div class="kpi"><span id="kpi-biased" class="kpi-value">--</span><span class="kpi-label">策略干预</span></div>
         <div class="kpi"><span id="kpi-failures" class="kpi-value">--</span><span class="kpi-label">失败次数</span></div>
+      </section>
+
+      <section class="card span-2">
+        <h2>检查点与回退 <small>保存可信记忆，发现污染后恢复</small></h2>
+        <form id="checkpoint-form" class="checkpoint-form">
+          <label for="checkpoint-name">检查点名称</label>
+          <input id="checkpoint-name" type="text" maxlength="80" placeholder="例如：确认表现正常的版本（可选）" autocomplete="off" />
+          <button id="btn-checkpoint" class="btn" type="submit" data-memory-mutation>创建检查点</button>
+        </form>
+        <p id="checkpoint-policy" class="checkpoint-policy"></p>
+        <p class="checkpoint-policy">面板回退会替换全部会话的记忆，并自动备份当前数据。仅回退当前会话可使用聊天指令。</p>
+        <ul id="checkpoints" class="checkpoints" aria-label="检查点列表"></ul>
       </section>
 
       <section class="card span-2">
@@ -53,7 +65,7 @@
     </main>
 
     <footer class="foot">
-      <p id="action-hint" class="action-hint"></p>
+      <p id="action-hint" class="action-hint" role="status" aria-live="polite"></p>
       <p id="hint" class="hint"></p>
     </footer>
     <script type="module" src="./app.js"></script>

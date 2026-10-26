@@ -649,6 +649,10 @@ async def test_web_apis_are_registered(plugin: Any) -> None:
         "/astrbot_plugin_jitrl/episodes",
         "/astrbot_plugin_jitrl/forget",
         "/astrbot_plugin_jitrl/export",
+        "/astrbot_plugin_jitrl/checkpoints",
+        "/astrbot_plugin_jitrl/checkpoint",
+        "/astrbot_plugin_jitrl/rollback",
+        "/astrbot_plugin_jitrl/checkpoint_delete",
     }
     for _route, handler, methods, desc in plugin.context.registered_web_apis:
         assert callable(handler)
