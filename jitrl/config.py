@@ -12,6 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .neural.config import LensConfig
+
 # Paper hyperparameters (Appendix H) used whenever a value is absent/invalid.
 _DEFAULT_GAMMA = 0.5
 _DEFAULT_K = 10
@@ -327,6 +329,7 @@ class JitRLConfig:
     feedback: FeedbackConfig = field(default_factory=FeedbackConfig)
     commands: CommandsConfig = field(default_factory=CommandsConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
+    neural: LensConfig = field(default_factory=LensConfig)
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any] | None) -> JitRLConfig:
@@ -350,6 +353,7 @@ class JitRLConfig:
         debug = raw.get("debug") if isinstance(raw.get("debug"), dict) else {}
 
         return cls(
+            neural=LensConfig.from_raw(raw.get("neural")),
             enabled=_as_bool(raw.get("enabled"), True),
             apply_mode=_as_str(
                 raw.get("apply_mode"), "hint", allowed=("off", "hint", "logit")

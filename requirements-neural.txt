@@ -1,0 +1,3 @@
+# Optional CPU-capable local Neural Lens. Install using PyTorch's CPU wheel
+# index when GPU support is unnecessary (see docs/neural-lens.md).
+torch>=2.2,<3

@@ -5,6 +5,21 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本规则：常规功能和修复递增末位补丁号；大规模架构改进才递增中间版本号。
 
+## [0.2.0] - 2026-10-27
+
+### 可选神经架构
+
+- 在 V0.1.2 基础上新增 `jitrl/neural`，独立分支 `codex/v0.2.0-neural-lens`；保留原插件入口、配置、命令、Web 路由及默认行为。`neural.mode` 默认 `off`，PyTorch 惰性导入且单独安装，旧数据库不迁移。
+- 可训练本地模型：结构事件 Engram-inspired 条件表与因果卷积、四层 RMSNorm/SwiGLU、经验编译器、受限低秩动态适配器、单层 6Q/2KV memory GQA、实际 PRE 与候选相关的 POST 价值/残差代理头。远端模型保持冻结，不宣称复现 MiTA 或继承 JitRL 收敛定理。
+- 私有 scope 的状态、精确历史快照、执行事实 PENDING 与 append-only 回报结算；排除未执行候选、自身、同 episode 和未来结算标签；保留回报来源、可靠性与跨版本校验。
+- 独立的会话模型和不可变 checkpoint：训练模型副本、梯度裁剪、原子发布、SHA-256 与 `weights_only=True` 加载；PRE/POST 绑定同一版本；重置失效旧写入并清理权重，卸载等待本地训练结束。
+- AstrBot PRE 临时提示和完成后采集；继续仅用宿主 logger，不改写 system prompt，不调整工具权限。shadow 保持基础请求，active 仅在门控通过时提供受限历史证据；独立 POST API 不接管宿主解码或执行。
+- 新增 `/jitrl lens status|train|reset`，复用原 `feedback` 命令和关键词并追加用户回报事件；面板新增神经状态，原有返回字段保持，明确旧经验库与神经库的删除/恢复边界。
+- 新增三篇论文与 plan 的研究说明、运行/API 文档、离线 CPU smoke、存储/模型/宿主兼容性和并发回归测试，以及可选神经 CPU CI 作业。正式 384d/4-block 合成验证跑通，不作为真实任务效果证据。
+- 同步 `0.2.0` 版本链，安装 ZIP 包含文档与可选依赖清单，排除本地数据库、权重、缓存和开发工具。
+
+[0.2.0]: https://github.com/2841649220/astrbot_plugin_jitrl/releases/tag/v0.2.0
+
 ## [0.1.2] - 2026-10-27
 
 ### 新增

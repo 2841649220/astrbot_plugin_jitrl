@@ -35,16 +35,38 @@ INCLUDE: tuple[str, ...] = (
     "metadata.yaml",
     "_conf_schema.json",
     "requirements.txt",
+    "requirements-neural.txt",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
     "jitrl",
     "views",
+    "docs",
 )
 """Release payload, in the order it is written."""
 
-EXCLUDED_DIRS = {"__pycache__", ".pytest_cache", ".ruff_cache"}
-EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
+EXCLUDED_DIRS = {
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    "checkpoints",
+    "exports",
+    ".git",
+    "node_modules",
+}
+EXCLUDED_SUFFIXES = {
+    ".pyc",
+    ".pyo",
+    ".pt",
+    ".pth",
+    ".safetensors",
+    ".sqlite3",
+    ".sqlite3-wal",
+    ".sqlite3-shm",
+    ".db",
+    ".db-wal",
+    ".db-shm",
+}
 
 VERSION_LINE = re.compile(r"^version:\s*(\S+)\s*$", re.MULTILINE)
 CODE_VERSION = re.compile(r'^__version__\s*=\s*"([^"]+)"', re.MULTILINE)

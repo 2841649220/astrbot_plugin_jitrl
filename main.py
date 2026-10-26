@@ -1,4 +1,8 @@
-"""JitRL: continual learning for the AstrBot agent without gradient updates.
+"""JitRL legacy policy and an optional, locally trained Neural Lens.
+
+V0.2.0 adds a scope-isolated neural controller in jitrl.neural. The remote
+LLM remains frozen; only the local optional PyTorch model is trained. The
+legacy path described below is selected when neural.mode is off.
 
 This plugin implements *Just-In-Time Reinforcement Learning* (Li et al.,
 ICML 2026) on top of AstrBot's agent pipeline. The paper keeps the model
@@ -36,7 +40,7 @@ import random
 import time
 import uuid
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -48,10 +52,19 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from .jitrl.config import JitRLConfig
 from .jitrl.estimator import estimate_values
-from .jitrl.evaluator import StepRewardEvaluator
+from .jitrl.evaluator import StepRewardEvaluator, discounted_returns
 from .jitrl.hint import render_preference_block, render_recall_report
 from .jitrl.memory import MemoryBank
 from .jitrl.models import Neighbor, PolicyDecision, StateView, ValueEstimate
+from .jitrl.neural.adapter import (
+    NeuralRun,
+    RequestFrame,
+    executed_transitions,
+    observed_context,
+    provider_messages,
+)
+from .jitrl.neural.contracts import Intervention
+from .jitrl.neural.encoding import canonicalize
 from .jitrl.policy import build_candidates, select_action, verbalized_to_logit
 from .jitrl.reranker import VerbalizedReranker
 from .jitrl.state import abstract_state, redact
@@ -68,6 +81,8 @@ _INJECTED_KEY = "_jitrl_injected"
 
 _GENERATION_KEY = "_jitrl_memory_generation"
 """Memory epoch in which an agent request started."""
+
+_NEURAL_KEY = "_jitrl_neural_run"
 
 _STATE_CHAR_LIMIT = 800
 """Character budget of the abstracted state used for retrieval."""
@@ -152,7 +167,7 @@ class _DecisionSnapshot:
 
 
 class JitRLLearner(Star):
-    """Continuous, gradient-free learning layer for the AstrBot agent.
+    """Legacy episodic learning and optional isolated local neural learning.
 
     The class owns the memory bank, the evaluator and the reranker, and wires
     them into AstrBot's event hooks. Every hook is defensive: a failure inside
@@ -171,6 +186,11 @@ class JitRLLearner(Star):
         self.cfg = JitRLConfig.from_raw(config)
         data_root = Path(get_astrbot_plugin_data_path()) / _PLUGIN_DATA_DIR
         self._db_path = data_root / "memory.sqlite3"
+        self._neural_root = data_root / "neural"
+        self._neural: Any | None = None
+        self._neural_ready_lock = asyncio.Lock()
+        self._neural_training: set[str] = set()
+        self._neural_last_episode: dict[str, tuple[str, float, float, int]] = {}
         self._bank: MemoryBank | None = None
         self._ready_lock = asyncio.Lock()
         self._background: set[asyncio.Task] = set()
@@ -233,6 +253,9 @@ class JitRLLearner(Star):
         if self._background:
             await asyncio.gather(*self._background, return_exceptions=True)
         self._background.clear()
+        if self._neural is not None:
+            await self._neural.close()
+            self._neural = None
         if self._bank is not None:
             await self._bank.close()
             self._bank = None
@@ -241,6 +264,209 @@ class JitRLLearner(Star):
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
+    async def _ensure_neural(self) -> Any:
+        if self._neural is None:
+            async with self._neural_ready_lock:
+                if self._neural is None:
+                    from .jitrl.neural.runtime import LensRuntime
+
+                    self._neural = await asyncio.to_thread(
+                        LensRuntime, self._neural_root, self.cfg.neural
+                    )
+        return self._neural
+
+    async def _neural_request(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ) -> None:
+        try:
+            runtime = await self._ensure_neural()
+            messages = provider_messages(req)
+            calls, observation, events = observed_context(messages)
+            run = event.get_extra(_NEURAL_KEY)
+            if not isinstance(run, NeuralRun) or run.completed:
+                run = NeuralRun(baseline_calls=calls)
+                event.set_extra(_NEURAL_KEY, run)
+                await self._maybe_apply_feedback(
+                    event.unified_msg_origin, event.get_message_str() or ""
+                )
+            new_calls = calls - run.baseline_calls
+            if len(run.frames) >= 40:
+                return
+            tools = set(req.func_tool.names()) if req.func_tool else set()
+            goal = (event.get_message_str() or req.prompt or "").strip()
+            state = canonicalize(
+                scope=event.unified_msg_origin,
+                goal=goal,
+                observation=observation,
+                events=events,
+                allowed_actions=tuple(tools | {"reply"}),
+                environment="astrbot-v4:"
+                + self._surface(event)
+                + ":model="
+                + str(getattr(req, "model", None) or "unknown"),
+                episode_id=run.episode_id,
+                step_index=len(new_calls),
+            )
+            decision, epoch = await runtime.prepare(state)
+            if self.cfg.apply_mode == "off":
+                decision = replace(
+                    decision,
+                    intervention=Intervention(reason="MASTER_APPLY_OFF"),
+                    rendered="",
+                )
+            part = (
+                _make_temporary_part(decision.rendered) if decision.rendered else None
+            )
+            if decision.rendered and part is None:
+                decision = replace(
+                    decision,
+                    intervention=Intervention(reason="HOST_TEXT_PART_UNAVAILABLE"),
+                    rendered="",
+                )
+            if not await runtime.commit(decision, epoch):
+                return
+            if part is not None:
+                req.extra_user_content_parts.append(part)
+            run.frames.append(RequestFrame(decision, epoch, new_calls))
+            self._stats["requests"] += 1
+            self._stats["biased"] += int(bool(decision.rendered))
+        except Exception:
+            self._stats["failures"] += 1
+            logger.warning("[JitRL Lens] request skipped; pure NO_OP", exc_info=True)
+
+    async def _neural_done(
+        self, event: AstrMessageEvent, run_context: Any, response: Any
+    ) -> None:
+        run = event.get_extra(_NEURAL_KEY)
+        if not isinstance(run, NeuralRun) or run.completed or not run.frames:
+            return
+        run.completed = True
+        messages = list(getattr(run_context, "messages", None) or [])
+        final_text = (getattr(response, "completion_text", "") or "").strip()
+        transitions, call_ids = executed_transitions(
+            messages,
+            goal=run.frames[0].decision.state.goal,
+            surface=self._surface(event),
+            baseline_calls=run.baseline_calls,
+            final_text=final_text,
+        )
+        if not transitions:
+            return
+        payload = {
+            "run": run,
+            "transitions": transitions,
+            "call_ids": call_ids,
+            "umo": event.unified_msg_origin,
+            "final_text": final_text,
+        }
+        if self.cfg.learning.async_learn:
+            self._spawn(self._learn_neural(**payload))
+        else:
+            await self._learn_neural(**payload)
+
+    async def _learn_neural(
+        self,
+        *,
+        run: NeuralRun,
+        transitions: list[Any],
+        call_ids: list[str],
+        umo: str,
+        final_text: str,
+    ) -> None:
+        runtime = await self._ensure_neural()
+        preceding: set[str] = set()
+        executions = []
+        for index, (transition, call_id) in enumerate(
+            zip(transitions, call_ids, strict=True)
+        ):
+            frame = run.frame_for(frozenset(preceding))
+            if (
+                frame is not None
+                and transition.action.name in frame.decision.state.allowed_actions
+            ):
+                experience_id = await asyncio.to_thread(
+                    runtime.store.append_execution,
+                    frame.decision.state.decision_id,
+                    index=index,
+                    action_key=transition.action.key,
+                    action_name=transition.action.name,
+                    expected_epoch=frame.epoch,
+                )
+                if experience_id:
+                    executions.append((experience_id, index, frame.epoch))
+            if call_id != "__final_reply__":
+                preceding.add(call_id)
+        # PENDING executions survive evaluator failure. An absent label never
+        # becomes a manufactured zero-return training target.
+        if not executions or self.cfg.learning.evaluator_mode == "off":
+            return
+        if len(transitions) < self.cfg.learning.min_steps:
+            return
+
+        async def generate(*, prompt: str, system_prompt: str | None = None) -> str:
+            return await self._llm_text(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                provider_id=self.cfg.learning.evaluator_provider_id,
+                umo=umo,
+            )
+
+        evaluator = StepRewardEvaluator(
+            generate if self.cfg.learning.evaluator_mode in {"auto", "llm"} else None,
+            mode=self.cfg.learning.evaluator_mode,
+            timeout=self.cfg.learning.evaluator_timeout,
+            max_reward=3.0,
+            heuristic_weight=self.cfg.learning.heuristic_weight,
+        )
+        result = await evaluator.score(
+            task=run.frames[0].decision.state.goal,
+            actions=[redact(t.action.text) for t in transitions],
+            observations=[redact(t.observation) for t in transitions],
+            outcomes=[t.outcome for t in transitions],
+            success=infer_success(transitions=transitions, final_text=final_text)
+            if self.cfg.learning.success_detection != "off"
+            else None,
+        )
+        if len(result.rewards) != len(transitions):
+            return
+        returns = discounted_returns(result.rewards, self.cfg.learning.gamma)
+        settled = 0
+        for experience_id, index, epoch in executions:
+            settled += await asyncio.to_thread(
+                runtime.store.settle,
+                experience_id,
+                reward=result.rewards[index],
+                return_g=returns[index],
+                source=result.source,
+                expected_epoch=epoch,
+            )
+        self._stats["episodes"] += int(settled > 0)
+        self._stats["experiences"] += settled
+        if settled:
+            self._neural_last_episode[umo] = (
+                run.episode_id,
+                time.time(),
+                self.cfg.learning.gamma,
+                executions[0][2],
+            )
+            if len(self._neural_last_episode) > 512:
+                self._neural_last_episode.pop(next(iter(self._neural_last_episode)))
+        if self.cfg.neural.auto_train and settled and umo not in self._neural_training:
+            stats = await asyncio.to_thread(runtime.store.stats, umo)
+            if (
+                stats["executions"] >= self.cfg.neural.min_samples
+                and stats["executions"] % self.cfg.neural.train_every < settled
+            ):
+                self._neural_training.add(umo)
+
+                async def consolidate() -> None:
+                    try:
+                        await runtime.train(umo)
+                    finally:
+                        self._neural_training.discard(umo)
+
+                self._spawn(consolidate())
+
     def _spawn(self, coroutine: Any) -> None:
         """Run a coroutine in the background, logging failures.
 
@@ -649,12 +875,17 @@ class JitRLLearner(Star):
         cfg = self.cfg.feedback
         if not cfg.enabled or not user_text or len(user_text) > 16:
             return
-        cached = self._last_episode.get(umo)
+        cache = (
+            self._neural_last_episode
+            if self.cfg.neural.mode != "off"
+            else self._last_episode
+        )
+        cached = cache.get(umo)
         if not cached:
             return
-        episode_id, created_at = cached
+        episode_id, created_at = cached[:2]
         if time.time() - created_at > cfg.window_seconds:
-            self._last_episode.pop(umo, None)
+            cache.pop(umo, None)
             return
         normalised = self._normalise_feedback(user_text)
         if not normalised:
@@ -672,6 +903,9 @@ class JitRLLearner(Star):
             delta = _FEEDBACK_DELTA
         if delta == 0.0:
             return
+        if self.cfg.neural.mode != "off":
+            await self._apply_neural_feedback(umo, delta)
+            return
         if self._bank is None:
             return
         updated = await self._bank.apply_user_feedback(
@@ -684,6 +918,22 @@ class JitRLLearner(Star):
             episode_id,
             delta,
             updated,
+        )
+
+    async def _apply_neural_feedback(self, umo: str, delta: float) -> int:
+        cached = self._neural_last_episode.pop(umo, None)
+        if not cached:
+            return 0
+        runtime = await self._ensure_neural()
+        episode_id, created_at, gamma, epoch = cached
+        if time.time() - created_at > self.cfg.feedback.window_seconds:
+            return 0
+        return await runtime.apply_user_feedback(
+            scope=umo,
+            episode_id=episode_id,
+            delta=delta,
+            gamma=gamma,
+            expected_epoch=epoch,
         )
 
     # ------------------------------------------------------------------
@@ -712,6 +962,9 @@ class JitRLLearner(Star):
             req: The outgoing provider request, mutated in place.
         """
         if not self.cfg.enabled:
+            return
+        if self.cfg.neural.mode != "off":
+            await self._neural_request(event, req)
             return
         if event.get_extra(_INJECTED_KEY):
             return
@@ -827,6 +1080,13 @@ class JitRLLearner(Star):
             response: Final LLM response of the run.
         """
         if not self.cfg.enabled or not self.cfg.learning.enabled:
+            return
+        if self.cfg.neural.mode != "off":
+            try:
+                await self._neural_done(event, run_context, response)
+            except Exception:
+                self._stats["failures"] += 1
+                logger.warning("[JitRL Lens] capture failed", exc_info=True)
             return
         try:
             await self._ensure_ready()
@@ -987,6 +1247,8 @@ class JitRLLearner(Star):
         """
         if not self.cfg.enabled or not self.cfg.commands.enable_agent_tools:
             return "Experience memory is disabled."
+        if self.cfg.neural.mode != "off":
+            return "Neural Lens uses private decision snapshots; legacy recall is disabled in neural mode."
         try:
             await self._ensure_ready()
             umo = event.unified_msg_origin
@@ -1072,10 +1334,68 @@ class JitRLLearner(Star):
             if cached:
                 decision = cached[1]
                 lines.append(f"· 最近决策：{decision.reason or '（无）'}")
+            lines.append(f"· Neural Lens：{self.cfg.neural.mode}（/jitrl lens status）")
+            if self.cfg.neural.mode != "off":
+                lines.append(
+                    "· 上述记忆与检查点统计属于 V0.1 经验库；神经库与权重独立管理。"
+                )
             yield event.plain_result("\n".join(lines))
         except Exception:
             logger.warning("[JitRL] status command failed", exc_info=True)
             yield event.plain_result("读取状态失败，请查看 AstrBot 日志。")
+
+    @jitrl_group.command("lens")
+    async def jitrl_lens(
+        self, event: AstrMessageEvent, action: str = "status", confirm: str = ""
+    ) -> Any:
+        """神经滤镜：status / train / reset confirm；均限当前会话。"""
+        denied = self._command_denied(event)
+        if denied:
+            yield event.plain_result(denied)
+            return
+        action = action.strip().lower()
+        if action not in {"status", "train", "reset"}:
+            yield event.plain_result(
+                "用法：/jitrl lens <status|train|reset>；重置需追加 confirm。"
+            )
+            return
+        if action != "status" and not event.is_admin():
+            yield event.plain_result("神经模型训练与重置仅管理员可用。")
+            return
+        if action == "reset" and confirm.strip().lower() != "confirm":
+            yield event.plain_result(
+                "将删除当前会话的神经经验、审计快照及全部本地模型权重。确认：/jitrl lens reset confirm"
+            )
+            return
+        try:
+            runtime = await self._ensure_neural()
+            scope = event.unified_msg_origin
+            if action == "train":
+                result = await runtime.train(scope)
+                if result["status"] == "trained":
+                    yield event.plain_result(
+                        f"本地训练完成：{result['checkpoint_id']}；样本 {result['samples']}，loss {result['before_loss']:.4f} → {result['after_loss']:.4f}。该训练损失不代表真实任务提升。"
+                    )
+                else:
+                    yield event.plain_result(f"本地训练未发布模型：{result}")
+            elif action == "reset":
+                await runtime.reset(scope)
+                self._neural_last_episode.pop(scope, None)
+                yield event.plain_result(
+                    "已重置当前会话的神经经验和权重；旧后台写入已失效。V0.1 经验库独立保留。"
+                )
+            else:
+                status = await runtime.status(scope)
+                yield event.plain_result(
+                    f"Neural Lens：{status['mode']}；PyTorch：{status['torch_installed']}\n"
+                    f"决策 {status['decisions']} / 执行事实 {status['executions']} / 回报事件 {status['settlements']}\n"
+                    f"检查点：{status['checkpoint_id']}；错误：{status['last_error'] or '无'}\n"
+                    "AstrBot 已接入 PRE；POST 为独立候选评分 API。\n"
+                    "训练：/jitrl lens train；神经库重置：/jitrl lens reset confirm"
+                )
+        except Exception:
+            logger.warning("[JitRL Lens] command failed", exc_info=True)
+            yield event.plain_result("神经滤镜操作失败，请查看 AstrBot 日志。")
 
     @jitrl_group.command("stats")
     async def jitrl_stats(self, event: AstrMessageEvent, limit: int = 10) -> Any:
@@ -1183,7 +1503,8 @@ class JitRLLearner(Star):
                 removed = await self._bank.forget(scope=event.unified_msg_origin)
             self._invalidate_memory_cache()
             yield event.plain_result(
-                f"已删除 {removed} 条经验。删除前已自动备份，可用 /jitrl checkpoints 查看并回退。"
+                f"已删除 {removed} 条 V0.1 经验。删除前已自动备份，可用 /jitrl checkpoints 查看并回退。\n"
+                "神经经验与权重独立管理：/jitrl lens reset confirm。"
             )
         except Exception:
             logger.warning("[JitRL] forget command failed", exc_info=True)
@@ -1203,8 +1524,19 @@ class JitRLLearner(Star):
             yield event.plain_result(denied)
             return
         try:
-            await self._ensure_ready()
             umo = event.unified_msg_origin
+            if self.cfg.neural.mode != "off":
+                delta = (
+                    -_FEEDBACK_DELTA
+                    if verdict.strip().lower() == "bad"
+                    else _FEEDBACK_DELTA
+                )
+                updated = await self._apply_neural_feedback(umo, delta)
+                yield event.plain_result(
+                    f"已回填 {delta:+.1f} 用户反馈到上一轮神经经验的 {updated} 个步骤（追加结算，保留原始记录）。"
+                )
+                return
+            await self._ensure_ready()
             cached = self._last_episode.get(umo)
             if not cached:
                 yield event.plain_result("没有可回填的上一轮经验。")
@@ -1408,7 +1740,8 @@ class JitRLLearner(Star):
             self._invalidate_memory_cache()
             yield event.plain_result(
                 f"已回退{'全部会话' if scope == 'all' else '当前会话'}：{result['experiences']} 条经验。\n"
-                f"撤销本次回退可恢复检查点：{result['safety_checkpoint']['id']}"
+                f"撤销本次回退可恢复检查点：{result['safety_checkpoint']['id']}\n"
+                "此检查点只含 V0.1 经验库，不含神经经验或模型权重。"
             )
         except (ValueError, FileNotFoundError) as exc:
             yield event.plain_result(str(exc))
@@ -1521,6 +1854,9 @@ class JitRLLearner(Star):
             return json_response(
                 {
                     "enabled": self.cfg.enabled,
+                    "neural": await self._neural.status()
+                    if self._neural is not None
+                    else {"mode": self.cfg.neural.mode},
                     "apply_mode": self.cfg.apply_mode,
                     "total": total,
                     "stats": dict(self._stats),

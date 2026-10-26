@@ -10,14 +10,14 @@
     <header class="head">
       <div class="head-title">
         <h1>JitRL 持续学习</h1>
-        <p>推理时策略优化 · 无梯度更新 · 无微调</p>
+        <p>经验策略优化 · 可选本地 Neural Lens · 远端模型冻结</p>
       </div>
       <div class="head-meta">
         <span id="chip-mode" class="chip">--</span>
         <span id="chip-state" class="chip chip-muted">--</span>
         <button id="btn-refresh" class="btn" type="button">刷新</button>
         <button id="btn-export" class="btn" type="button">导出</button>
-        <button id="btn-forget" class="btn btn-danger" type="button" data-memory-mutation>清空记忆</button>
+        <button id="btn-forget" class="btn btn-danger" type="button" data-memory-mutation>清空 V0.1 记忆</button>
       </div>
     </header>
 
@@ -30,7 +30,13 @@
       </section>
 
       <section class="card span-2">
-        <h2>检查点与回退 <small>保存可信记忆，发现污染后恢复</small></h2>
+        <h2>Neural Lens <small>V0.2.0 可选本地神经扩展</small></h2>
+        <p id="neural-status" class="checkpoint-policy"></p>
+        <p class="checkpoint-policy">神经状态：/jitrl lens status；训练：/jitrl lens train。下方经验、曲线与检查点管理 V0.1 经验库，神经库与权重由 /jitrl lens reset confirm 独立重置。</p>
+      </section>
+
+      <section class="card span-2">
+        <h2>V0.1 检查点与回退 <small>保存可信记忆，发现污染后恢复</small></h2>
         <form id="checkpoint-form" class="checkpoint-form">
           <label for="checkpoint-name">检查点名称</label>
           <input id="checkpoint-name" type="text" maxlength="80" placeholder="例如：确认表现正常的版本（可选）" autocomplete="off" />

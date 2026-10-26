@@ -16,10 +16,10 @@
     ],
     "labels": [
       "仅记录（不干预）",
-      "偏好提示（零额外开销）",
-      "闭式 Logit 重排（论文原始路径）"
+      "偏好提示（V0.1）",
+      "候选代理评分重排（V0.1）"
     ],
-    "hint": "hint 模式零额外 LLM 调用；logit 模式完整实现论文的闭式策略更新，代价是每次请求多一次轻量生成调用。"
+    "hint": "V0.1 的 hint 为经验提示；logit 使用 verbalized confidence 代理候选分数。均不修改远端模型内部 logits。off 也禁止 Neural Lens 注入。"
   },
   "learning": {
     "description": "学习回路（经验采集与奖励评估）",
@@ -379,14 +379,22 @@
         "description": "自动检查点间隔（Episode 数）",
         "type": "int",
         "default": 50,
-        "slider": { "min": 0, "max": 10000, "step": 1 },
+        "slider": {
+          "min": 0,
+          "max": 10000,
+          "step": 1
+        },
         "hint": "首次使用时保存基线，之后每累计指定数量的 Episode 保存快照。0 关闭自动检查点，清空/回退前的安全备份仍保留。计数在插件重载后重新开始。"
       },
       "keep_checkpoints": {
         "description": "自动/安全检查点各自保留数量",
         "type": "int",
         "default": 20,
-        "slider": { "min": 1, "max": 200, "step": 1 },
+        "slider": {
+          "min": 1,
+          "max": 200,
+          "step": 1
+        },
         "hint": "自动检查点和操作前备份分别轮换。手动检查点不会自动删除，需要在面板或指令中主动删除。"
       }
     }
@@ -475,6 +483,102 @@
         "description": "记录策略决策日志",
         "type": "bool",
         "default": false
+      }
+    }
+  },
+  "neural": {
+    "description": "V0.2.0 本地 Neural Lens（可选实验功能）",
+    "type": "object",
+    "items": {
+      "mode": {
+        "description": "神经滤镜模式",
+        "type": "string",
+        "default": "off",
+        "hint": "off 使用 V0.1 路径；shadow 采集私有快照但保持原始请求；active 在本地模型已训练且证据满足门控时注入提示。远端大模型始终冻结。",
+        "options": [
+          "off",
+          "shadow",
+          "active"
+        ]
+      },
+      "pre_enabled": {
+        "description": "允许请求前经验提示",
+        "type": "bool",
+        "default": true
+      },
+      "post_enabled": {
+        "description": "启用独立 POST 候选评分 API",
+        "type": "bool",
+        "default": false,
+        "hint": "现有 AstrBot 请求钩子尚未连接候选执行器；此设置仅控制显式调用 score_candidates 的适配器。"
+      },
+      "auto_train": {
+        "description": "允许后台本地训练",
+        "type": "bool",
+        "default": false,
+        "hint": "需显式安装 PyTorch；默认通过管理员 /jitrl lens train 训练。每个会话独立训练，绝不跨会话混用。"
+      },
+      "train_every": {
+        "description": "后台训练间隔（执行事实数）",
+        "type": "int",
+        "default": 32
+      },
+      "min_samples": {
+        "description": "最少已结算训练样本",
+        "type": "int",
+        "default": 32
+      },
+      "train_steps": {
+        "description": "单次训练步数",
+        "type": "int",
+        "default": 20
+      },
+      "batch_size": {
+        "description": "训练批大小",
+        "type": "int",
+        "default": 16
+      },
+      "learning_rate": {
+        "description": "本地学习率",
+        "type": "float",
+        "default": 0.0003
+      },
+      "min_support": {
+        "description": "最少已结算邻居支持",
+        "type": "int",
+        "default": 3
+      },
+      "max_uncertainty": {
+        "description": "残差不确定性代理阈值",
+        "type": "float",
+        "default": 0.5,
+        "hint": "此数值未经概率校准，不是统计置信界。"
+      },
+      "relevance_threshold": {
+        "description": "结构动作相关性代理阈值",
+        "type": "float",
+        "default": 0.6
+      },
+      "similarity_threshold": {
+        "description": "冻结词法检索相似度阈值",
+        "type": "float",
+        "default": 0.25
+      },
+      "max_adjustment": {
+        "description": "POST 代理评分最大调整幅度",
+        "type": "float",
+        "default": 1.0
+      },
+      "evidence_tokens": {
+        "description": "提示预算目标",
+        "type": "int",
+        "default": 128,
+        "hint": "当前使用不超过此数的 UTF-8 字节作为保守 token 预算代理；仅输出受控名称、历史回报、来源和证据 ID。"
+      },
+      "replay_limit": {
+        "description": "回放及检索扫描上限",
+        "type": "int",
+        "default": 2048
       }
     }
   }

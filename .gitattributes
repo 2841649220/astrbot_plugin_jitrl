@@ -11,8 +11,5 @@
 /.gitattributes export-ignore
 /AGENTS.md export-ignore
 /dist export-ignore
-# Development-only documentation (compliance and host-API audits); the release
-# payload is unchanged, but a GitHub source-archive install should not have to
-# carry it.
-/docs export-ignore
+# Documentation includes the neural operating and research boundaries.
 /benchmarks export-ignore

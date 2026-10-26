@@ -1,5 +1,9 @@
 __pycache__/
 *.py[cod]
+*.pt
+*.pth
+*.safetensors
+*.onnx
 
 # Plugin runtime artefacts
 *.sqlite3

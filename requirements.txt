@@ -1,2 +1,3 @@
-# astrbot_plugin_jitrl uses the Python standard library only.
-# No third-party runtime dependencies are required.
+# The legacy path uses the Python standard library only.
+# Optional local neural training: install requirements-neural.txt explicitly.
+# The plugin never downloads model weights or installs packages at runtime.

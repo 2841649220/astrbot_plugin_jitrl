@@ -1,0 +1,43 @@
+{
+  "evidence": "synthetic-mechanical-smoke-only-no-agent-performance-claim",
+  "architecture": {
+    "hidden_dim": 384,
+    "blocks": 4,
+    "query_heads": 6,
+    "kv_heads": 2,
+    "bases": 8,
+    "rank": 8
+  },
+  "torch_version": "2.8.0+cu128",
+  "device": "cpu",
+  "training": {
+    "status": "trained",
+    "before_loss": 0.3147005379199982,
+    "after_loss": 0.19937314391136168,
+    "steps": 20,
+    "samples": 40,
+    "uncertainty": "observed-residual-proxy-uncalibrated",
+    "relevance": "structural-action-match-proxy",
+    "parameters": {
+      "active_neural": 5790638,
+      "engram_tables": 262016,
+      "total": 6052654,
+      "frozen_encoder": 0
+    }
+  },
+  "future_synthetic_candidate_mse": 0.01177596175137885,
+  "synthetic_candidate_selections": [
+    "verify",
+    "verify",
+    "verify",
+    "verify"
+  ],
+  "rendered_utf8_bytes": [
+    164,
+    164,
+    164,
+    164
+  ],
+  "real_llm_calls": 0,
+  "note": "permissive smoke gates; no real task improvement measured"
+}

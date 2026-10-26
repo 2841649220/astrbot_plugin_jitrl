@@ -72,8 +72,15 @@ function renderOverview(data) {
   document.getElementById("kpi-failures").textContent = stats.failures || 0;
 
   const modeLabels = { off: "仅记录", hint: "偏好提示", logit: "闭式 Logit 重排" };
+  const neural = data.neural || { mode: "off" };
   document.getElementById("chip-mode").textContent =
-    "模式：" + (modeLabels[data.apply_mode] || data.apply_mode || "--");
+    "模式：" + (neural.mode !== "off" ? "Neural " + neural.mode : (modeLabels[data.apply_mode] || data.apply_mode || "--"));
+  document.getElementById("neural-status").textContent = neural.mode === "off"
+    ? "神经扩展关闭；旧配置与 V0.1 行为保持兼容。"
+    : "模式 " + neural.mode + " · 决策 " + (neural.decisions || 0)
+      + " / 执行事实 " + (neural.executions || 0) + " / 回报事件 " + (neural.settlements || 0)
+      + " · PyTorch " + (neural.torch_installed === undefined ? "尚未检查" : (neural.torch_installed ? "已安装" : "未安装"))
+      + " · AstrBot PRE 已接入，POST 为独立评分 API。";
   const state = document.getElementById("chip-state");
   state.textContent = data.enabled ? "运行中" : "已停用";
   state.classList.toggle("chip-muted", !data.enabled);

@@ -55,7 +55,7 @@ SCHEMA_TYPES = {
 
 SHIPPED_SOURCES = (
     PLUGIN_ROOT / "main.py",
-    *sorted((PLUGIN_ROOT / "jitrl").glob("*.py")),
+    *sorted((PLUGIN_ROOT / "jitrl").rglob("*.py")),
 )
 """Modules inside the published package (tests and tooling are not shipped)."""
 
