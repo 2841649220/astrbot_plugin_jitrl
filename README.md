@@ -1,7 +1,7 @@
 # JitRL 持续学习 · astrbot_plugin_jitrl
 
 [![CI](https://github.com/2841649220/astrbot_plugin_jitrl/actions/workflows/ci.yml/badge.svg)](https://github.com/2841649220/astrbot_plugin_jitrl/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.1.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.1-blue)](CHANGELOG.md)
 
 > 让 AstrBot 的 Agent 在对话中**持续自我进化**——不微调、不训练、不占 GPU。
 >
@@ -99,6 +99,10 @@ git clone https://github.com/2841649220/astrbot_plugin_jitrl.git
 ```
 
 或者直接把 `astrbot_plugin_jitrl` 目录放进 `data/plugins/`，然后在 WebUI 的「插件」页重载。
+
+也可从 [v0.1.1 Release](https://github.com/2841649220/astrbot_plugin_jitrl/releases/tag/v0.1.1)
+下载 `astrbot_plugin_jitrl-v0.1.1.zip`，在 AstrBot 插件管理页选择「从文件安装」。
+安装包包含单个插件根目录，以及完整的代码、配置和面板资源。
 
 **零第三方依赖**：只用 Python 标准库（`sqlite3` / `json` / `re` / `asyncio` / `math`），不需要 `pip install` 任何东西。
 
@@ -263,6 +267,9 @@ git clone https://github.com/2841649220/astrbot_plugin_jitrl.git
 ---
 
 ## 9. 测试
+
+版本规则：常规功能和修复递增末位补丁号；只有大规模架构改进才递增中间版本号。
+发布时同步更新 `metadata.yaml`、`jitrl/__init__.py`、README 徽章、更新日志及 Git 标签。
 
 ```bash
 cd AstrBot

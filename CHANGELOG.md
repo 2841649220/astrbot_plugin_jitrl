@@ -3,9 +3,9 @@
 本项目的所有重要变更都记录在这个文件里。
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
-版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+版本规则：常规功能和修复递增末位补丁号；大规模架构改进才递增中间版本号。
 
-## [0.2.0] - 2026-10-26
+## [0.1.1] - 2026-10-26
 
 ### 新增
 
@@ -22,7 +22,7 @@
 - 拒绝错误的删除作用域、非法检查点 ID、缺少明确确认的 Web 请求及损坏/不兼容的快照。
 - 备份失败时中止删除和回退；回退写入失败时整体回滚，不留下半恢复数据。
 - 面板并行加载统计，忽略过期刷新响应；变更处理中禁用重复操作，回退和删除使用沙箱兼容的页内两步确认。
-- 版本号更新为 `0.2.0`，维持零第三方运行时依赖。
+- 版本号更新为 `0.1.1`，维持零第三方运行时依赖。
 
 ## [0.1.0] - 2026-10-26
 
@@ -62,4 +62,4 @@ LLM Agents Without Gradient Updates*（Li et al., ICML 2026）的推理时策略
   `metadata.yaml` 与 `jitrl/__init__.py` 的 `__version__` 现在保持一致。
 
 [0.1.0]: https://github.com/2841649220/astrbot_plugin_jitrl/releases/tag/v0.1.0
-[0.2.0]: https://github.com/2841649220/astrbot_plugin_jitrl/compare/v0.1.0...main
+[0.1.1]: https://github.com/2841649220/astrbot_plugin_jitrl/releases/tag/v0.1.1

@@ -15,3 +15,6 @@ export-*.json
 
 # AstrBot data directory, only present when running the tests from here
 data/
+
+# Locally built release assets and notes
+dist/

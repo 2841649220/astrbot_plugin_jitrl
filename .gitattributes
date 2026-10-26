@@ -1,3 +1,12 @@
 # Normalise every text file to LF in the repository so Windows checkouts and
 # the Linux CI runner produce identical blobs and diffs.
 * text=auto eol=lf
+
+# Keep Git archives and release ZIPs focused on the installable plugin.
+/.github export-ignore
+/tests export-ignore
+/pyproject.toml export-ignore
+/.gitignore export-ignore
+/.gitattributes export-ignore
+/AGENTS.md export-ignore
+/dist export-ignore
