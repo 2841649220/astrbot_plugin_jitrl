@@ -100,6 +100,11 @@ git clone https://github.com/2841649220/astrbot_plugin_jitrl.git
 
 或者直接把 `astrbot_plugin_jitrl` 目录放进 `data/plugins/`，然后在 WebUI 的「插件」页重载。
 
+要求 **AstrBot `>=4.29,<5`**：学习钩子 `filter.on_agent_done` 从 4.24 起提供，
+而 `views/` 面板目录从 4.29 起才会被宿主扫描，因此整体门槛是 4.29（该版本要求
+Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot_version`
+阻止加载。
+
 也可从 [v0.1.1 Release](https://github.com/2841649220/astrbot_plugin_jitrl/releases/tag/v0.1.1)
 下载 `astrbot_plugin_jitrl-v0.1.1.zip`，在 AstrBot 插件管理页选择「从文件安装」。
 安装包包含单个插件根目录，以及完整的代码、配置和面板资源。
@@ -272,14 +277,17 @@ git clone https://github.com/2841649220/astrbot_plugin_jitrl.git
 发布时同步更新 `metadata.yaml`、`jitrl/__init__.py`、README 徽章、更新日志及 Git 标签。
 
 ```bash
-cd AstrBot
+python -m pytest tests -q                                      # 在仓库根目录即可
+node --test tests/test_dashboard.cjs
+
+# 或在 AstrBot 的 data/plugins/ 布局下运行
 python -m pytest data/plugins/astrbot_plugin_jitrl/tests -q
-node --test data/plugins/astrbot_plugin_jitrl/tests/test_dashboard.cjs
 ```
 
-本机（未安装 AstrBot）实测：**305 passed, 1 skipped**，另有 **7 项 Node.js 面板交互测试通过**。
-`test_integration.py` 会自己 `importorskip`；存储恢复、插件接线、并发保护和面板交互仍可在没有 AstrBot 的环境验证。
-在 AstrBot 仓库内还会额外执行该文件的 28 项集成测试。
+本机实测：未安装 AstrBot 时 **314 passed, 1 skipped**；把 AstrBot 4.29.3 装进独立 venv 后
+**342 passed**（多出 28 项真宿主集成测试）；另有 **7 项 Node.js 面板交互测试通过**。
+`test_integration.py` 会自己 `importorskip` 并按包名装载插件，因此在仓库根目录或
+`data/plugins/` 下都能跑；`test_manifest.py` 不依赖 AstrBot，专门守护发布元数据与版本一致性。
 测试分两层：
 
 | 文件 | 覆盖 |
@@ -295,6 +303,7 @@ node --test data/plugins/astrbot_plugin_jitrl/tests/test_dashboard.cjs
 | `test_trajectory.py` | dict 与 pydantic 两种消息形态、tool_call_id 匹配、坏 arguments、状态口径一致性 |
 | `test_integration.py` | **真实插件类**跑完整回路：Hook 注入 → 轨迹采集 → 落库 → 下轮生效、工具门控、用户反馈、指令、Web API |
 | `test_view.py` | 面板契约：沙箱内禁用 `alert/confirm/prompt`、清空记忆的页内两步确认、`bridge.download` 参数签名、`app.js` 与 `index.html` 的 id 一致性、静态资源入口 |
+| `test_manifest.py` | 发布契约：必填字段必须是字符串（防 YAML 把 `author` 解析成整数）、版本在 metadata / 代码 / 徽章 / 更新日志间一致、`repo` 与 `astrbot_version` 格式、安装布局、配置 schema 可渲染 |
 
 > Windows 提示：如果 `%TEMP%\pytest-of-ASUS` 的 ACL 被别的账户占用导致 `tmp_path` 报 `PermissionError`，把 TEMP 指到别处再跑：
 >
@@ -314,7 +323,7 @@ astrbot_plugin_jitrl/
 ├── metadata.yaml          # 插件元数据
 ├── _conf_schema.json      # 配置 Schema（WebUI 可视化）
 ├── __init__.py            # 使 `data.plugins.astrbot_plugin_jitrl` 成为包，保证相对导入
-├── requirements.txt       # 空（零第三方依赖）
+├── requirements.txt       # 仅注释，零第三方运行时依赖
 ├── pyproject.toml         # 仅 lint / 测试配置（本仓库不是 pip 包）
 ├── LICENSE                # AGPL-3.0
 ├── CHANGELOG.md           # 版本变更记录
@@ -333,6 +342,7 @@ astrbot_plugin_jitrl/
 │   ├── trajectory.py      # 从 run_context.messages 重建 (s_t, a_t) 轨迹
 │   └── hint.py            # 证据块 / 检索报告的渲染
 ├── views/dashboard/       # WebUI 可视化面板（index.html / app.js / style.css）
+├── scripts/               # python scripts/build_release.py：构建单根目录发布 ZIP
 └── tests/                 # pytest 单测与端到端集成测试
 ```
 
@@ -354,11 +364,18 @@ astrbot_plugin_jitrl/
 
 论文代码：<https://github.com/liushiliushi/JitRL>
 
+> 本插件是论文方法的**独立实现**，未复制或移植论文官方仓库（JitRL）的代码；论文及其官方实现的
+> 权利归原作者。面板与仓库内不含任何第三方 JS/CSS/CDN 资源，`LICENSE` 为 AGPL-3.0。
+
 ---
 
 ## 12. 版本
 
-当前版本 **0.1.0**（首个公开版本）。完整的版本变更记录见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本 **0.1.1**（修订重发：修正 `metadata.yaml` 的 `author` 类型与 AstrBot 版本声明，
+完整变更见 [CHANGELOG.md](CHANGELOG.md)）。
+
+发布：`python scripts/build_release.py` 会校验四处版本号一致，再生成单根目录的
+`dist/astrbot_plugin_jitrl-v<版本>.zip` 并输出 SHA-256（超过 16 MB 直接失败）。
 
 ---
 

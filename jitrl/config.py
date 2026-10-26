@@ -275,7 +275,7 @@ class CommandsConfig:
     Attributes:
         enabled: Whether the `/jitrl` command group is registered.
         admin_only: Restrict commands to AstrBot admins.
-        enable_agent_tools: Expose `jitrl_recall` / `jitrl_note` to the agent.
+        enable_agent_tools: Expose `jitrl_recall` to the agent.
     """
 
     enabled: bool = True
@@ -289,11 +289,9 @@ class DebugConfig:
 
     Attributes:
         log_decisions: Log every policy decision at INFO level.
-        expose_decision: Append a decision summary to the reply.
     """
 
     log_decisions: bool = False
-    expose_decision: bool = False
 
 
 @dataclass(slots=True)
@@ -470,6 +468,5 @@ class JitRLConfig:
             ),
             debug=DebugConfig(
                 log_decisions=_as_bool(debug.get("log_decisions"), False),
-                expose_decision=_as_bool(debug.get("expose_decision"), False),
             ),
         )

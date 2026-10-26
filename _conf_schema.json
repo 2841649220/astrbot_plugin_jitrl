@@ -19,11 +19,6 @@
       "偏好提示（零额外开销）",
       "闭式 Logit 重排（论文原始路径）"
     ],
-    "subtitles": [
-      "只学习不干预，用于观察",
-      "把优势排序后的经验注入系统提示词",
-      "额外一次轻量采样得到置信度，按 z'=z+β·Â 更新后重采样"
-    ],
     "hint": "hint 模式零额外 LLM 调用；logit 模式完整实现论文的闭式策略更新，代价是每次请求多一次轻量生成调用。"
   },
   "learning": {
@@ -63,7 +58,7 @@
       "evaluator_timeout": {
         "description": "评估器超时（秒）",
         "type": "float",
-        "default": 30,
+        "default": 30.0,
         "slider": {
           "min": 5,
           "max": 180,
@@ -184,7 +179,7 @@
       "recency_half_life_days": {
         "description": "时效半衰期（天）",
         "type": "float",
-        "default": 30,
+        "default": 30.0,
         "slider": {
           "min": 1,
           "max": 365,
@@ -234,7 +229,7 @@
       "ucb_alpha": {
         "description": "乐观奖励 α",
         "type": "float",
-        "default": 5,
+        "default": 5.0,
         "slider": {
           "min": 0.5,
           "max": 20,
@@ -251,7 +246,7 @@
       "sample_temperature": {
         "description": "重采样温度",
         "type": "float",
-        "default": 1,
+        "default": 1.0,
         "slider": {
           "min": 0.1,
           "max": 3,
@@ -438,7 +433,7 @@
         "default": true
       },
       "enable_agent_tools": {
-        "description": "向 Agent 暴露 jitrl_recall / jitrl_note 工具",
+        "description": "向 Agent 暴露 jitrl_recall 工具",
         "type": "bool",
         "default": true
       }
@@ -450,11 +445,6 @@
     "items": {
       "log_decisions": {
         "description": "记录策略决策日志",
-        "type": "bool",
-        "default": false
-      },
-      "expose_decision": {
-        "description": "在回复后附上本次策略决策摘要",
         "type": "bool",
         "default": false
       }

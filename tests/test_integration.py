@@ -8,7 +8,7 @@ instead of in production.
 
 Run with::
 
-    python -m pytest data/plugins/astrbot_plugin_jitrl/tests -q
+    python -m pytest tests/test_integration.py -q
 """
 
 from __future__ import annotations
@@ -280,10 +280,10 @@ def plugin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
     Returns:
         A configured ``JitRLLearner`` whose data path points at ``tmp_path``.
     """
-    from data.plugins.astrbot_plugin_jitrl.main import JitRLLearner
+    from astrbot_plugin_jitrl.main import JitRLLearner
 
     monkeypatch.setattr(
-        "data.plugins.astrbot_plugin_jitrl.main.get_astrbot_plugin_data_path",
+        "astrbot_plugin_jitrl.main.get_astrbot_plugin_data_path",
         lambda: str(tmp_path),
     )
     instance = JitRLLearner(FakeContext(), dict(CONFIG))

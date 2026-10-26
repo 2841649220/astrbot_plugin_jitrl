@@ -5,6 +5,7 @@
 # Keep Git archives and release ZIPs focused on the installable plugin.
 /.github export-ignore
 /tests export-ignore
+/scripts export-ignore
 /pyproject.toml export-ignore
 /.gitignore export-ignore
 /.gitattributes export-ignore
