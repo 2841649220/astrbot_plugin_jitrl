@@ -29,7 +29,7 @@
 
 ### 开发早期的神经基础设施与兼容路径
 
-- 在 V0.1.2 基础上新增 `jitrl/neural`，独立分支 `codex/v0.2.0-neural-lens`；保留原插件入口、配置、命令、Web 路由及默认行为。`neural.mode` 默认 `off`，PyTorch 惰性导入且单独安装，旧数据库不迁移。
+- 在 V0.1.2 基础上新增 `jitrl/neural`，独立实验分支 `v0.2.0-neural-lens`；保留原插件入口、配置、命令、Web 路由及默认行为。`neural.mode` 默认 `off`，PyTorch 惰性导入且单独安装，旧数据库不迁移。
 - 开发早期实现 Engram-inspired 条件表、四个向量 MLP、经验编译器、低秩适配器和单 query GQA；此向量主干现保留为 legacy，对应当前默认主干为上文的四层 MiTA。远端模型始终冻结，不宣称继承 JitRL 收敛定理。
 - 私有 scope 的状态、精确历史快照、执行事实 PENDING 与 append-only 回报结算；排除未执行候选、自身、同 episode 和未来结算标签；保留回报来源、可靠性与跨版本校验。
 - 独立的会话模型和不可变 checkpoint：训练模型副本、梯度裁剪、原子发布、SHA-256 与 `weights_only=True` 加载；PRE/POST 绑定同一版本；重置失效旧写入并清理权重，卸载等待本地训练结束。
@@ -38,7 +38,7 @@
 - 新增三篇论文与 plan 的研究说明、运行/API 文档、离线 CPU smoke、存储/模型/宿主兼容性和并发回归测试，以及可选神经 CPU CI 作业。正式 384d/4-block 合成验证跑通，不作为真实任务效果证据。
 - 同步 `0.2.0` 版本链，安装 ZIP 包含文档与可选依赖清单，排除本地数据库、权重、缓存和开发工具。
 
-[0.2.0]: https://github.com/2841649220/astrbot_plugin_jitrl/compare/v0.1.2...codex/v0.2.0-neural-lens
+[0.2.0]: https://github.com/2841649220/astrbot_plugin_jitrl/compare/v0.1.2...v0.2.0-neural-lens
 
 ## [0.1.2] - 2026-10-27
 
