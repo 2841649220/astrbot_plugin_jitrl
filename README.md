@@ -418,8 +418,7 @@ astrbot_plugin_jitrl/
 
 ## 12. 版本
 
-当前版本 **0.1.1**（修订重发：修正 `metadata.yaml` 的 `author` 类型与 AstrBot 版本声明，
-完整变更见 [CHANGELOG.md](CHANGELOG.md)）。
+当前版本 **0.1.2**（完整变更见 [CHANGELOG.md](CHANGELOG.md)）。
 
 发布：`python scripts/build_release.py` 会校验四处版本号一致，再生成单根目录的
 `dist/astrbot_plugin_jitrl-v<版本>.zip` 并输出 SHA-256（超过 16 MB 直接失败）。
