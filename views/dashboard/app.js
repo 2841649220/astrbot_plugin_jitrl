@@ -10,6 +10,8 @@ const bridge = window.AstrBotPluginView || window.AstrBotPluginPage;
 const hint = document.getElementById("hint");
 const actionHint = document.getElementById("action-hint");
 const forgetButton = document.getElementById("btn-forget");
+const robotSelect = document.getElementById("robot-select");
+const robotHint = document.getElementById("robot-hint");
 
 const FORGET_ARM_MS = 6000;
 let forgetArmed = false;
@@ -17,6 +19,7 @@ let forgetTimer = null;
 let checkpointArmed = null;
 let mutationBusy = false;
 let refreshVersion = 0;
+let selectedRobotId = "";
 
 function setMutationBusy(busy) {
   mutationBusy = busy;
@@ -24,6 +27,7 @@ function setMutationBusy(busy) {
     button.disabled = busy;
   }
   document.getElementById("checkpoint-name").disabled = busy;
+  document.getElementById("btn-export").disabled = busy || !selectedRobotId;
 }
 
 function disarmCheckpoint() {
@@ -57,11 +61,32 @@ function signClass(value) {
 
 async function apiGet(endpoint, params, fallback) {
   try {
-    return await bridge.apiGet(endpoint, params);
+    return await bridge.apiGet(endpoint, { ...params, robot: selectedRobotId });
   } catch (error) {
     setHint(String((error && error.message) || error), true);
     return fallback;
   }
+}
+
+function renderRobotSelector(robots, selected) {
+  robotSelect.textContent = "";
+  for (const robot of robots || []) {
+    const option = document.createElement("option");
+    option.value = robot.id;
+    option.textContent = robot.label || (robot.platform_name + " · " + robot.self_id);
+    robotSelect.append(option);
+  }
+  selectedRobotId = selected || "";
+  robotSelect.value = selectedRobotId;
+  robotSelect.disabled = !selectedRobotId;
+  for (const button of document.querySelectorAll("[data-memory-mutation]")) {
+    button.disabled = !selectedRobotId || mutationBusy;
+  }
+  document.getElementById("checkpoint-name").disabled = !selectedRobotId || mutationBusy;
+  document.getElementById("btn-export").disabled = !selectedRobotId || mutationBusy;
+  robotHint.textContent = selectedRobotId
+    ? "当前面板只查看和管理该机器人实例的独立记忆。"
+    : "还没有机器人实例完成学习；开始一轮对话后即可在此选择。";
 }
 
 function renderOverview(data) {
@@ -263,7 +288,7 @@ function renderCheckpoints(payload) {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "btn btn-danger";
-      button.textContent = action === "rollback" ? "回退全库" : "删除快照";
+      button.textContent = action === "rollback" ? "回退机器人记忆" : "删除快照";
       button.setAttribute("data-memory-mutation", "");
       button.disabled = mutationBusy;
       button.addEventListener("click", function () { checkpointAction(row, action, button); });
@@ -282,7 +307,7 @@ async function createCheckpoint(event) {
   setMutationBusy(true);
   const input = document.getElementById("checkpoint-name");
   try {
-    const result = await bridge.apiPost("checkpoint", { name: input.value.trim() });
+    const result = await bridge.apiPost("checkpoint", { name: input.value.trim(), robot: selectedRobotId });
     const row = result.checkpoint;
     sayAction("已保存检查点 " + row.id + "（" + row.experiences + " 条经验）。");
     input.value = "";
@@ -304,14 +329,14 @@ async function checkpointAction(row, action, button) {
     button.classList.add("btn-armed");
     checkpointArmed = { id: row.id, action, button, label, timer: setTimeout(disarmCheckpoint, FORGET_ARM_MS) };
     sayAction(action === "rollback"
-      ? "将用此检查点替换全部会话记忆，当前数据会自动备份。请在 6 秒内再次点击确认。"
+      ? "将用此检查点替换当前机器人的全部会话记忆，当前数据会自动备份。请在 6 秒内再次点击确认。"
       : "删除此快照不可撤销。请在 6 秒内再次点击确认。");
     return;
   }
   disarmCheckpoint();
   setMutationBusy(true);
   try {
-    const result = await bridge.apiPost(action, { id: row.id, scope: "all", confirm: true });
+    const result = await bridge.apiPost(action, { id: row.id, scope: "all", confirm: true, robot: selectedRobotId });
     sayAction(action === "rollback"
       ? "已回退 " + result.experiences + " 条经验。撤销本次回退可恢复备份 " + result.safety_checkpoint.id + "。"
       : "已删除指定快照。");
@@ -326,12 +351,34 @@ async function checkpointAction(row, action, button) {
 async function refresh() {
   const version = ++refreshVersion;
   setHint("正在加载…");
+  const robotPayload = await apiGet("robots", {}, null);
+  if (version !== refreshVersion) return;
+  if (!robotPayload) {
+    setHint("无法读取机器人实例列表，请确认插件已加载且后端可用。", true);
+    return;
+  }
+  const robots = robotPayload.robots || [];
+  if (!robots.length) {
+    renderRobotSelector([], "");
+    renderOverview({ enabled: false, apply_mode: "off", total: 0, stats: {}, hyper: {} });
+    renderCurve({ buckets: [] });
+    renderActions({ actions: [] });
+    renderEpisodes({ episodes: [] });
+    renderCheckpoints({ checkpoints: [], interval: 0, keep: 0 });
+    setHint("数据库：等待机器人开始学习");
+    return;
+  }
+  if (!robots.some((robot) => robot.id === selectedRobotId)) {
+    selectedRobotId = robots[0].id;
+  }
+  renderRobotSelector(robots, selectedRobotId);
   const overview = await apiGet("overview", {}, null);
   if (version !== refreshVersion) return;
   if (!overview) {
     setHint("无法读取 JitRL 状态，请确认插件已加载且后端可用。", true);
     return;
   }
+  renderRobotSelector(overview.robots, overview.robot_id);
   renderOverview(overview);
   const [curve, actions, episodes, checkpoints] = await Promise.all([
     apiGet("curve", { buckets: 14 }, null),
@@ -351,7 +398,7 @@ async function downloadExport() {
   const button = document.getElementById("btn-export");
   button.disabled = true;
   try {
-    await bridge.download("export", {}, "jitrl-export.json");
+    await bridge.download("export", { robot: selectedRobotId }, "jitrl-export.json");
     sayAction("已开始下载导出文件。");
   } catch (error) {
     sayAction("导出失败：" + String((error && error.message) || error), true);
@@ -377,7 +424,7 @@ async function forgetAll() {
     forgetArmed = true;
     forgetButton.textContent = "再次点击确认清空";
     forgetButton.classList.add("btn-armed");
-    sayAction("将清空全部记忆，清空前会自动保存检查点。请再点一次确认（6 秒后自动取消）。");
+    sayAction("将清空当前机器人的全部记忆，清空前会自动保存检查点。请再点一次确认（6 秒后自动取消）。");
     if (forgetTimer) clearTimeout(forgetTimer);
     forgetTimer = setTimeout(disarmForget, FORGET_ARM_MS);
     return;
@@ -385,7 +432,7 @@ async function forgetAll() {
   disarmForget();
   setMutationBusy(true);
   try {
-    const result = await bridge.apiPost("forget", { scope: "all", confirm: true });
+    const result = await bridge.apiPost("forget", { scope: "all", confirm: true, robot: selectedRobotId });
     const removed = result && typeof result.removed === "number" ? result.removed : 0;
     sayAction("已删除 " + removed + " 条经验，可从删除前备份回退。");
     await refresh();
@@ -403,6 +450,10 @@ async function main() {
   }
   await bridge.ready();
   document.getElementById("btn-refresh").addEventListener("click", refresh);
+  robotSelect.addEventListener("change", () => {
+    selectedRobotId = robotSelect.value;
+    refresh();
+  });
   document.getElementById("btn-export").addEventListener("click", downloadExport);
   forgetButton.addEventListener("click", forgetAll);
   document.getElementById("checkpoint-form").addEventListener("submit", createCheckpoint);

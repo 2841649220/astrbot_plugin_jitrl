@@ -13,6 +13,8 @@ const snapshot = {
   id: "a".repeat(32), name: "可信版本", kind: "manual", created_at: 1000,
   episodes: 1, experiences: 2, size_bytes: 8192,
 };
+const robot = { id: "1".repeat(64), label: "test · bot" };
+const robot2 = { id: "2".repeat(64), label: "test · bot 2" };
 
 class Element {
   constructor(tag = "div") {
@@ -57,14 +59,19 @@ async function dashboard() {
   const timers = new Map();
   let nextTimer = 0;
   const posts = [];
+  const gets = [];
   const bridge = {
     inventory: [{ ...snapshot }],
     ready: async () => {},
-    apiGet: async (endpoint) => ({
-      overview: { total: 2, enabled: true, apply_mode: "hint", stats: {} },
-      curve: { buckets: [] }, actions: { actions: [] }, episodes: { episodes: [] },
-      checkpoints: { checkpoints: bridge.inventory, interval: 50, keep: 20 },
-    })[endpoint],
+    apiGet: async (endpoint, params) => {
+      gets.push({ endpoint, params: JSON.parse(JSON.stringify(params)) });
+      return ({
+        robots: { robots: [robot, robot2] },
+        overview: { total: 2, enabled: true, apply_mode: "hint", stats: {}, robot_id: params.robot || robot.id, robots: [robot, robot2] },
+        curve: { buckets: [] }, actions: { actions: [] }, episodes: { episodes: [] },
+        checkpoints: { checkpoints: bridge.inventory, interval: 50, keep: 20 },
+      })[endpoint];
+    },
     apiPost: async (endpoint, payload) => {
       posts.push({ endpoint, payload: JSON.parse(JSON.stringify(payload)) });
       if (bridge.postHandler) return bridge.postHandler(endpoint, payload);
@@ -90,7 +97,7 @@ async function dashboard() {
   });
   vm.runInContext(source.replace(/\nmain\(\);\s*$/, "\nglobalThis.boot = main();"), context);
   await context.boot;
-  return { ids, bridge, posts, timers, document,
+  return { ids, bridge, posts, gets, timers, document,
     controls: () => ids.checkpoints.children[0].children[1].children,
   };
 }
@@ -101,14 +108,23 @@ test("snapshot inventory renders its ID, counts and retention policy", async () 
   assert.match(app.ids.checkpoints.textContent, /2 条经验/);
   assert.match(app.ids.checkpoints.textContent, new RegExp(snapshot.id));
   assert.match(app.ids["checkpoint-policy"].textContent, /手动检查点保留到主动删除/);
-  assert.equal(app.controls()[0].textContent, "回退全库");
+  assert.equal(app.controls()[0].textContent, "回退机器人记忆");
+});
+
+test("switching robots scopes every dashboard read to the selected instance", async () => {
+  const app = await dashboard();
+  const start = app.gets.length;
+  app.ids["robot-select"].value = robot2.id;
+  await app.ids["robot-select"].emit("change");
+  assert.equal(app.ids["robot-select"].value, robot2.id);
+  assert.ok(app.gets.slice(start).filter((call) => call.endpoint !== "robots").every((call) => call.params.robot === robot2.id));
 });
 
 test("form creates a named snapshot and reports the saved ID", async () => {
   const app = await dashboard();
   app.ids["checkpoint-name"].value = "  已验证  ";
   await app.ids["checkpoint-form"].emit("submit");
-  assert.deepEqual(app.posts, [{ endpoint: "checkpoint", payload: { name: "已验证" } }]);
+  assert.deepEqual(app.posts, [{ endpoint: "checkpoint", payload: { name: "已验证", robot: robot.id } }]);
   assert.equal(app.ids["checkpoint-name"].value, "");
   assert.match(app.ids["action-hint"].textContent, new RegExp(snapshot.id));
 });
@@ -120,7 +136,7 @@ test("rollback requires two clicks and includes explicit global confirmation", a
   assert.equal(app.posts.length, 0);
   assert.equal(button.textContent, "再次点击确认回退");
   await button.emit("click");
-  assert.deepEqual(app.posts, [{ endpoint: "rollback", payload: { id: snapshot.id, scope: "all", confirm: true } }]);
+  assert.deepEqual(app.posts, [{ endpoint: "rollback", payload: { id: snapshot.id, scope: "all", confirm: true, robot: robot.id } }]);
   assert.match(app.ids["action-hint"].textContent, new RegExp("b".repeat(32)));
 });
 
@@ -129,7 +145,7 @@ test("switching action and expiring confirmation cannot authorize deletion", asy
   const [rollback, remove] = app.controls();
   await rollback.emit("click");
   await remove.emit("click");
-  assert.equal(rollback.textContent, "回退全库");
+  assert.equal(rollback.textContent, "回退机器人记忆");
   assert.equal(app.posts.length, 0);
   for (const fn of [...app.timers.values()]) fn();
   assert.equal(remove.textContent, "删除快照");

@@ -162,7 +162,7 @@ class RetrievalConfig:
         k: Neighbourhood size `k`.
         similarity_threshold: Minimum Jaccard similarity `r`.
         surface_gate: Restrict retrieval to the same `surface`.
-        scope_isolation: `session`, `global` or `hybrid`.
+        scope_isolation: `session`, `global` or `hybrid`, applied within one robot.
         prefilter_limit: Work cap on the candidate rows scored per query.
         recency_half_life_days: Half-life of the recency weight; `0` disables.
         min_count: Minimum supporting neighbours before an action is trusted;

@@ -13,6 +13,8 @@
         <p>推理时策略优化 · 无梯度更新 · 无微调</p>
       </div>
       <div class="head-meta">
+        <label class="robot-select-label" for="robot-select">机器人</label>
+        <select id="robot-select" class="robot-select" aria-label="选择机器人实例"></select>
         <span id="chip-mode" class="chip">--</span>
         <span id="chip-state" class="chip chip-muted">--</span>
         <button id="btn-refresh" class="btn" type="button">刷新</button>
@@ -37,7 +39,7 @@
           <button id="btn-checkpoint" class="btn" type="submit" data-memory-mutation>创建检查点</button>
         </form>
         <p id="checkpoint-policy" class="checkpoint-policy"></p>
-        <p class="checkpoint-policy">面板回退会替换全部会话的记忆，并自动备份当前数据。仅回退当前会话可使用聊天指令。</p>
+        <p class="checkpoint-policy">面板回退会替换当前机器人的全部会话记忆，并自动备份当前数据。仅回退当前会话可使用聊天指令。</p>
         <ul id="checkpoints" class="checkpoints" aria-label="检查点列表"></ul>
       </section>
 
@@ -66,6 +68,7 @@
 
     <footer class="foot">
       <p id="action-hint" class="action-hint" role="status" aria-live="polite"></p>
+      <p id="robot-hint" class="hint"></p>
       <p id="hint" class="hint"></p>
     </footer>
     <script type="module" src="./app.js"></script>

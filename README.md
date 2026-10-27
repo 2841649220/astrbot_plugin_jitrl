@@ -1,7 +1,7 @@
 # JitRL 持续学习 · astrbot_plugin_jitrl
 
 [![CI](https://github.com/2841649220/astrbot_plugin_jitrl/actions/workflows/ci.yml/badge.svg)](https://github.com/2841649220/astrbot_plugin_jitrl/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.1.2-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.3-blue)](CHANGELOG.md)
 
 > 让 AstrBot 的 Agent 在对话中**持续自我进化**——不微调、不训练、不占 GPU。
 >
@@ -92,7 +92,13 @@ AstrBot 的对话是黑盒 API，拿不到原始 logits。论文 §5.1 正好给
 
 学习默认在**后台任务**里跑（`learning.async_learn`），用户不会多等一毫秒。
 
-### 2.3 相对论文的工程改进（算法与执行效率）
+### 2.3 多机器人独立学习
+
+每个 AstrBot 机器人账号使用独立的 SQLite 记忆库、检查点、导出文件与运行统计。插件按平台实例 ID 和机器人 `self_id` 识别机器人；`retrieval.scope_isolation` 的 `global` 只代表当前机器人内跨会话共享，任何模式都不会让不同机器人互相检索或训练。WebUI 面板可切换机器人，并且只会查看或管理当前选择的实例。
+
+升级时，旧版 `memory.sqlite3` 与检查点会迁移给第一个触发 JitRL 的机器人，其他机器人从空记忆开始；之后不会再次迁移旧库。
+
+### 2.4 相对论文的工程改进（算法与执行效率）
 
 论文是评测框架，本插件是**每次对话都要跑一遍**的运行时。落地时做了 8 处数学/工程上的改动，
 每一处都写清了"为什么"；要严格复现论文数值时，把 `retrieval.estimator_weighting` 与
@@ -139,13 +145,13 @@ git clone https://github.com/2841649220/astrbot_plugin_jitrl.git
 Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot_version`
 阻止加载。
 
-也可从 [v0.1.2 Release](https://github.com/2841649220/astrbot_plugin_jitrl/releases/tag/v0.1.2)
-下载 `astrbot_plugin_jitrl-v0.1.2.zip`，在 AstrBot 插件管理页选择「从文件安装」。
+也可从 [v0.1.3 Release](https://github.com/2841649220/astrbot_plugin_jitrl/releases/tag/v0.1.3)
+下载 `astrbot_plugin_jitrl-v0.1.3.zip`，在 AstrBot 插件管理页选择「从文件安装」。
 安装包包含单个插件根目录，以及完整的代码、配置和面板资源。
 
 **零第三方依赖**：只用 Python 标准库（`sqlite3` / `json` / `re` / `asyncio` / `math`），不需要 `pip install` 任何东西。
 
-数据库位置：`data/plugin_data/astrbot_plugin_jitrl/memory.sqlite3`。
+机器人记忆位置：`data/plugin_data/astrbot_plugin_jitrl/robots/<机器人实例哈希>/memory.sqlite3`。
 
 ---
 
@@ -185,22 +191,22 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 
 | 指令 | 作用 |
 | --- | --- |
-| `/jitrl status` | 记忆条数、学习进度、干预次数、当前超参、最近一次决策 |
+| `/jitrl status` | 当前机器人的记忆条数、学习进度、干预次数、当前超参、最近一次决策 |
 | `/jitrl stats [n]` | **各动作的平均回报 / 正回报率排行** —— 一眼看出哪个工具在这个部署里真的有用 |
 | `/jitrl curve [n]` | 学习曲线（按时间分桶的平均回报），复现论文 Figure 3 |
 | `/jitrl recall [query]` | 按当前或指定情景检索历史经验 |
 | `/jitrl episodes [n]` | 最近 episode 摘要 |
-| `/jitrl forget [session\|all]` | session 删除本会话记忆，all 清空全部；删除前自动备份 |
+| `/jitrl forget [session\|all]` | session 删除本会话记忆，all 清空当前机器人的全部记忆；删除前自动备份 |
 | `/jitrl checkpoint [名称]` | 创建手动检查点，保留到主动删除 |
 | `/jitrl checkpoints [n]` | 列出最近的检查点、完整 ID、时间和经验数 |
-| `/jitrl rollback <ID> [session\|all] confirm` | 从检查点回退，默认仅当前会话；回退前自动备份当前全库 |
+| `/jitrl rollback <ID> [session\|all] confirm` | 从当前机器人的检查点回退，默认仅当前会话；回退前自动备份 |
 | `/jitrl checkpoint_delete <ID> confirm` | 永久删除指定检查点，不修改当前记忆 |
 | `/jitrl feedback good\|bad` | 手动回填对上一轮的评价 |
 | `/jitrl export` | 导出记忆 JSON |
 
 ### 检查点与污染恢复
 
-检查点管理指令始终仅管理员可用，即使关闭了 `commands.admin_only`，因为每份快照包含全部会话的数据。
+检查点管理指令始终仅管理员可用，即使关闭了 `commands.admin_only`；每份快照包含当前机器人全部会话的数据。
 
 ```text
 /jitrl checkpoint 可信基线
@@ -209,7 +215,7 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 /jitrl rollback <从列表复制的完整ID> all confirm
 ```
 
-先在确认表现正常时保存一个手动检查点。发现异常后，可以只回退当前会话，或回退全部会话。
+先在确认表现正常时保存一个手动检查点。发现异常后，可以只回退当前会话，或回退当前机器人的全部会话。
 回退命令未带 `confirm` 时只提示确认用法。操作成功后会返回一份「回退前备份」的 ID；
 恢复这个 ID 即可撤销刚才的回退，撤销时同样可以选择 `session` 或 `all`。
 
@@ -217,7 +223,7 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 `memory.checkpoint_interval = 0` 关闭这两类自动保存，删除和回退前的备份仍然生效。
 自动保存计数在插件重载或回退后重新开始；自动历史和操作前备份各保留 **20** 份，手动检查点不参与轮换。
 
-快照独立存放在 `data/plugin_data/astrbot_plugin_jitrl/checkpoints/`，使用 SQLite Backup API
+快照独立存放在 `data/plugin_data/astrbot_plugin_jitrl/robots/<机器人实例哈希>/checkpoints/`，使用 SQLite Backup API
 保存已提交的 WAL 数据，校验后才发布完整文件。回退先校验格式、表结构、完整性和记录数，
 再备份当前数据，最后在一个事务内替换记忆；校验、备份或写入失败时，当前记忆保持不变。
 会话回退保留其他会话的数据。快照包括奖励、折扣回报、episode 元数据及原有脱敏内容，
@@ -236,22 +242,22 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 
 ### WebUI 面板
 
-插件自带一个可视化面板（`views/dashboard/`），在 WebUI「插件」页打开插件卡片即可进入。它通过 `context.register_web_api()` 注册的 10 个接口读写数据：
+插件自带一个可视化面板（`views/dashboard/`），在 WebUI「插件」页打开插件卡片即可进入。它通过 `context.register_web_api()` 注册的 11 个接口读写数据：
 
 | 面板区域 | 内容 |
 | --- | --- |
-| KPI 卡 | 记忆条数、Episodes、策略干预次数、失败次数 |
+| 机器人选择器与 KPI 卡 | 查看指定机器人的记忆条数、Episodes、策略干预次数、失败次数 |
 | 学习曲线 | 按时间分桶的平均折扣回报 `G`，复现论文 Figure 3 的形态 |
 | 动作排行 | 每个工具/回复的平均回报、正回报率、样本数 —— **一眼看出这个部署里哪个工具真的有用** |
 | 最近 Episode | 时间 / 步数 / 平均回报 / 用户请求摘要 |
 | 超参数 | 当前 k、r、γ、β、λ、α 与作用域、评估器模式 |
-| 检查点 | 名称、类型、完整 ID、时间、经验数、文件大小，支持创建、回退全库、删除快照 |
+| 检查点 | 当前机器人的名称、类型、完整 ID、时间、经验数、文件大小，支持创建、回退、删除快照 |
 | 操作 | 刷新、导出 JSON、带备份的清空记忆；回退、删除和清空均使用页内两步确认 |
 
-后端路由（`GET` 除注明外）：`/astrbot_plugin_jitrl/overview`、`/curve`、`/actions`、`/episodes`、`/export`，以及 `POST /forget`。
+后端路由（`GET` 除注明外）：`/astrbot_plugin_jitrl/robots`、`/overview`、`/curve`、`/actions`、`/episodes`、`/export`，以及 `POST /forget`。
 检查点路由同样使用 `/astrbot_plugin_jitrl` 前缀：`GET /checkpoints`、`POST /checkpoint`、
 `POST /rollback`、`POST /checkpoint_delete`。回退、删除检查点的请求必须提供 `confirm: true`。
-面板的回退操作针对全部会话；只回退当前会话请使用聊天指令。
+面板的回退和清空操作仅作用于当前选择的机器人；只回退当前会话请使用聊天指令。
 
 ---
 
@@ -264,7 +270,7 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 | `apply_mode` | `hint` | 见上一节 |
 | `retrieval.k` | `10` | 近邻数。论文实测 **k ∈ [8,14] 最稳**：太小方差大，太大噪声多 |
 | `retrieval.similarity_threshold` | `0.8` | Jaccard 门槛。论文 WebArena 用 0.8，Jericho 用 0.95 |
-| `retrieval.scope_isolation` | `hybrid` | `session` 只学本会话；`global` 全平台共享；`hybrid` 本会话优先、跨会话补充（跨会话相似度打 0.85 折） |
+| `retrieval.scope_isolation` | `hybrid` | `session` 只学本会话；`global` 当前机器人内跨会话共享；`hybrid` 当前机器人内本会话优先、跨会话补充（跨会话相似度打 0.85 折）。机器人间始终隔离 |
 | `learning.gamma` | `0.5` | 折扣因子。论文 WebArena 0.1 / Jericho 0.5 |
 | `learning.evaluator_mode` | `auto` | `llm` 用评估器；`heuristic` 零成本纯规则；`auto` 只在轨迹 ≥2 步或有报错时才调 LLM |
 | `policy.beta` | `1.5` | KL 温度。越大越激进地偏离模型自己的直觉 |
@@ -418,7 +424,7 @@ astrbot_plugin_jitrl/
 
 ## 12. 版本
 
-当前版本 **0.1.2**（完整变更见 [CHANGELOG.md](CHANGELOG.md)）。
+当前版本 **0.1.3**（完整变更见 [CHANGELOG.md](CHANGELOG.md)）。
 
 发布：`python scripts/build_release.py` 会校验四处版本号一致，再生成单根目录的
 `dist/astrbot_plugin_jitrl-v<版本>.zip` 并输出 SHA-256（超过 16 MB 直接失败）。

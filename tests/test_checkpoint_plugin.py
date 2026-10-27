@@ -18,6 +18,7 @@ import pytest
 import pytest_asyncio
 
 from jitrl.evaluator import RewardResult
+from jitrl.memory import MemoryBank
 from jitrl.state import abstract_state, normalize_action
 from jitrl.trajectory import (
     Transition,
@@ -44,11 +45,21 @@ MESSAGES = [
 
 
 class Event:
-    def __init__(self, *, admin=True, scope="s1", text="trusted task"):
+    def __init__(
+        self,
+        *,
+        admin=True,
+        scope="s1",
+        text="trusted task",
+        platform_id="platform-1",
+        self_id="bot-1",
+    ):
         self.unified_msg_origin = scope
         self.admin = admin
         self.text = text
         self.extra = {}
+        self.platform_id = platform_id
+        self.message_obj = SimpleNamespace(self_id=self_id)
 
     def is_admin(self):
         return self.admin
@@ -58,6 +69,12 @@ class Event:
 
     def get_platform_name(self):
         return "test"
+
+    def get_platform_id(self):
+        return self.platform_id
+
+    def get_self_id(self):
+        return self.message_obj.self_id
 
     def get_extra(self, key, default=None):
         return self.extra.get(key, default)
@@ -162,7 +179,7 @@ async def plugin(host):
     )
     plugin.routes = routes
     try:
-        await plugin._ensure_ready()
+        await plugin._ensure_ready(Event())
         yield plugin
     finally:
         await plugin.terminate()
@@ -173,14 +190,25 @@ async def command(generator):
 
 
 async def web_call(host, plugin, method, payload):
+    if isinstance(payload, dict):
+        payload.setdefault("robot", plugin._robot_key_for_event(Event()))
+
     async def json_body(default=None):
         return payload
 
-    host.web.request = SimpleNamespace(json=json_body)
+    def query_get(key, default=None, type=None):
+        value = payload.get(key, default) if isinstance(payload, dict) else default
+        return type(value) if type and value is not None else value
+
+    host.web.request = SimpleNamespace(
+        json=json_body, query=SimpleNamespace(get=query_get)
+    )
     return await getattr(plugin, method)()
 
 
 async def learn(plugin, scope="s1"):
+    event = Event(scope=scope)
+    await plugin._ensure_ready(event)
     await plugin._learn(
         umo=scope,
         user_text="trusted task",
@@ -189,6 +217,7 @@ async def learn(plugin, scope="s1"):
             messages=MESSAGES, user_text="trusted task", surface="test"
         ),
         reply_text="ok",
+        cache_scope=plugin._cache_scope(event),
     )
 
 
@@ -210,6 +239,58 @@ async def _seed(bank, task, tool, reward, scope="s1"):
             gamma=0.5,
         )
     )
+
+
+async def test_robot_instances_learn_in_separate_banks(plugin):
+    first_event = Event(platform_id="platform-a", self_id="bot-a")
+    second_event = Event(platform_id="platform-a", self_id="bot-b")
+    first_bank = await plugin._ensure_ready(first_event)
+    await _seed(first_bank, "trusted task", "search", 3.0)
+
+    second_bank = await plugin._ensure_ready(second_event)
+    assert second_bank is not first_bank
+    assert await second_bank.count() == 0
+    assert await second_bank.topk(abstract_state(task="trusted task"), scope="s1") == []
+    assert (
+        plugin._db_path != plugin._bank_paths[plugin._robot_key_for_event(first_event)]
+    )
+
+    assert await plugin._ensure_ready(first_event) is first_bank
+    assert await first_bank.count() == 1
+    await _seed(second_bank, "trusted task", "summarize", 2.0)
+    assert {row["action_name"] for row in await first_bank.action_stats()} == {"search"}
+    assert {row["action_name"] for row in await second_bank.action_stats()} == {
+        "summarize"
+    }
+    await command(plugin.jitrl_forget(first_event, "all"))
+    assert await first_bank.count() == 0
+    assert await second_bank.count() == 1
+    known = {robot["id"] for robot in plugin._known_robots()}
+    assert plugin._robot_key_for_event(first_event) in known
+    assert plugin._robot_key_for_event(second_event) in known
+
+
+async def test_upgrade_moves_legacy_memory_to_first_robot(host, tmp_path):
+    data_root = tmp_path / "astrbot_plugin_jitrl"
+    legacy_path = data_root / "memory.sqlite3"
+    legacy = MemoryBank(legacy_path, checkpoint_dir=data_root / "checkpoints")
+    await legacy.initialize()
+    await _seed(legacy, "old trusted task", "search", 2.0)
+    saved = await legacy.create_checkpoint("legacy")
+    await legacy.close()
+
+    plugin = host.module.JitRLLearner(
+        SimpleNamespace(register_web_api=lambda *args: None),
+        {"memory": {"checkpoint_interval": 0}},
+    )
+    try:
+        bank = await plugin._ensure_ready(Event(self_id="first-after-upgrade"))
+        assert await bank.count() == 1
+        assert saved["id"] in {row["id"] for row in await bank.list_checkpoints()}
+        assert not legacy_path.exists()
+        assert not (data_root / "checkpoints").exists()
+    finally:
+        await plugin.terminate()
 
 
 async def test_checkpoint_routes_and_manual_command(plugin):
@@ -286,6 +367,22 @@ async def test_web_checkpoint_restore_and_delete_flow(host, plugin):
         host, plugin, "_web_checkpoint_delete", {"id": saved["id"], "confirm": True}
     )
     assert response.payload["deleted"] == saved["id"]
+
+
+async def test_web_mutation_requires_robot_selection_when_multiple_exist(host, plugin):
+    first_event = Event()
+    first_bank = await plugin._ensure_ready(first_event)
+    await _seed(first_bank, "trusted task", "search", 1.0)
+    await plugin._ensure_ready(Event(self_id="second-bot"))
+
+    response = await web_call(
+        host,
+        plugin,
+        "_web_forget",
+        {"scope": "all", "confirm": True, "robot": ""},
+    )
+    assert response.status_code == 400
+    assert await first_bank.count() == 1
 
 
 @pytest.mark.parametrize("confirm", [None, False, "true", 1])
@@ -407,7 +504,7 @@ async def test_rerank_in_flight_cannot_inject_old_policy_after_restore(
 
 
 async def test_experience_block_rides_on_the_user_message(plugin):
-    await plugin._ensure_ready()
+    await plugin._ensure_ready(Event())
     for tool, reward in (("web_search", 2.0), ("bad_tool", -2.0)):
         await _seed(plugin._bank, "trusted task", tool, reward)
     event = Event()
