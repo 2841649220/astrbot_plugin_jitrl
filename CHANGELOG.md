@@ -5,7 +5,17 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本规则：常规功能和修复递增末位补丁号；大规模架构改进才递增中间版本号。
 
-## [0.2.1] - 2026-10-27
+## [0.2.0] - 2026-10-27
+
+本版本仍处于独立分支研发阶段；按用户要求保持 V0.2.0，后续神经主干与性能研究均归入本版本。
+
+### 性能研究与执行优化
+
+- 保持版本 `0.2.0`，同步配置、元数据、文档与本地发布标签；撤销开发过程中的 `0.2.1` 编号。
+- 区分 N 宽度、query 相关归一化的 fast-weight MLP 与固定宽度普通 MLP；新增完整 attention/projection/SwiGLU 算量、短序列 Amdahl 分析、真实算子 profiler 和长序列交叉点实验。
+- MiTA 默认采用 grouped 执行：按 expert 打包 queries、复用 KV、使用局部融合 SDPA 并恢复原顺序，避免逐 query KV 复制和 Python chunk 循环；保留 reference 路径逐式对照。执行内核不改变模型参数布局，不需要重训已有 MiTA 权重。
+- 短序列减少 packed block 空槽，长 CUDA 序列用静态分配上界消除动态尺寸的主机同步；仍使用 MiTA 的共享/路由 KV 联合归一化，没有偷换为全量 GQA。
+- 生产前向跳过未使用的路由诊断张量构造；修复 FP16/BF16 landmark 原子累加导致的硬路由重复性问题，改用 FP32 累加；补充公式、梯度、静态/动态分组与低精度回归。
 
 ### 真正的 MiTA 神经主干
 
@@ -15,16 +25,12 @@
 - 新增后端、landmark/top-k/chunk/记忆预算配置和状态展示。架构参数纳入 checkpoint/cache 身份，旧经验与精确历史快照保持原样；旧权重可在 legacy 严格加载，升级 MiTA 从历史快照重训。
 - 增加显式 CPU/CUDA/auto 设备选择，默认 CPU；训练和服务在选择设备上进行，checkpoint 可跨设备加载，不重设宿主随机状态或线程设置。
 - 完成正式 384d、四层 MiTA 的 CPU/CUDA 训练闭环。新增匹配权重的算子/主干延迟与内存基准，以及独立规则绑定记忆任务消融；区分算术稀疏、实际运行速度、训练降损与留出集任务效果，保存负面结果。
-- 保留原插件 API、旧配置默认值、临时用户上下文注入和独立分支；以补丁版迭代 V0.2 神经主干，不改动 V0.1 分支或 `v0.2.0` 标签。
+- 保留原插件 API、旧配置默认值、临时用户上下文注入和独立分支；全部神经架构迭代保持 `0.2.0`，不改动 V0.1 分支。
 
-[0.2.1]: https://github.com/2841649220/astrbot_plugin_jitrl/releases/tag/v0.2.1
-
-## [0.2.0] - 2026-10-27
-
-### 可选神经架构
+### 开发早期的神经基础设施与兼容路径
 
 - 在 V0.1.2 基础上新增 `jitrl/neural`，独立分支 `codex/v0.2.0-neural-lens`；保留原插件入口、配置、命令、Web 路由及默认行为。`neural.mode` 默认 `off`，PyTorch 惰性导入且单独安装，旧数据库不迁移。
-- 可训练本地模型：结构事件 Engram-inspired 条件表与因果卷积、四层 RMSNorm/SwiGLU、经验编译器、受限低秩动态适配器、单层 6Q/2KV memory GQA、实际 PRE 与候选相关的 POST 价值/残差代理头。远端模型保持冻结，不宣称复现 MiTA 或继承 JitRL 收敛定理。
+- 开发早期实现 Engram-inspired 条件表、四个向量 MLP、经验编译器、低秩适配器和单 query GQA；此向量主干现保留为 legacy，对应当前默认主干为上文的四层 MiTA。远端模型始终冻结，不宣称继承 JitRL 收敛定理。
 - 私有 scope 的状态、精确历史快照、执行事实 PENDING 与 append-only 回报结算；排除未执行候选、自身、同 episode 和未来结算标签；保留回报来源、可靠性与跨版本校验。
 - 独立的会话模型和不可变 checkpoint：训练模型副本、梯度裁剪、原子发布、SHA-256 与 `weights_only=True` 加载；PRE/POST 绑定同一版本；重置失效旧写入并清理权重，卸载等待本地训练结束。
 - AstrBot PRE 临时提示和完成后采集；继续仅用宿主 logger，不改写 system prompt，不调整工具权限。shadow 保持基础请求，active 仅在门控通过时提供受限历史证据；独立 POST API 不接管宿主解码或执行。
@@ -32,7 +38,7 @@
 - 新增三篇论文与 plan 的研究说明、运行/API 文档、离线 CPU smoke、存储/模型/宿主兼容性和并发回归测试，以及可选神经 CPU CI 作业。正式 384d/4-block 合成验证跑通，不作为真实任务效果证据。
 - 同步 `0.2.0` 版本链，安装 ZIP 包含文档与可选依赖清单，排除本地数据库、权重、缓存和开发工具。
 
-[0.2.0]: https://github.com/2841649220/astrbot_plugin_jitrl/releases/tag/v0.2.0
+[0.2.0]: https://github.com/2841649220/astrbot_plugin_jitrl/compare/v0.1.2...codex/v0.2.0-neural-lens
 
 ## [0.1.2] - 2026-10-27
 

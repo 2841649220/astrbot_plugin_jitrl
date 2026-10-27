@@ -1,0 +1,875 @@
+{
+  "harness_version": 3,
+  "meta": {
+    "python": "3.13.12",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "processor": "AMD64 Family 25 Model 80 Stepping 0, AuthenticAMD",
+    "torch_version": "2.8.0+cu128",
+    "device": "cpu",
+    "dtype": "float32",
+    "cuda": null,
+    "cuda_synchronized_before_and_after_every_sample_and_warmup": false,
+    "tf32_matmul_and_cudnn_enabled": false,
+    "seed": 1729,
+    "threads": 1,
+    "interop_threads": 1,
+    "batch_size": 1,
+    "warmup_per_phase": 3,
+    "repeats_per_phase": 7,
+    "padding_fraction": 0.0,
+    "matched_projection_parameters": 393216,
+    "kernel_backends": [
+      "gqa",
+      "mita_reference",
+      "mita_grouped"
+    ],
+    "selected_mita_alias": "mita_grouped",
+    "source_sha256": {
+      "jitrl/neural/attention.py": "659af39397e9fbd004447a5991910783a9c525060c7064c19d54fa6812fbc7aa",
+      "jitrl/neural/mita_grouped.py": "611fed6cb6a31d1eb9dbb5ee5bcbc7568d2034c1d7cefc8b128e7c5825ba0f81",
+      "jitrl/neural/config.py": "481eb9a8ca2681ef29d5002edc43c8cf5f051b0d0c40c458aa7b90329b4d46b0",
+      "scripts/bench_mita.py": "0317017464ee8d2c8bb0c9bf2d563aa1d4fdd71d9444f939d8b0daa86a795a48",
+      "jitrl/neural/model.py": "b49755f118576b71edddfd244693b3378bb5490b50c10572d198e1613c6b7234"
+    },
+    "config": {
+      "mode": "off",
+      "pre_enabled": true,
+      "post_enabled": false,
+      "auto_train": false,
+      "train_every": 32,
+      "min_samples": 32,
+      "train_steps": 20,
+      "batch_size": 16,
+      "learning_rate": 0.0003,
+      "min_support": 3,
+      "max_uncertainty": 0.5,
+      "relevance_threshold": 0.6,
+      "similarity_threshold": 0.25,
+      "max_adjustment": 1.0,
+      "evidence_tokens": 128,
+      "max_memory": 32,
+      "coarse_limit": 128,
+      "replay_limit": 2048,
+      "hidden_dim": 384,
+      "embedding_dim": 256,
+      "summary_dim": 128,
+      "blocks": 4,
+      "query_heads": 6,
+      "kv_heads": 2,
+      "bases": 8,
+      "rank": 8,
+      "engram_buckets": 4093,
+      "engram_heads": 2,
+      "engram_dim": 16,
+      "max_events": 32,
+      "return_scale": 6.0,
+      "seed": 1729,
+      "attention_backend": "mita",
+      "mita_landmarks": 8,
+      "mita_topk": 16,
+      "mita_query_chunk": 64,
+      "memory_tokens": 128,
+      "device": "cpu",
+      "mita_execution": "grouped"
+    },
+    "revision": {
+      "head": "1b02e6065ae66554cfca7132e1230d21593c5215",
+      "working_tree_dirty": true
+    },
+    "forward_and_backward_includes": "zero_grad(set_to_none), input grad reset, attention forward, float32 mean-square synthetic loss and backward; excludes optimizer/data generation/routing inspection"
+  },
+  "limitations": [
+    "Matched production GQA/reference/grouped comparisons use the same run, weights, input, dtype and device. Older JSONs remain historical baselines, not this comparison's denominator.",
+    "MiTA approximates dense attention; matching projections does not imply identical GQA and MiTA functions. Reference/grouped equivalence is checked separately.",
+    "Reference arithmetic N(2m+k) is not grouped padded SDPA work. Grouped interactions use observed packed_query_slots; both omit projections, packing/sorting/top-k and framework overhead.",
+    "Reference-only query-local KV gather capacity is not a grouped buffer or an allocator peak. Measured CUDA allocator fields are separate.",
+    "CUDA allocator peaks exclude reserved cache, driver, other processes and non-PyTorch allocations. Timings include synchronization overhead and depend on load.",
+    "Synthetic attention/model workload; no Agent task-quality or universal speed claim."
+  ],
+  "results": [
+    {
+      "length": 161,
+      "valid_tokens_per_batch_row": 161,
+      "interactions": {
+        "effective_landmarks": 8,
+        "effective_topk": 16,
+        "routed_experts_per_query": 1,
+        "dense": {
+          "score_dot_product_pairs": 155526,
+          "weighted_value_pairs": 155526,
+          "attention_only_scalar_flop_estimate": 39814656
+        },
+        "mita_reference": {
+          "compression_score_pairs": 7728,
+          "routing_score_pairs": 7728,
+          "shared_plus_routed_score_pairs": 23184,
+          "reused_routing_score_pairs_in_final_support": 7728,
+          "score_dot_product_pairs": 30912,
+          "weighted_value_pairs": 30912,
+          "attention_only_scalar_flop_estimate": 7913472
+        },
+        "reference_to_dense_score_pair_ratio": 0.19875776397515527,
+        "reference_to_dense_attention_flop_ratio": 0.19875776397515527,
+        "mita_grouped": {
+          "compression_score_pairs": 7728,
+          "routing_score_pairs": 7728,
+          "padded_final_sdpa_score_pairs": 36864,
+          "score_dot_product_pairs": 52320,
+          "weighted_value_pairs": 44592,
+          "attention_only_scalar_flop_estimate": 12404736,
+          "score_pair_ratio_to_dense": 0.33640677442999883,
+          "attention_flop_ratio_to_dense": 0.31156205393310443,
+          "note": "grouped final joint SDPA recomputes shared query-landmark logits and includes padding slots; reference N(2m+k) is not its actual score count",
+          "tensor_capacities": {
+            "kind": "logical_individual_buffer_capacities_not_measured_allocator_peaks",
+            "packed_query_and_output_bytes": 786432,
+            "block_key_and_value_bytes": 589824,
+            "merged_expert_key_and_value_bytes": 589824,
+            "padded_sdpa_scores_if_materialized_bytes": 147456,
+            "note": "fused SDPA need not materialize logical scores; grouped does not create reference-style per-query [N,k,d] KV gathers"
+          }
+        }
+      },
+      "tensor_capacities": {
+        "unit": "bytes",
+        "element_bytes": 4,
+        "kind": "individual_logical_tensor_capacity_estimates_not_measured_allocator_peak",
+        "applies_to": "common compression/routing plus explicitly reference-only per-query KV gathers; grouped capacities are reported separately from actual routing diagnostics",
+        "dense_explicit_score_matrix": 622104,
+        "mita_compression_scores": 30912,
+        "mita_full_routing_scores_upper_bound": 30912,
+        "reference_only_one_chunk_final_scores": 36864,
+        "reference_only_one_chunk_routed_key_and_value_gather": 3145728,
+        "mita_reusable_expert_key_and_value_buffer": 393216,
+        "mita_landmark_query_and_compressed_value": 24576,
+        "reference_only_all_queries_routed_key_and_value_gather": 7913472,
+        "caveat": "Several intermediates may coexist. Backward may retain tensors from every chunk. Dense optimized SDPA may avoid materializing its full logical score matrix. These values do not measure either allocator or process peak memory."
+      },
+      "routing_diagnostics": {
+        "mita_reference": {
+          "score_elements": 30912,
+          "peak_score_elements": 9216,
+          "execution": "reference",
+          "valid_query_slots": 966,
+          "host_size_syncs": 0
+        },
+        "mita_grouped": {
+          "packed_blocks": 48,
+          "packed_query_slots": 1536,
+          "host_size_syncs": 1,
+          "active_packed_blocks": 48,
+          "score_elements": 52320,
+          "peak_score_elements": 36864,
+          "execution": "grouped",
+          "valid_query_slots": 966,
+          "packed_padding_fraction": 0.37109375,
+          "group_counts": [
+            [
+              [
+                22,
+                20,
+                12,
+                26,
+                15,
+                23,
+                22,
+                21
+              ],
+              [
+                17,
+                22,
+                11,
+                24,
+                19,
+                15,
+                26,
+                27
+              ],
+              [
+                23,
+                22,
+                20,
+                17,
+                24,
+                17,
+                23,
+                15
+              ],
+              [
+                18,
+                18,
+                21,
+                11,
+                31,
+                20,
+                29,
+                13
+              ],
+              [
+                18,
+                15,
+                18,
+                15,
+                29,
+                24,
+                17,
+                25
+              ],
+              [
+                23,
+                22,
+                11,
+                14,
+                23,
+                22,
+                28,
+                18
+              ]
+            ]
+          ]
+        }
+      },
+      "relative_output_l2_difference_from_gqa": {
+        "mita_reference": 2.2059078216552734,
+        "mita_grouped": 2.2059080600738525
+      },
+      "execution_equivalence": {
+        "max_abs": 1.043081283569336e-07,
+        "rtol": 1e-05,
+        "atol": 1e-05,
+        "within_tolerance": true
+      },
+      "gqa": {
+        "forward": {
+          "median_ms": 2.5119,
+          "p95_ms": 2.6051,
+          "min_ms": 2.3811,
+          "max_ms": 2.6051,
+          "samples_ms": [
+            2.6051,
+            2.3811,
+            2.5119,
+            2.5593,
+            2.5313,
+            2.4951,
+            2.3876
+          ]
+        },
+        "forward_and_backward": {
+          "median_ms": 7.6835,
+          "p95_ms": 7.9224,
+          "min_ms": 7.4282,
+          "max_ms": 7.9224,
+          "samples_ms": [
+            7.693,
+            7.9224,
+            7.4282,
+            7.6835,
+            7.5207,
+            7.6868,
+            7.6294
+          ]
+        }
+      },
+      "mita_reference": {
+        "forward": {
+          "median_ms": 9.2972,
+          "p95_ms": 9.4846,
+          "min_ms": 8.7289,
+          "max_ms": 9.4846,
+          "samples_ms": [
+            9.0234,
+            8.7289,
+            9.2972,
+            9.4597,
+            8.9508,
+            9.3457,
+            9.4846
+          ]
+        },
+        "forward_and_backward": {
+          "median_ms": 24.4211,
+          "p95_ms": 27.8279,
+          "min_ms": 22.6305,
+          "max_ms": 27.8279,
+          "samples_ms": [
+            22.6305,
+            23.2995,
+            23.7219,
+            24.9091,
+            27.8279,
+            24.4211,
+            27.3594
+          ]
+        }
+      },
+      "mita_grouped": {
+        "forward": {
+          "median_ms": 5.3706,
+          "p95_ms": 6.5259,
+          "min_ms": 4.9749,
+          "max_ms": 6.5259,
+          "samples_ms": [
+            5.3706,
+            5.6718,
+            5.2985,
+            6.5259,
+            4.9749,
+            5.2222,
+            5.6517
+          ]
+        },
+        "forward_and_backward": {
+          "median_ms": 12.0596,
+          "p95_ms": 14.1576,
+          "min_ms": 11.5528,
+          "max_ms": 14.1576,
+          "samples_ms": [
+            14.1576,
+            13.3041,
+            13.6125,
+            11.6596,
+            11.6224,
+            11.5528,
+            12.0596
+          ]
+        }
+      },
+      "mita": {
+        "forward": {
+          "median_ms": 5.3706,
+          "p95_ms": 6.5259,
+          "min_ms": 4.9749,
+          "max_ms": 6.5259,
+          "samples_ms": [
+            5.3706,
+            5.6718,
+            5.2985,
+            6.5259,
+            4.9749,
+            5.2222,
+            5.6517
+          ]
+        },
+        "forward_and_backward": {
+          "median_ms": 12.0596,
+          "p95_ms": 14.1576,
+          "min_ms": 11.5528,
+          "max_ms": 14.1576,
+          "samples_ms": [
+            14.1576,
+            13.3041,
+            13.6125,
+            11.6596,
+            11.6224,
+            11.5528,
+            12.0596
+          ]
+        }
+      },
+      "mita_to_gqa_median_latency_ratio": {
+        "forward": 2.1380628209721726,
+        "forward_and_backward": 1.5695451291729028
+      },
+      "executions_to_gqa_median_latency_ratio": {
+        "mita_reference": {
+          "forward": 3.701261992913731,
+          "forward_and_backward": 3.178382247673586
+        },
+        "mita_grouped": {
+          "forward": 2.1380628209721726,
+          "forward_and_backward": 1.5695451291729028
+        }
+      }
+    },
+    {
+      "length": 1024,
+      "valid_tokens_per_batch_row": 1024,
+      "interactions": {
+        "effective_landmarks": 8,
+        "effective_topk": 16,
+        "routed_experts_per_query": 1,
+        "dense": {
+          "score_dot_product_pairs": 6291456,
+          "weighted_value_pairs": 6291456,
+          "attention_only_scalar_flop_estimate": 1610612736
+        },
+        "mita_reference": {
+          "compression_score_pairs": 49152,
+          "routing_score_pairs": 49152,
+          "shared_plus_routed_score_pairs": 147456,
+          "reused_routing_score_pairs_in_final_support": 49152,
+          "score_dot_product_pairs": 196608,
+          "weighted_value_pairs": 196608,
+          "attention_only_scalar_flop_estimate": 50331648
+        },
+        "reference_to_dense_score_pair_ratio": 0.03125,
+        "reference_to_dense_attention_flop_ratio": 0.03125,
+        "mita_grouped": {
+          "compression_score_pairs": 49152,
+          "routing_score_pairs": 49152,
+          "padded_final_sdpa_score_pairs": 184320,
+          "score_dot_product_pairs": 282624,
+          "weighted_value_pairs": 233472,
+          "attention_only_scalar_flop_estimate": 66060288,
+          "score_pair_ratio_to_dense": 0.044921875,
+          "attention_flop_ratio_to_dense": 0.041015625,
+          "note": "grouped final joint SDPA recomputes shared query-landmark logits and includes padding slots; reference N(2m+k) is not its actual score count",
+          "tensor_capacities": {
+            "kind": "logical_individual_buffer_capacities_not_measured_allocator_peaks",
+            "packed_query_and_output_bytes": 3932160,
+            "block_key_and_value_bytes": 1474560,
+            "merged_expert_key_and_value_bytes": 589824,
+            "padded_sdpa_scores_if_materialized_bytes": 737280,
+            "note": "fused SDPA need not materialize logical scores; grouped does not create reference-style per-query [N,k,d] KV gathers"
+          }
+        }
+      },
+      "tensor_capacities": {
+        "unit": "bytes",
+        "element_bytes": 4,
+        "kind": "individual_logical_tensor_capacity_estimates_not_measured_allocator_peak",
+        "applies_to": "common compression/routing plus explicitly reference-only per-query KV gathers; grouped capacities are reported separately from actual routing diagnostics",
+        "dense_explicit_score_matrix": 25165824,
+        "mita_compression_scores": 196608,
+        "mita_full_routing_scores_upper_bound": 196608,
+        "reference_only_one_chunk_final_scores": 36864,
+        "reference_only_one_chunk_routed_key_and_value_gather": 3145728,
+        "mita_reusable_expert_key_and_value_buffer": 393216,
+        "mita_landmark_query_and_compressed_value": 24576,
+        "reference_only_all_queries_routed_key_and_value_gather": 50331648,
+        "caveat": "Several intermediates may coexist. Backward may retain tensors from every chunk. Dense optimized SDPA may avoid materializing its full logical score matrix. These values do not measure either allocator or process peak memory."
+      },
+      "routing_diagnostics": {
+        "mita_reference": {
+          "score_elements": 196608,
+          "peak_score_elements": 49152,
+          "execution": "reference",
+          "valid_query_slots": 6144,
+          "host_size_syncs": 0
+        },
+        "mita_grouped": {
+          "packed_blocks": 120,
+          "packed_query_slots": 7680,
+          "host_size_syncs": 1,
+          "active_packed_blocks": 120,
+          "score_elements": 282624,
+          "peak_score_elements": 184320,
+          "execution": "grouped",
+          "valid_query_slots": 6144,
+          "packed_padding_fraction": 0.19999999999999996,
+          "group_counts": [
+            [
+              [
+                108,
+                90,
+                156,
+                158,
+                100,
+                106,
+                163,
+                143
+              ],
+              [
+                120,
+                138,
+                104,
+                170,
+                94,
+                157,
+                95,
+                146
+              ],
+              [
+                121,
+                177,
+                149,
+                171,
+                135,
+                113,
+                69,
+                89
+              ],
+              [
+                124,
+                153,
+                137,
+                111,
+                135,
+                122,
+                135,
+                107
+              ],
+              [
+                146,
+                117,
+                97,
+                168,
+                130,
+                77,
+                132,
+                157
+              ],
+              [
+                144,
+                167,
+                84,
+                125,
+                181,
+                106,
+                118,
+                99
+              ]
+            ]
+          ]
+        }
+      },
+      "relative_output_l2_difference_from_gqa": {
+        "mita_reference": 5.19523286819458,
+        "mita_grouped": 5.195233345031738
+      },
+      "execution_equivalence": {
+        "max_abs": 1.1920928955078125e-07,
+        "rtol": 1e-05,
+        "atol": 1e-05,
+        "within_tolerance": true
+      },
+      "gqa": {
+        "forward": {
+          "median_ms": 35.1361,
+          "p95_ms": 36.2991,
+          "min_ms": 34.7133,
+          "max_ms": 36.2991,
+          "samples_ms": [
+            35.1218,
+            34.838,
+            35.1361,
+            34.7133,
+            35.4863,
+            35.4197,
+            36.2991
+          ]
+        },
+        "forward_and_backward": {
+          "median_ms": 113.7897,
+          "p95_ms": 116.8004,
+          "min_ms": 110.4056,
+          "max_ms": 116.8004,
+          "samples_ms": [
+            116.8004,
+            114.2342,
+            112.9616,
+            111.1035,
+            113.7897,
+            110.4056,
+            115.044
+          ]
+        }
+      },
+      "mita_reference": {
+        "forward": {
+          "median_ms": 61.0287,
+          "p95_ms": 73.5993,
+          "min_ms": 55.2988,
+          "max_ms": 73.5993,
+          "samples_ms": [
+            60.827,
+            64.5596,
+            59.241,
+            55.2988,
+            61.0287,
+            73.5993,
+            73.2766
+          ]
+        },
+        "forward_and_backward": {
+          "median_ms": 139.9022,
+          "p95_ms": 142.4495,
+          "min_ms": 137.0294,
+          "max_ms": 142.4495,
+          "samples_ms": [
+            139.9022,
+            142.4495,
+            140.4799,
+            137.0294,
+            139.1421,
+            137.0466,
+            139.9898
+          ]
+        }
+      },
+      "mita_grouped": {
+        "forward": {
+          "median_ms": 19.0055,
+          "p95_ms": 19.9557,
+          "min_ms": 18.5779,
+          "max_ms": 19.9557,
+          "samples_ms": [
+            18.7369,
+            18.5779,
+            18.7167,
+            19.4151,
+            19.9557,
+            19.2293,
+            19.0055
+          ]
+        },
+        "forward_and_backward": {
+          "median_ms": 55.7266,
+          "p95_ms": 60.6373,
+          "min_ms": 53.263,
+          "max_ms": 60.6373,
+          "samples_ms": [
+            57.7612,
+            60.6373,
+            59.8719,
+            54.3486,
+            53.263,
+            54.5023,
+            55.7266
+          ]
+        }
+      },
+      "mita": {
+        "forward": {
+          "median_ms": 19.0055,
+          "p95_ms": 19.9557,
+          "min_ms": 18.5779,
+          "max_ms": 19.9557,
+          "samples_ms": [
+            18.7369,
+            18.5779,
+            18.7167,
+            19.4151,
+            19.9557,
+            19.2293,
+            19.0055
+          ]
+        },
+        "forward_and_backward": {
+          "median_ms": 55.7266,
+          "p95_ms": 60.6373,
+          "min_ms": 53.263,
+          "max_ms": 60.6373,
+          "samples_ms": [
+            57.7612,
+            60.6373,
+            59.8719,
+            54.3486,
+            53.263,
+            54.5023,
+            55.7266
+          ]
+        }
+      },
+      "mita_to_gqa_median_latency_ratio": {
+        "forward": 0.5409109149848732,
+        "forward_and_backward": 0.4897332535370073
+      },
+      "executions_to_gqa_median_latency_ratio": {
+        "mita_reference": {
+          "forward": 1.7369229937300954,
+          "forward_and_backward": 1.2294803483970869
+        },
+        "mita_grouped": {
+          "forward": 0.5409109149848732,
+          "forward_and_backward": 0.4897332535370073
+        }
+      }
+    }
+  ],
+  "model_forward": {
+    "workload": {
+      "batch_size": 1,
+      "events": 32,
+      "memories": 128,
+      "candidates": 3,
+      "backbone_tokens": 161
+    },
+    "timing_scope": "network forward on precomputed seeded synthetic features; excludes retrieval, canonicalization, frozen hashing, training and remote API",
+    "weight_matching": "gqa/mita/hybrid share every state_dict tensor; legacy has a different scalar-query architecture and only shares the seed and input feature workload",
+    "backends": {
+      "legacy": {
+        "forward": {
+          "median_ms": 7.5587,
+          "p95_ms": 8.1268,
+          "min_ms": 6.7032,
+          "max_ms": 8.1268,
+          "samples_ms": [
+            7.5335,
+            7.5281,
+            8.1268,
+            7.5587,
+            8.1232,
+            6.7032,
+            7.736
+          ]
+        },
+        "mita_execution": null,
+        "attention_inventory": {
+          "backend": "legacy",
+          "mita_layers": 0,
+          "gqa_layers": 1,
+          "total_attention_layers": 1
+        },
+        "parameters": {
+          "active_neural": 5790638,
+          "engram_tables": 262016,
+          "total": 6052654,
+          "frozen_encoder": 0
+        }
+      },
+      "gqa": {
+        "forward": {
+          "median_ms": 30.0665,
+          "p95_ms": 30.9283,
+          "min_ms": 28.945,
+          "max_ms": 30.9283,
+          "samples_ms": [
+            29.9033,
+            30.5907,
+            28.945,
+            29.7932,
+            30.0665,
+            30.1306,
+            30.9283
+          ]
+        },
+        "mita_execution": null,
+        "attention_inventory": {
+          "backend": "gqa",
+          "mita_layers": 0,
+          "gqa_layers": 4,
+          "total_attention_layers": 4
+        },
+        "parameters": {
+          "active_neural": 7084334,
+          "engram_tables": 262016,
+          "total": 7346350,
+          "frozen_encoder": 0
+        }
+      },
+      "hybrid": {
+        "forward": {
+          "median_ms": 36.0002,
+          "p95_ms": 36.0987,
+          "min_ms": 35.4013,
+          "max_ms": 36.0987,
+          "samples_ms": [
+            36.0853,
+            36.0014,
+            35.4013,
+            36.0002,
+            35.5765,
+            35.8442,
+            36.0987
+          ]
+        },
+        "mita_execution": "grouped",
+        "attention_inventory": {
+          "backend": "hybrid",
+          "mita_layers": 3,
+          "gqa_layers": 1,
+          "total_attention_layers": 4
+        },
+        "parameters": {
+          "active_neural": 7084334,
+          "engram_tables": 262016,
+          "total": 7346350,
+          "frozen_encoder": 0
+        }
+      },
+      "mita_reference": {
+        "forward": {
+          "median_ms": 66.5208,
+          "p95_ms": 69.9379,
+          "min_ms": 65.0831,
+          "max_ms": 69.9379,
+          "samples_ms": [
+            66.5208,
+            69.9379,
+            68.8702,
+            68.9776,
+            65.0831,
+            65.8403,
+            65.7691
+          ]
+        },
+        "mita_execution": "reference",
+        "attention_inventory": {
+          "backend": "mita",
+          "mita_layers": 4,
+          "gqa_layers": 0,
+          "total_attention_layers": 4
+        },
+        "parameters": {
+          "active_neural": 7084334,
+          "engram_tables": 262016,
+          "total": 7346350,
+          "frozen_encoder": 0
+        }
+      },
+      "mita_grouped": {
+        "forward": {
+          "median_ms": 47.6705,
+          "p95_ms": 55.6878,
+          "min_ms": 42.2575,
+          "max_ms": 55.6878,
+          "samples_ms": [
+            47.6705,
+            42.4468,
+            42.2575,
+            55.6878,
+            48.0448,
+            43.4234,
+            48.5747
+          ]
+        },
+        "mita_execution": "grouped",
+        "attention_inventory": {
+          "backend": "mita",
+          "mita_layers": 4,
+          "gqa_layers": 0,
+          "total_attention_layers": 4
+        },
+        "parameters": {
+          "active_neural": 7084334,
+          "engram_tables": 262016,
+          "total": 7346350,
+          "frozen_encoder": 0
+        }
+      },
+      "mita": {
+        "forward": {
+          "median_ms": 47.6705,
+          "p95_ms": 55.6878,
+          "min_ms": 42.2575,
+          "max_ms": 55.6878,
+          "samples_ms": [
+            47.6705,
+            42.4468,
+            42.2575,
+            55.6878,
+            48.0448,
+            43.4234,
+            48.5747
+          ]
+        },
+        "mita_execution": "grouped",
+        "attention_inventory": {
+          "backend": "mita",
+          "mita_layers": 4,
+          "gqa_layers": 0,
+          "total_attention_layers": 4
+        },
+        "parameters": {
+          "active_neural": 7084334,
+          "engram_tables": 262016,
+          "total": 7346350,
+          "frozen_encoder": 0
+        }
+      }
+    },
+    "selected_mita_alias": "mita_grouped"
+  }
+}

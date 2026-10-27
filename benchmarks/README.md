@@ -63,16 +63,18 @@ python .tmp-baseline/src/scripts/bench_jitrl.py --no-checkpoints \
 - r=0.8 是插件默认值，也是论文 WebArena 的取值；r=0.5 属于放宽检索，成本更高是预期行为。
 - 复现前请保证没有其它重进程在跑；`benchmarks/baseline.json` 与 `after.json` 都保留了
   完整的分场景数据（含 p95、命中率、每次查询的邻居数）。
-# Neural Lens / MiTA 实验（V0.2.1）
+# Neural Lens / MiTA 实验（V0.2.0）
 
 本目录同时保存原有 V0.1 检索基准和新增神经研究记录。新增结果均为本地合成工作负载，不能当作真实 Agent 成功率。
 
 | 记录 | 内容与复现 |
 |---|---|
-| `neural-smoke.json` / `neural-smoke-cuda.json` | 正式 384d、四层 MiTA、40 条合成经验、20 步训练；`python scripts/neural_lens.py smoke --device cpu` 或 `--device cuda` |
-| `mita-attention.json` | CPU fp32 算子和四种主干对照；`python scripts/bench_mita.py --lengths 32,128,512,1024 --model --json benchmarks/mita-attention.json` |
-| `mita-attention-cuda.json` | RTX 3050 Ti CUDA fp32，同步计时与分配器峰值；上一命令追加 `--device cuda` 并指定对应 JSON |
-| `mita-attention-cuda-fp16.json` | CUDA fp16 对照；追加 `--device cuda --dtype float16` |
+| `neural-smoke-grouped-cuda.json` | 当前 384d、四层 MiTA grouped 执行的 CUDA 机械 smoke；无真实 Agent 效果声明。旧 `neural-smoke*.json` 保留为历史记录 |
+| `mita-optimized-cpu.json` | 当前 grouped/reference/GQA 同条件 CPU fp32；`python scripts/bench_mita.py --device cpu --dtype float32 --lengths 161,1024 --mita-execution grouped --compare-reference --warmup 3 --repeats 7 --model --json benchmarks/mita-optimized-cpu.json` |
+| `mita-optimized-cuda.json` | RTX 3050 Ti CUDA fp32，同一输入、权重、投影和同步协议；将上命令改为 `--device cuda --lengths 161,1024,8192` |
+| `mita-optimized-cuda-fp16.json` | RTX 3050 Ti CUDA fp16；在 CUDA 命令上改为 `--dtype float16` |
+| `mita-profile-optimized.json` | 当前 production kernel 的 Kineto/CUDA 归因；profiler 开销不用于正常延迟结论。旧 `mita-profile.json` 是 reference 历史证据 |
+| `mita-scaling-cuda-fp16.json` | 优化前 eager/reference 的历史长度扫描，保留用于解释为什么需要 grouped；不与当前结果混作同一分母 |
 | `mita-memory-ablation.json` | 两个种子、三种等参数主干、独立规则绑定留出集，保留逐样本预测；`python scripts/ablate_mita.py --json benchmarks/mita-memory-ablation.json` |
 
-当前结果：正式 MiTA 模型可训练并能跨 CPU/CUDA 保存重载；纯 PyTorch MiTA 尚未在测量范围内优于优化 GQA 的运行时或显存表现。小型规则绑定实验在 100 步设置下未展示留出泛化。训练降损、机制正确性、稀疏交互数量和真实任务收益分开解释，完整协议与负面结果见 [MiTA 研究说明](../docs/mita-backbone-research.md)。
+当前结果：默认 grouped MiTA 已替换四个 token-attention block，并通过输出、梯度、padding、静态/动态 packing 和 FP16 重复性回归。短序列仍可能慢于 fused GQA：同一 RTX 3050 Ti 上，N=161 fp16 forward 为 GQA 0.702 ms、grouped 2.633 ms；N=8192 则为 15.448 ms、6.093 ms，forward+backward 为 63.630 ms、12.593 ms。N=8192 的 grouped CUDA allocator 峰值仍高于 GQA，不能把速度交叉点写成普遍显存优势。历史基准按其源码哈希复现，完整算量、profiler 和边界见 [MiTA 性能分析](../docs/mita-performance-analysis.md)。

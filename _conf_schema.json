@@ -487,7 +487,7 @@
     }
   },
   "neural": {
-    "description": "V0.2.1 本地 Neural Lens（默认 MiTA 主干）",
+    "description": "V0.2.0 本地 Neural Lens（默认 MiTA 主干）",
     "type": "object",
     "items": {
       "mode": {
@@ -590,7 +590,7 @@
           "gqa",
           "legacy"
         ],
-        "hint": "默认四层全部使用 MiTA；hybrid 为 3 MiTA+1 GQA，gqa 是四层对照，legacy 保留 V0.2.0 主干。更换主干需重新训练本地权重，经验与快照继续复用。"
+        "hint": "默认四层全部使用 MiTA；hybrid 为 3 MiTA+1 GQA，gqa 是四层对照，legacy 保留开发早期的向量主干。更换主干需重新训练本地权重，经验与快照继续复用。"
       },
       "mita_landmarks": {
         "description": "每层 MiTA 的 landmark / expert 数",
@@ -603,9 +603,10 @@
         "default": 16
       },
       "mita_query_chunk": {
-        "description": "MiTA 路由 gather 的 query 分块大小",
+        "description": "MiTA query / expert 分块上限",
         "type": "int",
-        "default": 64
+        "default": 64,
+        "hint": "分组执行在短序列使用不超过 32 的块降低 padding；参考路径使用该 query 分块上限。"
       },
       "memory_tokens": {
         "description": "进入神经 token 主干的历史经验上限",
@@ -622,6 +623,16 @@
           "auto"
         ],
         "hint": "默认 CPU；cuda 明确要求可用 GPU，auto 自动选择。权重可跨设备加载；修改后重载插件。"
+      },
+      "mita_execution": {
+        "description": "MiTA 执行内核",
+        "type": "string",
+        "default": "grouped",
+        "options": [
+          "grouped",
+          "reference"
+        ],
+        "hint": "grouped 按 expert 复用 KV 并使用融合 SDPA；reference 保留逐 query 对照。公式与参数相同，切换无需重训。"
       }
     }
   }

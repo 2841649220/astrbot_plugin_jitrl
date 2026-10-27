@@ -33,18 +33,25 @@ def masked_landmarks(query: Tensor, valid: Tensor, count: int) -> tuple[Tensor, 
     empty windows are masked. Inserting padding does not change any window.
     """
     batch, heads, length, dimension = query.shape
-    clean = query.masked_fill(~valid[:, None, :, None], 0.0)
+    # Half atomics lose enough bits to change hard top-k/routes between
+    # identical forwards. Accumulate pooling in float32 before casting back.
+    accumulator_dtype = (
+        torch.float32 if query.dtype in {torch.float16, torch.bfloat16} else query.dtype
+    )
+    clean = query.masked_fill(~valid[:, None, :, None], 0.0).to(accumulator_dtype)
     population = valid.sum(-1).clamp_min(1)
     rank = (valid.long().cumsum(-1) - 1).clamp_min(0)
     window = torch.div(rank * count, population[:, None], rounding_mode="floor")
     window = window.clamp_max(count - 1)
     index = window[:, None, :, None].expand(batch, heads, length, dimension)
-    pooled = query.new_zeros(batch, heads, count, dimension).scatter_add(
-        2, index, clean
-    )
-    sizes = query.new_zeros(batch, count).scatter_add(1, window, valid.to(query.dtype))
+    pooled = torch.zeros(
+        batch, heads, count, dimension, device=query.device, dtype=accumulator_dtype
+    ).scatter_add(2, index, clean)
+    sizes = torch.zeros(
+        batch, count, device=query.device, dtype=accumulator_dtype
+    ).scatter_add(1, window, valid.to(accumulator_dtype))
     pooled = pooled / sizes[:, None, :, None].clamp_min(1)
-    return pooled, sizes > 0
+    return pooled.to(query.dtype), sizes > 0
 
 
 def mita_attention(
@@ -55,6 +62,8 @@ def mita_attention(
     landmarks: int = 8,
     topk: int = 16,
     query_chunk: int = 64,
+    *,
+    return_diagnostics: bool = True,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Compute self-attention with one routed KV expert per query.
 
@@ -71,6 +80,8 @@ def mita_attention(
     if min(landmarks, topk, query_chunk, dimension) < 1:
         raise ValueError("MiTA budgets and head dimension must be positive")
     if not length:
+        if not return_diagnostics:
+            return torch.zeros_like(query), {}
         return torch.zeros_like(query), {
             "landmark_queries": query.new_zeros(batch, heads, landmarks, dimension),
             "landmark_values": value.new_zeros(batch, heads, landmarks, dimension),
@@ -150,6 +161,8 @@ def mita_attention(
         routed_output = (weights[..., landmarks:, None] * routed_value).sum(-2)
         chunks.append(shared_output + routed_output)
     result = torch.cat(chunks, dim=2).masked_fill(~valid[:, None, :, None], 0.0)
+    if not return_diagnostics:
+        return result, {}
     diagnostics = {
         "landmark_queries": landmark_query.detach(),
         "landmark_values": landmark_value.detach(),
@@ -230,19 +243,55 @@ class MiTAAttention(_GroupedProjections):
         self.landmarks = cfg.mita_landmarks
         self.topk = cfg.mita_topk
         self.query_chunk = cfg.mita_query_chunk
+        self.execution = cfg.mita_execution
+
+    def _context(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        valid: Tensor,
+        *,
+        diagnostics: bool,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        if self.execution == "reference":
+            return mita_attention(
+                query,
+                key,
+                value,
+                valid,
+                self.landmarks,
+                self.topk,
+                self.query_chunk,
+                return_diagnostics=diagnostics,
+            )
+        # The same MiTA support and joint normalizer, executed as expert query
+        # blocks so K/V are reused instead of being copied for every query.
+        from .mita_grouped import grouped_mita_attention
+
+        block_size = (
+            min(self.query_chunk, 32) if query.shape[2] <= 256 else self.query_chunk
+        )
+        return grouped_mita_attention(
+            query,
+            key,
+            value,
+            valid,
+            self.landmarks,
+            self.topk,
+            block_size,
+            return_diagnostics=diagnostics,
+            static_pack=query.is_cuda and query.shape[2] >= 4096,
+        )
 
     def forward(self, tokens: Tensor, valid: Tensor) -> Tensor:
         query, key, value = self.project(tokens, valid)
-        context, _ = mita_attention(
-            query, key, value, valid, self.landmarks, self.topk, self.query_chunk
-        )
+        context, _ = self._context(query, key, value, valid, diagnostics=False)
         return self.merge(context, valid)
 
     def inspect_routing(self, tokens: Tensor, valid: Tensor) -> dict[str, Tensor]:
         query, key, value = self.project(tokens, valid)
-        _, diagnostics = mita_attention(
-            query, key, value, valid, self.landmarks, self.topk, self.query_chunk
-        )
+        _, diagnostics = self._context(query, key, value, valid, diagnostics=True)
         return diagnostics
 
 

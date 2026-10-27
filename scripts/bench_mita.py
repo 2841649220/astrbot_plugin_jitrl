@@ -33,7 +33,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-HARNESS_VERSION = 2
+HARNESS_VERSION = 3
 PROJECTIONS = ("query.", "key.", "value.", "output.")
 
 
@@ -73,6 +73,14 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--landmarks", type=_positive, default=8)
     parser.add_argument("--topk", type=_positive, default=16)
     parser.add_argument("--query-chunk", type=_positive, default=64)
+    parser.add_argument(
+        "--mita-execution", choices=("reference", "grouped"), default="grouped"
+    )
+    parser.add_argument(
+        "--compare-reference",
+        action="store_true",
+        help="compare both MiTA execution paths with the same GQA projections in one run",
+    )
     parser.add_argument("--seed", type=_positive, default=1729)
     parser.add_argument("--padding-fraction", type=float, default=0.0)
     parser.add_argument(
@@ -208,7 +216,7 @@ def interaction_counts(cfg: Any, length: int, batch_size: int) -> dict[str, Any]
             "weighted_value_pairs": multiplier * dense,
             "attention_only_scalar_flop_estimate": multiplier * dense * 4 * head_dim,
         },
-        "mita": {
+        "mita_reference": {
             "compression_score_pairs": multiplier * compression,
             "routing_score_pairs": multiplier * routing,
             "shared_plus_routed_score_pairs": multiplier * final,
@@ -220,8 +228,8 @@ def interaction_counts(cfg: Any, length: int, batch_size: int) -> dict[str, Any]
             * 2
             * head_dim,
         },
-        "mita_to_dense_score_pair_ratio": sparse_scores / dense,
-        "mita_to_dense_attention_flop_ratio": (sparse_scores + sparse_values)
+        "reference_to_dense_score_pair_ratio": sparse_scores / dense,
+        "reference_to_dense_attention_flop_ratio": (sparse_scores + sparse_values)
         / (2 * dense),
     }
 
@@ -243,14 +251,20 @@ def tensor_capacities(
         "unit": "bytes",
         "element_bytes": element_bytes,
         "kind": "individual_logical_tensor_capacity_estimates_not_measured_allocator_peak",
+        "applies_to": "common compression/routing plus explicitly reference-only per-query KV gathers; grouped capacities are reported separately from actual routing diagnostics",
         "dense_explicit_score_matrix": h * length * length * element_bytes,
         "mita_compression_scores": h * m * length * element_bytes,
         "mita_full_routing_scores_upper_bound": h * length * m * element_bytes,
-        "mita_one_chunk_final_scores": h * q * (m + k) * element_bytes,
-        "mita_one_chunk_routed_key_and_value_gather": 2 * h * q * k * d * element_bytes,
+        "reference_only_one_chunk_final_scores": h * q * (m + k) * element_bytes,
+        "reference_only_one_chunk_routed_key_and_value_gather": 2
+        * h
+        * q
+        * k
+        * d
+        * element_bytes,
         "mita_reusable_expert_key_and_value_buffer": 2 * h * m * k * d * element_bytes,
         "mita_landmark_query_and_compressed_value": 2 * h * m * d * element_bytes,
-        "mita_all_queries_routed_key_and_value_gather": 2
+        "reference_only_all_queries_routed_key_and_value_gather": 2
         * h
         * length
         * k
@@ -260,34 +274,113 @@ def tensor_capacities(
     }
 
 
-def _matched_modules(cfg: Any, torch: Any) -> tuple[Any, Any, int]:
+def _executions(args: argparse.Namespace) -> list[str]:
+    return ["reference", "grouped"] if args.compare_reference else [args.mita_execution]
+
+
+def _matched_modules(
+    cfg: Any, args: argparse.Namespace, torch: Any
+) -> tuple[dict[str, Any], int]:
     from jitrl.neural.attention import GroupedSelfAttention, MiTAAttention
 
     with torch.random.fork_rng(devices=[]):
         torch.random.default_generator.manual_seed(cfg.seed)
         dense = GroupedSelfAttention(cfg).cpu()
-        sparse = MiTAAttention(cfg).cpu()
-    reference = {
-        name: value
-        for name, value in dense.state_dict().items()
-        if name.startswith(PROJECTIONS)
-    }
-    actual = sparse.state_dict()
-    if not reference or any(
-        name not in actual or actual[name].shape != value.shape
-        for name, value in reference.items()
-    ):
-        raise RuntimeError(
-            "attention kernels do not expose identical projection parameter shapes"
+        reference = {
+            name: value
+            for name, value in dense.state_dict().items()
+            if name.startswith(PROJECTIONS)
+        }
+        modules = {"gqa": dense}
+        for execution in _executions(args):
+            sparse = MiTAAttention(replace(cfg, mita_execution=execution)).cpu()
+            actual = sparse.state_dict()
+            if not reference or any(
+                name not in actual or actual[name].shape != value.shape
+                for name, value in reference.items()
+            ):
+                raise RuntimeError(
+                    "attention kernels do not expose identical projection parameter shapes"
+                )
+            actual.update(reference)
+            sparse.load_state_dict(actual, strict=True)
+            if any(
+                not torch.equal(sparse.state_dict()[name], value)
+                for name, value in reference.items()
+            ):
+                raise RuntimeError("failed to match attention projection weights")
+            modules["mita_" + execution] = sparse
+    return modules, sum(value.numel() for value in reference.values())
+
+
+def routing_diagnostics(
+    module: Any, tokens: Any, valid: Any, torch: Any
+) -> dict[str, Any]:
+    """Inspect packing outside every timed and allocator-measured interval."""
+    with torch.inference_mode():
+        data = module.inspect_routing(tokens, valid)
+    scalar_names = (
+        "packed_blocks",
+        "packed_query_slots",
+        "host_size_syncs",
+        "active_packed_blocks",
+        "score_elements",
+        "peak_score_elements",
+    )
+    result = {name: int(data[name].item()) for name in scalar_names if name in data}
+    result["execution"] = module.execution
+    result["valid_query_slots"] = int(valid.sum().item()) * module.query_heads
+    if "packed_query_slots" in result:
+        result["packed_padding_fraction"] = 1.0 - result["valid_query_slots"] / max(
+            1, result["packed_query_slots"]
         )
-    actual.update(reference)
-    sparse.load_state_dict(actual, strict=True)
-    if any(
-        not torch.equal(sparse.state_dict()[name], value)
-        for name, value in reference.items()
-    ):
-        raise RuntimeError("failed to match attention projection weights")
-    return dense, sparse, sum(value.numel() for value in reference.values())
+        result["group_counts"] = data["group_counts"].tolist()
+    else:
+        result["host_size_syncs"] = 0
+    return result
+
+
+def grouped_work(
+    cfg: Any,
+    length: int,
+    batch_size: int,
+    diagnostics: dict[str, Any],
+    element_bytes: int,
+) -> dict[str, Any]:
+    """Count actual padded grouped work, rather than reuse reference formulas."""
+    h, m, k = (
+        batch_size * cfg.query_heads,
+        cfg.mita_landmarks,
+        min(length, cfg.mita_topk),
+    )
+    d = cfg.hidden_dim // cfg.query_heads
+    slots, blocks = diagnostics["packed_query_slots"], diagnostics["packed_blocks"]
+    compression, routing, final = h * m * length, h * length * m, slots * (m + k)
+    scores, values = compression + routing + final, compression + final
+    return {
+        "compression_score_pairs": compression,
+        "routing_score_pairs": routing,
+        "padded_final_sdpa_score_pairs": final,
+        "score_dot_product_pairs": scores,
+        "weighted_value_pairs": values,
+        "attention_only_scalar_flop_estimate": 2 * d * (scores + values),
+        "score_pair_ratio_to_dense": scores / (h * length * length),
+        "attention_flop_ratio_to_dense": (scores + values) / (2 * h * length * length),
+        "note": "grouped final joint SDPA recomputes shared query-landmark logits and includes padding slots; reference N(2m+k) is not its actual score count",
+        "tensor_capacities": {
+            "kind": "logical_individual_buffer_capacities_not_measured_allocator_peaks",
+            "packed_query_and_output_bytes": 2 * slots * d * element_bytes,
+            "block_key_and_value_bytes": 2 * blocks * (m + k) * d * element_bytes,
+            "merged_expert_key_and_value_bytes": 2
+            * h
+            * m
+            * (m + k)
+            * d
+            * element_bytes,
+            "padded_sdpa_scores_if_materialized_bytes": final * element_bytes,
+            "note": "fused SDPA need not materialize logical scores; grouped does not create reference-style per-query [N,k,d] KV gathers",
+        },
+    }
 
 
 def _model_forward(cfg: Any, args: argparse.Namespace, torch: Any) -> dict[str, Any]:
@@ -341,11 +434,21 @@ def _model_forward(cfg: Any, args: argparse.Namespace, torch: Any) -> dict[str, 
         "weight_matching": "gqa/mita/hybrid share every state_dict tensor; legacy has a different scalar-query architecture and only shares the seed and input feature workload",
         "backends": {},
     }
-    for backend in ("legacy", "gqa", "hybrid", "mita"):
+    cases = [
+        ("legacy", "legacy", args.mita_execution),
+        ("gqa", "gqa", args.mita_execution),
+        ("hybrid", "hybrid", args.mita_execution),
+    ]
+    cases.extend(
+        ("mita_" + execution, "mita", execution) for execution in _executions(args)
+    )
+    for label, backend, execution in cases:
         model = (
             reference
             if backend == "gqa"
-            else create_model(replace(cfg, attention_backend=backend))
+            else create_model(
+                replace(cfg, attention_backend=backend, mita_execution=execution)
+            )
         )
         model = model.to(device=device, dtype=dtype)
         if backend in {"mita", "hybrid"}:
@@ -361,11 +464,14 @@ def _model_forward(cfg: Any, args: argparse.Namespace, torch: Any) -> dict[str, 
                 args.repeats,
                 device=device,
             )
-        result["backends"][backend] = {
+        result["backends"][label] = {
             "forward": timing,
+            "mita_execution": execution if backend in {"mita", "hybrid"} else None,
             "attention_inventory": model.attention_inventory(),
             "parameters": model.parameter_counts(),
         }
+    result["backends"]["mita"] = result["backends"]["mita_" + args.mita_execution]
+    result["selected_mita_alias"] = "mita_" + args.mita_execution
     return result
 
 
@@ -392,10 +498,12 @@ def benchmark(args: argparse.Namespace) -> dict[str, Any]:
         mita_query_chunk=args.query_chunk,
         seed=args.seed,
         device=args.device,
+        mita_execution=args.mita_execution,
     )
-    dense, sparse, matched = _matched_modules(cfg, torch)
-    dense = dense.to(device=device, dtype=dtype)
-    sparse = sparse.to(device=device, dtype=dtype)
+    modules, matched = _matched_modules(cfg, args, torch)
+    modules = {
+        name: module.to(device=device, dtype=dtype) for name, module in modules.items()
+    }
     rows = []
     for length in args.lengths:
         generator = torch.Generator(device="cpu").manual_seed(args.seed + length)
@@ -405,11 +513,10 @@ def benchmark(args: argparse.Namespace) -> dict[str, Any]:
             cfg.hidden_dim,
             generator=generator,
             dtype=torch.float32,
-        )
+        ).to(device=device, dtype=dtype)
         valid = torch.ones(args.batch_size, length, dtype=torch.bool)
         active = max(1, math.floor(length * (1 - args.padding_fraction)))
         valid[:, active:] = False
-        tokens = tokens.to(device=device, dtype=dtype)
         valid = valid.to(device=device)
         row = {
             "length": length,
@@ -418,20 +525,54 @@ def benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "tensor_capacities": tensor_capacities(
                 cfg, length, args.batch_size, tokens.element_size()
             ),
+            "routing_diagnostics": {},
         }
-        with torch.no_grad():
-            outputs = [module.eval()(tokens, valid) for module in (dense, sparse)]
+        with torch.inference_mode():
+            outputs = {
+                name: module.eval()(tokens, valid) for name, module in modules.items()
+            }
             if any(
                 output.shape != tokens.shape or not torch.isfinite(output).all()
-                for output in outputs
+                for output in outputs.values()
             ):
                 raise RuntimeError("invalid attention output")
-            difference = (outputs[1].float() - outputs[0].float()).norm() / outputs[
-                0
-            ].float().norm().clamp_min(1e-12)
-            row["relative_output_l2_difference"] = float(difference)
+            row["relative_output_l2_difference_from_gqa"] = {
+                name: float(
+                    (output.float() - outputs["gqa"].float()).norm()
+                    / outputs["gqa"].float().norm().clamp_min(1e-12)
+                )
+                for name, output in outputs.items()
+                if name != "gqa"
+            }
+            if "mita_reference" in outputs and "mita_grouped" in outputs:
+                first, second = outputs["mita_reference"], outputs["mita_grouped"]
+                tolerance = 0.002 if dtype == torch.float16 else 0.00001
+                equivalent = bool(
+                    torch.allclose(first, second, atol=tolerance, rtol=tolerance)
+                )
+                row["execution_equivalence"] = {
+                    "max_abs": float((first.float() - second.float()).abs().max()),
+                    "rtol": tolerance,
+                    "atol": tolerance,
+                    "within_tolerance": equivalent,
+                }
+                if not equivalent:
+                    raise RuntimeError(
+                        f"reference/grouped outputs differ at N={length}: {row['execution_equivalence']}"
+                    )
             del outputs
-        for name, module in (("gqa", dense), ("mita", sparse)):
+        # inspect_routing includes diagnostic tensors and deliberate scalar
+        # transfers; none of its work is part of timed production forward.
+        for name, module in modules.items():
+            if name == "gqa":
+                continue
+            diagnostic = routing_diagnostics(module, tokens, valid, torch)
+            row["routing_diagnostics"][name] = diagnostic
+            if module.execution == "grouped":
+                row["interactions"][name] = grouped_work(
+                    cfg, length, args.batch_size, diagnostic, tokens.element_size()
+                )
+        for name, module in modules.items():
             print(
                 f"{args.device.upper()} {args.dtype} N={length} {name}: forward and backward",
                 file=sys.stderr,
@@ -475,9 +616,18 @@ def benchmark(args: argparse.Namespace) -> dict[str, Any]:
             training_tokens.grad = None
             del train_step, clear_gradients, training_tokens
             row[name] = {"forward": forward, "forward_and_backward": backward}
+        row["mita"] = row["mita_" + args.mita_execution]
         row["mita_to_gqa_median_latency_ratio"] = {
             phase: row["mita"][phase]["median_ms"] / row["gqa"][phase]["median_ms"]
             for phase in ("forward", "forward_and_backward")
+        }
+        row["executions_to_gqa_median_latency_ratio"] = {
+            name: {
+                phase: row[name][phase]["median_ms"] / row["gqa"][phase]["median_ms"]
+                for phase in ("forward", "forward_and_backward")
+            }
+            for name in modules
+            if name != "gqa"
         }
         rows.append(row)
     result = {
@@ -511,10 +661,13 @@ def benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "repeats_per_phase": args.repeats,
             "padding_fraction": args.padding_fraction,
             "matched_projection_parameters": matched,
+            "kernel_backends": list(modules),
+            "selected_mita_alias": "mita_" + args.mita_execution,
             "source_sha256": {
                 name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
                 for name in (
                     "jitrl/neural/attention.py",
+                    "jitrl/neural/mita_grouped.py",
                     "jitrl/neural/config.py",
                     "scripts/bench_mita.py",
                     *(["jitrl/neural/model.py"] if args.model else []),
@@ -522,15 +675,15 @@ def benchmark(args: argparse.Namespace) -> dict[str, Any]:
             },
             "config": asdict(cfg),
             "revision": _revision(),
-            "forward_and_backward_includes": "zero_grad(set_to_none), input grad reset, attention forward, mean-square synthetic loss and backward; excludes optimizer and data generation",
+            "forward_and_backward_includes": "zero_grad(set_to_none), input grad reset, attention forward, float32 mean-square synthetic loss and backward; excludes optimizer/data generation/routing inspection",
         },
         "limitations": [
-            "Kernel microbenchmark on synthetic Gaussian inputs; no end-to-end Agent, remote API, training quality or task-success claim.",
-            "MiTA approximates dense attention; matched projections do not imply identical output functions.",
-            "Interaction/FLOP formulas omit projections, pooling, top-k, gathers and framework overhead; lower interaction counts do not guarantee lower latency.",
-            "Tensor capacity estimates are not measured allocator peaks; forward query chunking does not guarantee one-chunk training activation retention.",
-            "CUDA allocator peaks, when present, measure PyTorch allocated tensors in this benchmark process. They exclude reserved cache, driver, other processes and non-PyTorch allocations.",
-            "Timings depend on machine load, thread settings, synchronization overhead and PyTorch implementation; raw samples are retained.",
+            "Matched production GQA/reference/grouped comparisons use the same run, weights, input, dtype and device. Older JSONs remain historical baselines, not this comparison's denominator.",
+            "MiTA approximates dense attention; matching projections does not imply identical GQA and MiTA functions. Reference/grouped equivalence is checked separately.",
+            "Reference arithmetic N(2m+k) is not grouped padded SDPA work. Grouped interactions use observed packed_query_slots; both omit projections, packing/sorting/top-k and framework overhead.",
+            "Reference-only query-local KV gather capacity is not a grouped buffer or an allocator peak. Measured CUDA allocator fields are separate.",
+            "CUDA allocator peaks exclude reserved cache, driver, other processes and non-PyTorch allocations. Timings include synchronization overhead and depend on load.",
+            "Synthetic attention/model workload; no Agent task-quality or universal speed claim.",
         ],
         "results": rows,
     }
@@ -550,11 +703,12 @@ def main() -> int:
     else:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(serialized, encoding="utf-8")
-        print("N    GQA forward / fwd+bwd ms    MiTA forward / fwd+bwd ms")
+        print("N backend                 forward_ms  forward_and_backward_ms")
         for row in result["results"]:
-            print(
-                f"{row['length']:<5}{row['gqa']['forward']['median_ms']:>9.3f} / {row['gqa']['forward_and_backward']['median_ms']:<9.3f}   {row['mita']['forward']['median_ms']:>9.3f} / {row['mita']['forward_and_backward']['median_ms']:<9.3f}"
-            )
+            for backend in result["meta"]["kernel_backends"]:
+                print(
+                    f"{row['length']:<5}{backend:<24}{row[backend]['forward']['median_ms']:>9.3f}  {row[backend]['forward_and_backward']['median_ms']:>12.3f}"
+                )
         for backend, row in result.get("model_forward", {}).get("backends", {}).items():
             print(
                 f"Lens {backend}: forward {row['forward']['median_ms']:.3f} ms; inventory={row['attention_inventory']}"

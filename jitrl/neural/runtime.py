@@ -163,7 +163,11 @@ class LensRuntime:
         ):
             raise ValueError("checkpoint was published after this decision")
         architecture = {name: getattr(self.cfg, name) for name in _ARCHITECTURE}
-        key = (scope, record["checkpoint_id"], digest((architecture, self.cfg.device)))
+        key = (
+            scope,
+            record["checkpoint_id"],
+            digest((architecture, self.cfg.device, self.cfg.mita_execution)),
+        )
         with self._model_lock:
             if key in self._models:
                 self._models.move_to_end(key)
@@ -548,6 +552,7 @@ class LensRuntime:
                 "attention": trained.attention_inventory(),
                 "initialization": initialization,
                 "device": str(next(trained.parameters()).device),
+                "mita_execution": self.cfg.mita_execution,
             }
         except ImportError:
             self.last_error = "PYTORCH_UNAVAILABLE"
@@ -603,6 +608,7 @@ class LensRuntime:
             "mode": self.cfg.mode,
             "attention_backend": self.cfg.attention_backend,
             "device": self.cfg.device,
+            "mita_execution": self.cfg.mita_execution,
             "mita_layers": (
                 0
                 if self.cfg.attention_backend in {"legacy", "gqa"}

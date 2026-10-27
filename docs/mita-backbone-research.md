@@ -21,7 +21,7 @@
 
 原来的经验 compiler、低秩 fast adapter 和一次 memory GQA，分别完成经验汇总、条件调制和精确访问，但没有构建 landmark queries、共享压缩 KV、可复用的 top-k 原始 KV experts，也没有让每个 query 在共享专家和被路由专家之间共同归一化。它们只能归类为对“压缩与路由”思想的借鉴。
 
-当前 `jitrl/neural/attention.py` 实现以下完整计算链：
+当前 `jitrl/neural/attention.py` 与 `jitrl/neural/mita_grouped.py` 实现以下完整计算链：
 
 ```text
 输入状态 / 事件 / 经验 tokens
@@ -90,7 +90,7 @@ o_i=\operatorname{maskedsoftmax}
 \left(q_iK_i^{\star\top}/\sqrt{d_h}\right)V_i^\star.
 \]
 
-这就是论文式 (10)-(12)。本实现复用 `routing_scores` 作为共享分支的 logits，再计算被路由原始 KV 的 logits；拼接两者后调用一次 softmax。
+这就是论文式 (10)-(12)。`reference` 路径复用 `routing_scores` 作为共享分支的 logits，再计算被路由原始 KV 的 logits；拼接两者后调用一次 softmax。默认 `grouped` 路径按 expert 打包 query，拼接共享与原始 expert KV 后调用一次融合 SDPA；它重算共享 logits，但保持同一支持集和共同分母。
 
 若分别计算共享输出 `O_s` 和路由输出 `O_r`，必须保留两个分区函数：
 
@@ -113,7 +113,7 @@ O=\frac{Z_sO_s+Z_rO_r}{Z_s+Z_r}.
 - 作者官方视觉模块使用 2D spatial pooling，并带图像 token 布局假设；本地采用 1D 有效 rank 窗口。它保留局部有序压缩，但在不可整除长度上不等同于可能产生重叠窗口的 adaptive pooling。
 - 本地采用 6 query heads / 2 KV heads 的 GQA 投影，再广播到 query heads。每个 query head 分别生成自己的 landmarks、experts 和路由；共享的是 KV 投影，不是假定六个头的 top-k 索引相同。
 - 本地增加 padding、空窗口和空样本处理。无有效支持的行输出零，不在全 `-∞` 上直接运行 softmax。mask 也必须覆盖被 top-k 补齐的无效 KV。
-- 为适应 CPU 和现有 PyTorch 环境，本实现按 query chunk gather，使用标准张量运算与 autograd；不依赖官方 FlashAttention 2.6.3 的变长 CUDA 内核，也不宣称获得相同吞吐。
+- 使用标准 PyTorch 与 autograd；默认按 expert 打包 query、复用 KV 并调用局部融合 SDPA，保留逐 query chunk gather 的 `reference` 对照。不依赖官方 FlashAttention 2.6.3 的变长 CUDA 内核，也不宣称获得相同吞吐。
 
 官方代码还存在一个应公开的数值差异：`mita_attention.py` 将 `router * d_h^-0.5` 传为共享 keys，而 `MixedAttention` 内部再次使用 `d_h^-0.5`。这使共享分支比字面论文公式多一层平滑。本分支采用论文式 (10)-(12) 的统一标准缩放，属于基于论文核心的独立实现，不能宣称逐位复刻官方数值路径。
 
@@ -127,9 +127,9 @@ O=\frac{Z_sO_s+Z_rO_r}{Z_s+Z_r}.
 
 梯度数值对照应在 top-k 与 argmax 排序间隔明确的输入上进行。排序边界处的有限差分包含离散路径切换，不能据此要求不存在的索引导数。相同分数的 tie 也可能导致不同设备的索引顺序不同，应将随机种子、设备和 dtype 一并记录。
 
-## 6. 复杂度、gather 与实际交叉点
+## 6. 原始 reference 的复杂度与当前 grouped 执行
 
-设 batch 为 B、query heads 为 H、head width 为 d_h，m 为 landmarks，k 为 expert 宽度，C 为 query chunk。MiTA 每层的主要工作包括：
+设 batch 为 B、query heads 为 H、head width 为 d_h，m 为 landmarks，k 为 expert 宽度，C 为 query chunk。下表先列原始 `reference` 路径，不能直接当作当前 grouped 的物理执行量。每层的主要工作包括：
 
 | 阶段 | 主要计算或容量 |
 |---|---|
@@ -145,7 +145,7 @@ O=\frac{Z_sO_s+Z_rO_r}{Z_s+Z_r}.
 
 因此，完整分析必须包含 `mN` 构建阶段，不能只报最后 `N(m+k)` 的访问成本。若 m、k 固定且 N 增长，attention 交互相对 N 近似线性；若把 m 也设成随 N 线性增长，则该阶段仍可回到二次规模。Q/K/V 和输出投影，以及每个 token 的 SwiGLU 计算，也不因稀疏访问消失。
 
-由于共享 logits 已复用，一层形成的主要点积分数数目为
+由于 reference 复用共享 logits，一层形成的主要点积分数数目为
 
 \[
 BHN(2m+\min(k,N)),
@@ -153,7 +153,9 @@ BHN(2m+\min(k,N)),
 
 而 full GQA 为 `BHN²`。以预算上限 `N=161,m=8,k=16` 为例，单 head 分别为 5,152 和 25,921 个分数；这是算术数量，**不是端到端 FLOPs 或速度测量**。若 `N=8,m=8,k≥8`，则分别为 192 和 64，MiTA 的分数工作反而更多。
 
-`score_elements` 描述主要点积分数构建量，`peak_score_elements` 描述最大单个 score 张量的逻辑容量。它们都不等于 allocator 峰值：compression scores、weights、routing scores、expert vectors、chunk gather 和输出可以同时存活。GQA 的 KV 广播也会增加实际内存。对于较短序列，稠密 SDPA 的成熟内核可能更快；交叉点需要按真实 N、padding、B、dtype、线程数和设备测量。
+默认 grouped 路径在 SDPA 内重算共享 logits，并对 packed 空槽计算。若 P 为所有 batch/head 的 query 槽位总数，其 score 构建量为 `2BHNm+P(m+k)`，主要 FMA 为 `d_h[3BHNm+2P(m+k)]`。它用额外的部分算术和 padding 换取更少 KV 搬运与更好的矩阵执行；两种路径的实际操作数需分开报告。
+
+`score_elements` 描述主要点积分数构建量，`peak_score_elements` 描述最大单个 score 张量的逻辑容量。它们都不等于 allocator 峰值：compression scores、weights、routing scores、expert vectors、chunk gather 和输出可以同时存活，融合 SDPA 也未必物化完整分数矩阵。GQA 的 KV 广播也会增加实际内存。短序列开销、长序列实测交叉点与完整算量见 [MiTA 性能分析](mita-performance-analysis.md)。
 
 Chunking 限制推理时单次 gather 的临时规模，但训练 autograd 可能保留各 chunk 的中间值直到 backward，累计保存量仍可随 `B H N k d_h` 增长。不能用 C 替代 N 宣称训练峰值已经固定，也不能从“没有显式完整 N×N self-score 张量”推出一定省内存。
 
@@ -195,7 +197,7 @@ Chunking 限制推理时单次 gather 的临时规模，但训练 autograd 可�
 
 ## 10. 已完成实验的实际结果
 
-已按预先确定的两种种子、三种主干协议运行受控记忆任务，并在最终 model/config/learner 源码冻结后原样重跑。任务使用十个 code，每个回合随机改变五个 alpha / 五个 beta 的绑定；snapshot 中包含二十条已结算历史记录和打乱顺序的干扰项。配对样本具有相同当前状态与实际执行动作，但历史 rulebook 互为补集、观察回报相反，因此固定的 state→action 策略不能超过配对的 50% 排序基线。训练只接受实际执行动作的 ±3 回报；完整候选真值只用于评估。
+已按预先确定的两种种子、三种主干协议运行受控记忆任务，并在当轮 model/config/learner 源码冻结后原样重跑（原始 reference 内核，具体源码哈希保留于 JSON）。任务使用十个 code，每个回合随机改变五个 alpha / 五个 beta 的绑定；snapshot 中包含二十条已结算历史记录和打乱顺序的干扰项。配对样本具有相同当前状态与实际执行动作，但历史 rulebook 互为补集、观察回报相反，因此固定的 state→action 策略不能超过配对的 50% 排序基线。训练只接受实际执行动作的 ±3 回报；完整候选真值只用于评估。
 
 每种种子使用 128 条训练样本、64 条未见完整绑定赋值的评估样本；词汇表共享，回合、经验 ID 与完整绑定赋值不跨训练/评估。网络为四层、hidden 48、embedding 64、m=4、k=4，100 次更新、batch 16、学习率 0.001、CPU 两线程。三个后端每种种子的初始参数逐字节相同，均为 129,082 个参数；训练后都有非零参数变化和训练损失下降。以下是两种种子的描述性均值，MSE 使用原始回报单位的平方：
 
@@ -208,7 +210,7 @@ Chunking 限制推理时单次 gather 的临时规模，但训练 autograd 可�
 
 这些结果展示了训练链路和真实参数更新，**没有展示本设定下的记忆条件化泛化收益，也没有展示 MiTA 的任务优势**。去掉 memory 后三个后端的配对排序准确率都为 50%；完整原始预测、补集 rulebook 诊断、每种种子的损失/计时和源码 SHA-256 保存在 [受控记忆任务结果](../benchmarks/mita-memory-ablation.json)，可由 `scripts/ablate_mita.py` 复现。最终六次训练累计约 36.31 秒。评估结果没有被用于选择新学习率、训练步数或重试筛选更好种子；两种种子和一个小型合成任务不足以给出普遍架构结论。
 
-另已测量当前标准 PyTorch 实现的 CPU/CUDA 时延。以下数据只适用于记录中的机器和工作负载：Windows、PyTorch 2.8.0+cu128、float32、batch 1、两次热身与七次采样；CPU 单线程，GPU 为 RTX 3050 Ti Laptop GPU。完整网络测量使用 384 hidden、32 个事件、128 条 memory、三个候选、共 161 个主干 tokens，输入特征预先编码；不含检索、哈希、训练或远端 API。
+另已测量优化前 reference 实现的 CPU/CUDA 时延，以下保留为历史基线；当前 grouped 路径的同轮结果见 [性能分析](mita-performance-analysis.md)。以下数据只适用于记录中的机器和工作负载：Windows、PyTorch 2.8.0+cu128、float32、batch 1、两次热身与七次采样；CPU 单线程，GPU 为 RTX 3050 Ti Laptop GPU。完整网络测量使用 384 hidden、32 个事件、128 条 memory、三个候选、共 161 个主干 tokens，输入特征预先编码；不含检索、哈希、训练或远端 API。
 
 | 测量对象 | Full GQA 前向中位数 | MiTA 前向中位数 |
 |---|---:|---:|
@@ -216,4 +218,4 @@ Chunking 限制推理时单次 gather 的临时规模，但训练 autograd 可�
 | CUDA float32，四层完整本地网络 | 9.939 ms | 17.141 ms |
 | CUDA float32，单层 attention，N=1024 | 2.432 ms | 9.702 ms |
 
-N=1024 的 CUDA attention forward+backward 测得 PyTorch allocated tensor 峰值相对基线增量分别为 GQA 16.139 MiB、MiTA 68.399 MiB。这是已驻留参数/输入之上的分配器测量，不是 reserved cache、驱动显存或进程总显存。数据见 [CPU 基准](../benchmarks/mita-attention.json) 和 [CUDA float32 基准](../benchmarks/mita-attention-cuda.json)。这些观测中，当前 MiTA 实现的实际时延与该训练内存指标都高于优化后的稠密 SDPA；较少的理论点积分数并未转化为这里的加速或节省。CUDA 支持提供可选执行设备，不代表已经实现官方专用 FlashAttention 内核的性能。
+N=1024 的 CUDA attention forward+backward 测得 PyTorch allocated tensor 峰值相对基线增量分别为 GQA 16.139 MiB、MiTA 68.399 MiB。这是已驻留参数/输入之上的分配器测量，不是 reserved cache、驱动显存或进程总显存。数据见 [CPU 基准](../benchmarks/mita-attention.json) 和 [CUDA float32 基准](../benchmarks/mita-attention-cuda.json)。这些历史观测中，原 reference 的实际时延与该训练内存指标都高于优化后的稠密 SDPA；较少的理论点积分数并未转化为这里的加速或节省。CUDA 支持提供可选执行设备，不代表已经实现官方专用 FlashAttention 内核的性能。

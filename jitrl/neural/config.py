@@ -47,6 +47,7 @@ class LensConfig:
     mita_query_chunk: int = 64
     memory_tokens: int = 128
     device: str = "cpu"
+    mita_execution: str = "grouped"
 
     def __post_init__(self) -> None:
         if self.mode not in {"off", "shadow", "active"}:
@@ -55,6 +56,8 @@ class LensConfig:
             raise ValueError("unknown attention backend")
         if self.device not in {"cpu", "cuda", "auto"}:
             raise ValueError("unknown neural device")
+        if self.mita_execution not in {"grouped", "reference"}:
+            raise ValueError("unknown MiTA execution kernel")
         for item in fields(self):
             value = getattr(self, item.name)
             if isinstance(value, float) and not math.isfinite(value):
@@ -88,6 +91,10 @@ class LensConfig:
         )
         device = str(raw.get("device", "cpu")).lower()
         values["device"] = device if device in {"cpu", "cuda", "auto"} else "cpu"
+        execution = str(raw.get("mita_execution", "grouped")).lower()
+        values["mita_execution"] = (
+            execution if execution in {"grouped", "reference"} else "grouped"
+        )
         for name in ("pre_enabled", "post_enabled", "auto_train"):
             value = raw.get(name, getattr(base, name))
             values[name] = (

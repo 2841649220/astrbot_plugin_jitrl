@@ -34,7 +34,9 @@ def bootstrap() -> None:
     sys.modules["astrbot.api"] = api
 
 
-async def smoke(steps: int, backend: str = "mita", device: str = "cpu") -> dict:
+async def smoke(
+    steps: int, backend: str = "mita", device: str = "cpu", execution: str = "grouped"
+) -> dict:
     import torch
 
     from jitrl.neural.config import LensConfig
@@ -57,6 +59,7 @@ async def smoke(steps: int, backend: str = "mita", device: str = "cpu") -> dict:
         evidence_tokens=256,
         attention_backend=backend,
         device=device,
+        mita_execution=execution,
     )
     scope = "synthetic-private-scope"
     with tempfile.TemporaryDirectory(prefix="jitrl-neural-smoke-") as folder:
@@ -158,7 +161,7 @@ async def smoke(steps: int, backend: str = "mita", device: str = "cpu") -> dict:
 
 async def run(args: argparse.Namespace) -> dict:
     if args.command == "smoke":
-        return await smoke(args.steps, args.backend, args.device)
+        return await smoke(args.steps, args.backend, args.device, args.mita_execution)
     from jitrl.neural.config import LensConfig
     from jitrl.neural.runtime import LensRuntime
 
@@ -172,6 +175,7 @@ async def run(args: argparse.Namespace) -> dict:
         train_steps=args.steps,
         attention_backend=args.backend,
         device=args.device,
+        mita_execution=args.mita_execution,
     )
     runtime = LensRuntime(root, cfg)
     try:
@@ -196,6 +200,9 @@ def main() -> int:
         "--backend", choices=("mita", "hybrid", "gqa", "legacy"), default="mita"
     )
     demo.add_argument("--device", choices=("cpu", "cuda", "auto"), default="cpu")
+    demo.add_argument(
+        "--mita-execution", choices=("grouped", "reference"), default="grouped"
+    )
     for name in ("train", "status"):
         command = sub.add_parser(name)
         command.add_argument("--data-dir", required=True)
@@ -205,6 +212,9 @@ def main() -> int:
             "--backend", choices=("mita", "hybrid", "gqa", "legacy"), default="mita"
         )
         command.add_argument("--device", choices=("cpu", "cuda", "auto"), default="cpu")
+        command.add_argument(
+            "--mita-execution", choices=("grouped", "reference"), default="grouped"
+        )
     args = parser.parse_args()
     if not 1 <= args.steps <= 1000:
         parser.error("--steps must be in [1,1000]")

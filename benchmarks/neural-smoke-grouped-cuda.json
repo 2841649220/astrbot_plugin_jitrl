@@ -1,0 +1,56 @@
+{
+  "evidence": "synthetic-mechanical-smoke-only-no-agent-performance-claim",
+  "architecture": {
+    "hidden_dim": 384,
+    "blocks": 4,
+    "query_heads": 6,
+    "kv_heads": 2,
+    "bases": 8,
+    "rank": 8,
+    "attention_backend": "mita",
+    "mita_landmarks": 8,
+    "mita_topk": 16,
+    "memory_tokens": 128
+  },
+  "torch_version": "2.8.0+cu128",
+  "device": "cuda:0",
+  "training": {
+    "status": "trained",
+    "before_loss": 0.37192890644073484,
+    "after_loss": 0.2168335199356079,
+    "steps": 20,
+    "samples": 40,
+    "uncertainty": "observed-residual-proxy-uncalibrated",
+    "relevance": "structural-action-match-proxy",
+    "parameters": {
+      "active_neural": 7084334,
+      "engram_tables": 262016,
+      "total": 7346350,
+      "frozen_encoder": 0
+    },
+    "attention": {
+      "backend": "mita",
+      "mita_layers": 4,
+      "gqa_layers": 0,
+      "total_attention_layers": 4
+    },
+    "initialization": "fresh_architecture",
+    "device": "cuda:0",
+    "mita_execution": "grouped"
+  },
+  "future_synthetic_candidate_mse": 0.024457421762564824,
+  "synthetic_candidate_selections": [
+    "verify",
+    "verify",
+    "verify",
+    "verify"
+  ],
+  "rendered_utf8_bytes": [
+    164,
+    164,
+    164,
+    164
+  ],
+  "real_llm_calls": 0,
+  "note": "permissive smoke gates; no real task improvement measured"
+}

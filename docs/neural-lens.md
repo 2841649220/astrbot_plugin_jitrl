@@ -1,4 +1,4 @@
-# V0.2.1 Neural Lens 使用与 API 兼容约定
+# V0.2.0 Neural Lens 使用与 API 兼容约定
 
 本分支在 V0.1.2 上增量搭建，分支为 `codex/v0.2.0-neural-lens`。原来的插件名、`JitRLLearner` 入口、AstrBot 版本范围、两个事件钩子、`jitrl_recall` 工具、配置键和 Web 路由均保留。`neural.mode` 默认 `off`，旧配置无需修改，也不要求安装 PyTorch；其行为继续由 V0.1 的 `apply_mode`、`learning`、`retrieval`、`policy` 等控制。
 
@@ -23,6 +23,7 @@
   "neural": {
     "mode": "shadow",
     "attention_backend": "mita",
+    "mita_execution": "grouped",
     "mita_landmarks": 8,
     "mita_topk": 16,
     "mita_query_chunk": 64,
@@ -72,7 +73,11 @@ Engram 继续使用结构事件 suffix 2/3-gram、多头确定性哈希、上下
 
 检索基线使用冻结的带符号字符 N-gram 特征和结构重合度，在最近至多 2048 条有效经验中作有界精确扫描，合并最多 128 条粗选；神经主干保留至多 `memory_tokens` 条，默认 128，证据渲染仍最多两条且有独立文本预算。`legacy` 仍保留原 32 条上限。这里没有部署语义 embedding 服务或 ANN 索引。默认 MiTA 模型约 735 万参数（其中 Engram 表约 26 万），SQLite 与 checkpoint 文件占用独立存在。
 
-后端选项：`mita` 为默认四层 MiTA；`hybrid` 为前三层 MiTA、末层完整 GQA；`gqa` 为同样 token、深度和投影参数的四层完整 GQA；`legacy` 保留 V0.2.0 单 query GQA + 四个向量 MLP。只有前三者是可直接比较的等深 token 主干，不能把相对 legacy 增加容量的变化写成 MiTA 提速。
+后端选项：`mita` 为默认四层 MiTA；`hybrid` 为前三层 MiTA、末层完整 GQA；`gqa` 为同样 token、深度和投影参数的四层完整 GQA；`legacy` 保留开发早期的单 query GQA + 四个向量 MLP。只有前三者是可直接比较的等深 token 主干，不能把相对 legacy 增加容量的变化写成 MiTA 提速。
+
+MiTA 执行层另由 `mita_execution` 控制：默认 `grouped` 将同一专家的 queries 排序打包，KV 在 expert/block 层复用，通过局部融合 SDPA 共同归一化共享和路由分支，然后还原 query 顺序；`reference` 保留逐 query gather 路径。两种执行使用相同权重与支持集，切换无需重训。`mita_query_chunk` 是块上限；分组路径在短序列采用不超过 32 个 query 的块减少空槽，长 CUDA 序列采用静态分配上界避免主机读取动态块数，均未回退全量 GQA。
+
+生产前向关闭路由诊断张量的额外构造；调试接口 `inspect_routing()` 仍返回诊断。FP16/BF16 landmark pooling 使用 FP32 累加后转换回输入精度，避免半精度原子累加抖动改变硬路由。完整性能分析见 [MiTA 算量与算子研究](mita-performance-analysis.md)。
 
 本地训练使用已执行动作的条件回报 Huber loss、实际 PRE 的条件回报 loss、结构动作匹配相关性代理、已观察残差的不确定性代理和正则项。未执行候选没有 return 标签。shadow 的 PRE 只有 NO_OP 数据，active 的首次证据选择依靠受限的相关性规则；它不意味着已经学会某个干预的因果增益。
 
@@ -137,7 +142,7 @@ settlement 追加历史事件，读取按截止时间可见的最新有效事件
 - `/jitrl lens train`：管理员训练当前会话的本地模型。
 - `/jitrl lens reset confirm`：管理员删除当前会话神经事实、快照和全部已登记权重，并使旧后台写入失效。
 
-V0.2.0 升级时无需清空神经库或重建历史快照。默认 MiTA 检测到旧主干权重时拒绝误加载，`/jitrl lens train` 会用既有因果快照训练新的 MiTA 权重，保留旧 checkpoint。若要继续旧模型，显式设 `neural.attention_backend: legacy`；只有旧参数布局匹配时才可加载。切换 MiTA/hybrid/GQA 的 checkpoint 也需要严格匹配，不使用 `strict=False` 静默补权重。
+从早期向量主干切换时无需清空神经库或重建历史快照。默认 MiTA 检测到旧主干权重时拒绝误加载，`/jitrl lens train` 会用既有因果快照训练新的 MiTA 权重，保留旧 checkpoint。若要继续旧模型，显式设 `neural.attention_backend: legacy`；只有旧参数布局匹配时才可加载。切换 MiTA/hybrid/GQA 的 checkpoint 也需要严格匹配，不使用 `strict=False` 静默补权重。
 
 **旧 `forget`、`checkpoint`、`rollback`、`export` 与对应面板操作只管理 V0.1 经验库。** 它们不会被改成隐式删除新模型；也不构成神经模型的备份或恢复。要删除神经知识，请显式执行 `lens reset confirm`。旧检查点可继续在 V0.1 数据上使用。本版本尚无神经 checkpoint 回滚 UI、神经库导入导出和自动磁盘轮换；长期运行需管理数据目录容量。reset 是逻辑删除，不承诺数据库空闲页、备份介质或已发送远端提示的物理擦除。
 
@@ -168,6 +173,6 @@ python scripts/neural_lens.py status --data-dir <path-to-neural-directory> --sco
 python scripts/neural_lens.py train --data-dir <path-to-neural-directory> --scope <private-scope> --steps 20
 ```
 
-离线命令可追加 `--backend mita|hybrid|gqa|legacy` 与 `--device cpu|cuda|auto`；CPU/CUDA 测试报告是独立的运行记录。
+离线命令可追加 `--backend mita|hybrid|gqa|legacy`、`--mita-execution grouped|reference` 与 `--device cpu|cuda|auto`；CPU/CUDA 测试报告是独立的运行记录。
 
 禁止把几个私有 scope 合并成一次训练。比较 V0.1、shadow 与 active 的真实效果时，按时间/任务分割、固定 provider 与评估协议，并记录决策时确实已发布的模型版本；建议消融见研究说明。

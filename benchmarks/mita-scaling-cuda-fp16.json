@@ -1,0 +1,643 @@
+{
+  "harness_version": 2,
+  "meta": {
+    "python": "3.13.12",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "processor": "AMD64 Family 25 Model 80 Stepping 0, AuthenticAMD",
+    "torch_version": "2.8.0+cu128",
+    "device": "cuda",
+    "dtype": "float16",
+    "cuda": {
+      "gpu_name": "NVIDIA GeForce RTX 3050 Ti Laptop GPU",
+      "total_memory_bytes": 4294443008,
+      "compute_capability": [
+        8,
+        6
+      ],
+      "runtime_version": "12.8",
+      "cudnn_version": 91002
+    },
+    "cuda_synchronized_before_and_after_every_sample_and_warmup": true,
+    "tf32_matmul_and_cudnn_enabled": false,
+    "seed": 1729,
+    "threads": 1,
+    "interop_threads": 1,
+    "batch_size": 1,
+    "warmup_per_phase": 2,
+    "repeats_per_phase": 3,
+    "padding_fraction": 0.0,
+    "matched_projection_parameters": 393216,
+    "source_sha256": {
+      "jitrl/neural/attention.py": "eab67ada56298a1a6cb5000a50a5f298ed186fbefd11ea89e1bb5d1ec8b181ab",
+      "jitrl/neural/config.py": "1d1ba3604a59d28e1cc337caf3eff5656fc5e5fdbdbd646f61731c6c3bbc0850",
+      "scripts/bench_mita.py": "e74920630efbf15ef0e369638ab5a1d07e9d482e3e86e74f51bc618f265d0df4"
+    },
+    "config": {
+      "mode": "off",
+      "pre_enabled": true,
+      "post_enabled": false,
+      "auto_train": false,
+      "train_every": 32,
+      "min_samples": 32,
+      "train_steps": 20,
+      "batch_size": 16,
+      "learning_rate": 0.0003,
+      "min_support": 3,
+      "max_uncertainty": 0.5,
+      "relevance_threshold": 0.6,
+      "similarity_threshold": 0.25,
+      "max_adjustment": 1.0,
+      "evidence_tokens": 128,
+      "max_memory": 32,
+      "coarse_limit": 128,
+      "replay_limit": 2048,
+      "hidden_dim": 384,
+      "embedding_dim": 256,
+      "summary_dim": 128,
+      "blocks": 4,
+      "query_heads": 6,
+      "kv_heads": 2,
+      "bases": 8,
+      "rank": 8,
+      "engram_buckets": 4093,
+      "engram_heads": 2,
+      "engram_dim": 16,
+      "max_events": 32,
+      "return_scale": 6.0,
+      "seed": 1729,
+      "attention_backend": "mita",
+      "mita_landmarks": 8,
+      "mita_topk": 16,
+      "mita_query_chunk": 64,
+      "memory_tokens": 128,
+      "device": "cuda"
+    },
+    "revision": {
+      "head": "1b02e6065ae66554cfca7132e1230d21593c5215",
+      "working_tree_dirty": true
+    },
+    "forward_and_backward_includes": "zero_grad(set_to_none), input grad reset, attention forward, mean-square synthetic loss and backward; excludes optimizer and data generation"
+  },
+  "limitations": [
+    "Kernel microbenchmark on synthetic Gaussian inputs; no end-to-end Agent, remote API, training quality or task-success claim.",
+    "MiTA approximates dense attention; matched projections do not imply identical output functions.",
+    "Interaction/FLOP formulas omit projections, pooling, top-k, gathers and framework overhead; lower interaction counts do not guarantee lower latency.",
+    "Tensor capacity estimates are not measured allocator peaks; forward query chunking does not guarantee one-chunk training activation retention.",
+    "CUDA allocator peaks, when present, measure PyTorch allocated tensors in this benchmark process. They exclude reserved cache, driver, other processes and non-PyTorch allocations.",
+    "Timings depend on machine load, thread settings, synchronization overhead and PyTorch implementation; raw samples are retained."
+  ],
+  "results": [
+    {
+      "length": 2048,
+      "valid_tokens_per_batch_row": 2048,
+      "interactions": {
+        "effective_landmarks": 8,
+        "effective_topk": 16,
+        "routed_experts_per_query": 1,
+        "dense": {
+          "score_dot_product_pairs": 25165824,
+          "weighted_value_pairs": 25165824,
+          "attention_only_scalar_flop_estimate": 6442450944
+        },
+        "mita": {
+          "compression_score_pairs": 98304,
+          "routing_score_pairs": 98304,
+          "shared_plus_routed_score_pairs": 294912,
+          "reused_routing_score_pairs_in_final_support": 98304,
+          "score_dot_product_pairs": 393216,
+          "weighted_value_pairs": 393216,
+          "attention_only_scalar_flop_estimate": 100663296
+        },
+        "mita_to_dense_score_pair_ratio": 0.015625,
+        "mita_to_dense_attention_flop_ratio": 0.015625
+      },
+      "tensor_capacities": {
+        "unit": "bytes",
+        "element_bytes": 2,
+        "kind": "individual_logical_tensor_capacity_estimates_not_measured_allocator_peak",
+        "dense_explicit_score_matrix": 50331648,
+        "mita_compression_scores": 196608,
+        "mita_full_routing_scores_upper_bound": 196608,
+        "mita_one_chunk_final_scores": 18432,
+        "mita_one_chunk_routed_key_and_value_gather": 1572864,
+        "mita_reusable_expert_key_and_value_buffer": 196608,
+        "mita_landmark_query_and_compressed_value": 12288,
+        "mita_all_queries_routed_key_and_value_gather": 50331648,
+        "caveat": "Several intermediates may coexist. Backward may retain tensors from every chunk. Dense optimized SDPA may avoid materializing its full logical score matrix. These values do not measure either allocator or process peak memory."
+      },
+      "relative_output_l2_difference": 7.143077850341797,
+      "gqa": {
+        "forward": {
+          "median_ms": 1.861,
+          "p95_ms": 1.9914,
+          "min_ms": 1.8602,
+          "max_ms": 1.9914,
+          "samples_ms": [
+            1.9914,
+            1.861,
+            1.8602
+          ],
+          "cuda_allocator": {
+            "kind": "measured_pytorch_cuda_allocated_tensor_memory_not_reserved_or_process_memory",
+            "max_peak_allocated_bytes": 21109248,
+            "max_peak_minus_baseline_bytes": 9441280,
+            "samples": [
+              {
+                "baseline_allocated_bytes": 11667968,
+                "peak_allocated_bytes": 21109248,
+                "peak_minus_baseline_bytes": 9441280
+              },
+              {
+                "baseline_allocated_bytes": 11667968,
+                "peak_allocated_bytes": 21109248,
+                "peak_minus_baseline_bytes": 9441280
+              },
+              {
+                "baseline_allocated_bytes": 11667968,
+                "peak_allocated_bytes": 21109248,
+                "peak_minus_baseline_bytes": 9441280
+              }
+            ],
+            "baseline": "all currently resident benchmark weights/inputs; gradients cleared before each training sample; excludes reserved cache, driver and non-PyTorch allocations"
+          }
+        },
+        "forward_and_backward": {
+          "median_ms": 6.9809,
+          "p95_ms": 7.0783,
+          "min_ms": 6.9281,
+          "max_ms": 7.0783,
+          "samples_ms": [
+            6.9281,
+            7.0783,
+            6.9809
+          ],
+          "cuda_allocator": {
+            "kind": "measured_pytorch_cuda_allocated_tensor_memory_not_reserved_or_process_memory",
+            "max_peak_allocated_bytes": 45411840,
+            "max_peak_minus_baseline_bytes": 23651328,
+            "samples": [
+              {
+                "baseline_allocated_bytes": 21760512,
+                "peak_allocated_bytes": 45411840,
+                "peak_minus_baseline_bytes": 23651328
+              },
+              {
+                "baseline_allocated_bytes": 21760512,
+                "peak_allocated_bytes": 45411840,
+                "peak_minus_baseline_bytes": 23651328
+              },
+              {
+                "baseline_allocated_bytes": 21760512,
+                "peak_allocated_bytes": 45411840,
+                "peak_minus_baseline_bytes": 23651328
+              }
+            ],
+            "baseline": "all currently resident benchmark weights/inputs; gradients cleared before each training sample; excludes reserved cache, driver and non-PyTorch allocations"
+          }
+        }
+      },
+      "mita": {
+        "forward": {
+          "median_ms": 14.2372,
+          "p95_ms": 14.5182,
+          "min_ms": 14.1398,
+          "max_ms": 14.5182,
+          "samples_ms": [
+            14.2372,
+            14.5182,
+            14.1398
+          ],
+          "cuda_allocator": {
+            "kind": "measured_pytorch_cuda_allocated_tensor_memory_not_reserved_or_process_memory",
+            "max_peak_allocated_bytes": 37002240,
+            "max_peak_minus_baseline_bytes": 16814592,
+            "samples": [
+              {
+                "baseline_allocated_bytes": 20187648,
+                "peak_allocated_bytes": 37002240,
+                "peak_minus_baseline_bytes": 16814592
+              },
+              {
+                "baseline_allocated_bytes": 20187648,
+                "peak_allocated_bytes": 37002240,
+                "peak_minus_baseline_bytes": 16814592
+              },
+              {
+                "baseline_allocated_bytes": 20187648,
+                "peak_allocated_bytes": 37002240,
+                "peak_minus_baseline_bytes": 16814592
+              }
+            ],
+            "baseline": "all currently resident benchmark weights/inputs; gradients cleared before each training sample; excludes reserved cache, driver and non-PyTorch allocations"
+          }
+        },
+        "forward_and_backward": {
+          "median_ms": 45.9005,
+          "p95_ms": 47.7927,
+          "min_ms": 45.3457,
+          "max_ms": 47.7927,
+          "samples_ms": [
+            45.3457,
+            45.9005,
+            47.7927
+          ],
+          "cuda_allocator": {
+            "kind": "measured_pytorch_cuda_allocated_tensor_memory_not_reserved_or_process_memory",
+            "max_peak_allocated_bytes": 98406912,
+            "max_peak_minus_baseline_bytes": 76646400,
+            "samples": [
+              {
+                "baseline_allocated_bytes": 21760512,
+                "peak_allocated_bytes": 98406912,
+                "peak_minus_baseline_bytes": 76646400
+              },
+              {
+                "baseline_allocated_bytes": 21760512,
+                "peak_allocated_bytes": 98406912,
+                "peak_minus_baseline_bytes": 76646400
+              },
+              {
+                "baseline_allocated_bytes": 21760512,
+                "peak_allocated_bytes": 98406912,
+                "peak_minus_baseline_bytes": 76646400
+              }
+            ],
+            "baseline": "all currently resident benchmark weights/inputs; gradients cleared before each training sample; excludes reserved cache, driver and non-PyTorch allocations"
+          }
+        }
+      },
+      "mita_to_gqa_median_latency_ratio": {
+        "forward": 7.650295540032241,
+        "forward_and_backward": 6.575155065965706
+      }
+    },
+    {
+      "length": 4096,
+      "valid_tokens_per_batch_row": 4096,
+      "interactions": {
+        "effective_landmarks": 8,
+        "effective_topk": 16,
+        "routed_experts_per_query": 1,
+        "dense": {
+          "score_dot_product_pairs": 100663296,
+          "weighted_value_pairs": 100663296,
+          "attention_only_scalar_flop_estimate": 25769803776
+        },
+        "mita": {
+          "compression_score_pairs": 196608,
+          "routing_score_pairs": 196608,
+          "shared_plus_routed_score_pairs": 589824,
+          "reused_routing_score_pairs_in_final_support": 196608,
+          "score_dot_product_pairs": 786432,
+          "weighted_value_pairs": 786432,
+          "attention_only_scalar_flop_estimate": 201326592
+        },
+        "mita_to_dense_score_pair_ratio": 0.0078125,
+        "mita_to_dense_attention_flop_ratio": 0.0078125
+      },
+      "tensor_capacities": {
+        "unit": "bytes",
+        "element_bytes": 2,
+        "kind": "individual_logical_tensor_capacity_estimates_not_measured_allocator_peak",
+        "dense_explicit_score_matrix": 201326592,
+        "mita_compression_scores": 393216,
+        "mita_full_routing_scores_upper_bound": 393216,
+        "mita_one_chunk_final_scores": 18432,
+        "mita_one_chunk_routed_key_and_value_gather": 1572864,
+        "mita_reusable_expert_key_and_value_buffer": 196608,
+        "mita_landmark_query_and_compressed_value": 12288,
+        "mita_all_queries_routed_key_and_value_gather": 100663296,
+        "caveat": "Several intermediates may coexist. Backward may retain tensors from every chunk. Dense optimized SDPA may avoid materializing its full logical score matrix. These values do not measure either allocator or process peak memory."
+      },
+      "relative_output_l2_difference": 8.669130325317383,
+      "gqa": {
+        "forward": {
+          "median_ms": 4.5377,
+          "p95_ms": 4.5661,
+          "min_ms": 4.4226,
+          "max_ms": 4.5661,
+          "samples_ms": [
+            4.4226,
+            4.5377,
+            4.5661
+          ],
+          "cuda_allocator": {
+            "kind": "measured_pytorch_cuda_allocated_tensor_memory_not_reserved_or_process_memory",
+            "max_peak_allocated_bytes": 40645120,
+            "max_peak_minus_baseline_bytes": 18882560,
+            "samples": [
+              {
+                "baseline_allocated_bytes": 21762560,
+                "peak_allocated_bytes": 40645120,
+                "peak_minus_baseline_bytes": 18882560
+              },
+              {
+                "baseline_allocated_bytes": 21762560,
+                "peak_allocated_bytes": 40645120,
+                "peak_minus_baseline_bytes": 18882560
+              },
+              {
+                "baseline_allocated_bytes": 21762560,
+                "peak_allocated_bytes": 40645120,
+                "peak_minus_baseline_bytes": 18882560
+              }
+            ],
+            "baseline": "all currently resident benchmark weights/inputs; gradients cleared before each training sample; excludes reserved cache, driver and non-PyTorch allocations"
+          }
+        },
+        "forward_and_backward": {
+          "median_ms": 18.6808,
+          "p95_ms": 18.6982,
+          "min_ms": 18.4978,
+          "max_ms": 18.6982,
+          "samples_ms": [
+            18.6808,
+            18.4978,
+            18.6982
+          ],
+          "cuda_allocator": {
+            "kind": "measured_pytorch_cuda_allocated_tensor_memory_not_reserved_or_process_memory",
+            "max_peak_allocated_bytes": 72209920,
+            "max_peak_minus_baseline_bytes": 47301632,
+            "samples": [
+              {
+                "baseline_allocated_bytes": 24908288,
+                "peak_allocated_bytes": 72209920,
+                "peak_minus_baseline_bytes": 47301632
+              },
+              {
+                "baseline_allocated_bytes": 24908288,
+                "peak_allocated_bytes": 72209920,
+                "peak_minus_baseline_bytes": 47301632
+              },
+              {
+                "baseline_allocated_bytes": 24908288,
+                "peak_allocated_bytes": 72209920,
+                "peak_minus_baseline_bytes": 47301632
+              }
+            ],
+            "baseline": "all currently resident benchmark weights/inputs; gradients cleared before each training sample; excludes reserved cache, driver and non-PyTorch allocations"
+          }
+        }
+      },
+      "mita": {
+        "forward": {
+          "median_ms": 26.8913,
+          "p95_ms": 26.964,
+          "min_ms": 26.8292,
+          "max_ms": 26.964,
+          "samples_ms": [
+            26.8292,
+            26.964,
+            26.8913
+          ],
+          "cuda_allocator": {
+            "kind": "measured_pytorch_cuda_allocated_tensor_memory_not_reserved_or_process_memory",
+            "max_peak_allocated_bytes": 53439488,
+            "max_peak_minus_baseline_bytes": 31676928,
+            "samples": [
+              {
+                "baseline_allocated_bytes": 21762560,
+                "peak_allocated_bytes": 53439488,
+                "peak_minus_baseline_bytes": 31676928
+              },
+              {
+                "baseline_allocated_bytes": 21762560,
+                "peak_allocated_bytes": 53439488,
+                "peak_minus_baseline_bytes": 31676928
+              },
+              {
+                "baseline_allocated_bytes": 21762560,
+                "peak_allocated_bytes": 53439488,
+                "peak_minus_baseline_bytes": 31676928
+              }
+            ],
+            "baseline": "all currently resident benchmark weights/inputs; gradients cleared before each training sample; excludes reserved cache, driver and non-PyTorch allocations"
+          }
+        },
+        "forward_and_backward": {
+          "median_ms": 87.7862,
+          "p95_ms": 87.867,
+          "min_ms": 87.527,
+          "max_ms": 87.867,
+          "samples_ms": [
+            87.7862,
+            87.867,
+            87.527
+          ],
+          "cuda_allocator": {
+            "kind": "measured_pytorch_cuda_allocated_tensor_memory_not_reserved_or_process_memory",
+            "max_peak_allocated_bytes": 177984000,
+            "max_peak_minus_baseline_bytes": 153075712,
+            "samples": [
+              {
+                "baseline_allocated_bytes": 24908288,
+                "peak_allocated_bytes": 177984000,
+                "peak_minus_baseline_bytes": 153075712
+              },
+              {
+                "baseline_allocated_bytes": 24908288,
+                "peak_allocated_bytes": 177984000,
+                "peak_minus_baseline_bytes": 153075712
+              },
+              {
+                "baseline_allocated_bytes": 24908288,
+                "peak_allocated_bytes": 177984000,
+                "peak_minus_baseline_bytes": 153075712
+              }
+            ],
+            "baseline": "all currently resident benchmark weights/inputs; gradients cleared before each training sample; excludes reserved cache, driver and non-PyTorch allocations"
+          }
+        }
+      },
+      "mita_to_gqa_median_latency_ratio": {
+        "forward": 5.926196090530445,
+        "forward_and_backward": 4.699274121022653
+      }
+    },
+    {
+      "length": 8192,
+      "valid_tokens_per_batch_row": 8192,
+      "interactions": {
+        "effective_landmarks": 8,
+        "effective_topk": 16,
+        "routed_experts_per_query": 1,
+        "dense": {
+          "score_dot_product_pairs": 402653184,
+          "weighted_value_pairs": 402653184,
+          "attention_only_scalar_flop_estimate": 103079215104
+        },
+        "mita": {
+          "compression_score_pairs": 393216,
+          "routing_score_pairs": 393216,
+          "shared_plus_routed_score_pairs": 1179648,
+          "reused_routing_score_pairs_in_final_support": 393216,
+          "score_dot_product_pairs": 1572864,
+          "weighted_value_pairs": 1572864,
+          "attention_only_scalar_flop_estimate": 402653184
+        },
+        "mita_to_dense_score_pair_ratio": 0.00390625,
+        "mita_to_dense_attention_flop_ratio": 0.00390625
+      },
+      "tensor_capacities": {
+        "unit": "bytes",
+        "element_bytes": 2,
+        "kind": "individual_logical_tensor_capacity_estimates_not_measured_allocator_peak",
+        "dense_explicit_score_matrix": 805306368,
+        "mita_compression_scores": 786432,
+        "mita_full_routing_scores_upper_bound": 786432,
+        "mita_one_chunk_final_scores": 18432,
+        "mita_one_chunk_routed_key_and_value_gather": 1572864,
+        "mita_reusable_expert_key_and_value_buffer": 196608,
+        "mita_landmark_query_and_compressed_value": 12288,
+        "mita_all_queries_routed_key_and_value_gather": 201326592,
+        "caveat": "Several intermediates may coexist. Backward may retain tensors from every chunk. Dense optimized SDPA may avoid materializing its full logical score matrix. These values do not measure either allocator or process peak memory."
+      },
+      "relative_output_l2_difference": 11.217859268188477,
+      "gqa": {
+        "forward": {
+          "median_ms": 15.296,
+          "p95_ms": 15.5156,
+          "min_ms": 13.675,
+          "max_ms": 15.5156,
+          "samples_ms": [
+            13.675,
+            15.296,
+            15.5156
+          ],
+          "cuda_allocator": {
+            "kind": "measured_pytorch_cuda_allocated_tensor_memory_not_reserved_or_process_memory",
+            "max_peak_allocated_bytes": 62677504,
+            "max_peak_minus_baseline_bytes": 37765120,
+            "samples": [
+              {
+                "baseline_allocated_bytes": 24912384,
+                "peak_allocated_bytes": 62677504,
+                "peak_minus_baseline_bytes": 37765120
+              },
+              {
+                "baseline_allocated_bytes": 24912384,
+                "peak_allocated_bytes": 62677504,
+                "peak_minus_baseline_bytes": 37765120
+              },
+              {
+                "baseline_allocated_bytes": 24912384,
+                "peak_allocated_bytes": 62677504,
+                "peak_minus_baseline_bytes": 37765120
+              }
+            ],
+            "baseline": "all currently resident benchmark weights/inputs; gradients cleared before each training sample; excludes reserved cache, driver and non-PyTorch allocations"
+          }
+        },
+        "forward_and_backward": {
+          "median_ms": 62.7594,
+          "p95_ms": 62.8905,
+          "min_ms": 62.0791,
+          "max_ms": 62.8905,
+          "samples_ms": [
+            62.7594,
+            62.8905,
+            62.0791
+          ],
+          "cuda_allocator": {
+            "kind": "measured_pytorch_cuda_allocated_tensor_memory_not_reserved_or_process_memory",
+            "max_peak_allocated_bytes": 125806080,
+            "max_peak_minus_baseline_bytes": 94602240,
+            "samples": [
+              {
+                "baseline_allocated_bytes": 31203840,
+                "peak_allocated_bytes": 125806080,
+                "peak_minus_baseline_bytes": 94602240
+              },
+              {
+                "baseline_allocated_bytes": 31203840,
+                "peak_allocated_bytes": 125806080,
+                "peak_minus_baseline_bytes": 94602240
+              },
+              {
+                "baseline_allocated_bytes": 31203840,
+                "peak_allocated_bytes": 125806080,
+                "peak_minus_baseline_bytes": 94602240
+              }
+            ],
+            "baseline": "all currently resident benchmark weights/inputs; gradients cleared before each training sample; excludes reserved cache, driver and non-PyTorch allocations"
+          }
+        }
+      },
+      "mita": {
+        "forward": {
+          "median_ms": 52.2702,
+          "p95_ms": 53.5675,
+          "min_ms": 52.2136,
+          "max_ms": 53.5675,
+          "samples_ms": [
+            52.2702,
+            53.5675,
+            52.2136
+          ],
+          "cuda_allocator": {
+            "kind": "measured_pytorch_cuda_allocated_tensor_memory_not_reserved_or_process_memory",
+            "max_peak_allocated_bytes": 86313984,
+            "max_peak_minus_baseline_bytes": 61401600,
+            "samples": [
+              {
+                "baseline_allocated_bytes": 24912384,
+                "peak_allocated_bytes": 86313984,
+                "peak_minus_baseline_bytes": 61401600
+              },
+              {
+                "baseline_allocated_bytes": 24912384,
+                "peak_allocated_bytes": 86313984,
+                "peak_minus_baseline_bytes": 61401600
+              },
+              {
+                "baseline_allocated_bytes": 24912384,
+                "peak_allocated_bytes": 86313984,
+                "peak_minus_baseline_bytes": 61401600
+              }
+            ],
+            "baseline": "all currently resident benchmark weights/inputs; gradients cleared before each training sample; excludes reserved cache, driver and non-PyTorch allocations"
+          }
+        },
+        "forward_and_backward": {
+          "median_ms": 169.5905,
+          "p95_ms": 170.9388,
+          "min_ms": 169.3369,
+          "max_ms": 170.9388,
+          "samples_ms": [
+            169.3369,
+            170.9388,
+            169.5905
+          ],
+          "cuda_allocator": {
+            "kind": "measured_pytorch_cuda_allocated_tensor_memory_not_reserved_or_process_memory",
+            "max_peak_allocated_bytes": 337138176,
+            "max_peak_minus_baseline_bytes": 305934336,
+            "samples": [
+              {
+                "baseline_allocated_bytes": 31203840,
+                "peak_allocated_bytes": 337138176,
+                "peak_minus_baseline_bytes": 305934336
+              },
+              {
+                "baseline_allocated_bytes": 31203840,
+                "peak_allocated_bytes": 337138176,
+                "peak_minus_baseline_bytes": 305934336
+              },
+              {
+                "baseline_allocated_bytes": 31203840,
+                "peak_allocated_bytes": 337138176,
+                "peak_minus_baseline_bytes": 305934336
+              }
+            ],
+            "baseline": "all currently resident benchmark weights/inputs; gradients cleared before each training sample; excludes reserved cache, driver and non-PyTorch allocations"
+          }
+        }
+      },
+      "mita_to_gqa_median_latency_ratio": {
+        "forward": 3.4172463389121344,
+        "forward_and_backward": 2.702232653594521
+      }
+    }
+  ]
+}

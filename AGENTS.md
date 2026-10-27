@@ -2,7 +2,7 @@
 
 - For routine features and fixes, increment only the patch (last) version number.
 - Increment the middle version number only for large architectural improvements.
-- This branch targets the V0.2 neural architecture, currently `0.2.1` (the MiTA backbone iteration after `0.2.0`). Its V0.1 baseline is `0.1.2`; `0.1.1` was re-released with market fixes and `0.1.0` was the first public version.
+- This branch targets the architectural release `0.2.0`; keep all ongoing neural and MiTA research under `0.2.0` until the user explicitly requests another version. Its V0.1 baseline is `0.1.2`; `0.1.1` was re-released with market fixes and `0.1.0` was the first public version.
 - Keep V0.2 neural work on `codex/v0.2.0-neural-lens`; do not merge it into the V0.1 line without an explicit request.
 - Neural training is optional and scope-isolated. Preserve exact historical retrieval snapshots, exclude pending rewards from supervised targets, and never claim local candidate scores are remote logits or causal uplift.
 - The default neural backbone uses actual MiTA in all four token-attention blocks. Keep landmark compression, reusable top-k KV experts and jointly normalized routing intact; GQA/hybrid/legacy are explicit comparisons, not silent substitutions.
