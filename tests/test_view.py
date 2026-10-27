@@ -98,7 +98,9 @@ def test_export_uses_the_bridge_download_signature() -> None:
         "bridge.download takes (endpoint, params, filename); passing a string as "
         "params drops the download filename"
     )
-    assert args[1] == "{}", "params must be an object"
+    assert args[1].startswith("{") and "robot:" in args[1], (
+        "export must include the selected robot ID in its query parameters"
+    )
     assert args[2].startswith('"') and len(args[2]) > 2, "filename is missing"
 
 

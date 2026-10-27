@@ -46,6 +46,22 @@ body {
 .head p { margin: 0; color: var(--muted); font-size: 12.5px; }
 .head-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
+.robot-select-label { color: var(--muted); font-size: 12px; }
+.robot-select {
+  min-width: 180px;
+  max-width: min(300px, 65vw);
+  padding: 5px 28px 5px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card-2);
+  color: var(--text);
+  font: inherit;
+}
+.robot-select:disabled { opacity: 0.55; }
+.robot-scope-card { padding-block: 10px; }
+.robot-scope-card h2 { margin-bottom: 2px; }
+.robot-scope-card p { margin: 0; }
+
 .chip {
   padding: 4px 10px;
   border-radius: 999px;

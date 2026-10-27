@@ -487,7 +487,7 @@
     }
   },
   "neural": {
-    "description": "V0.2.0 本地 Neural Lens（默认 MiTA 主干）",
+    "description": "V0.2.1 本地 Neural Lens（机器人实例隔离，默认 MiTA 主干）",
     "type": "object",
     "items": {
       "mode": {

@@ -13,6 +13,7 @@ const snapshot = {
   id: "a".repeat(32), name: "可信版本", kind: "manual", created_at: 1000,
   episodes: 1, experiences: 2, size_bytes: 8192,
 };
+const robot = { id: "robot-one", platform_name: "test", self_id: "bot-1", label: "test · bot-1" };
 
 class Element {
   constructor(tag = "div") {
@@ -44,7 +45,7 @@ class Element {
   }
 }
 
-async function dashboard() {
+async function dashboard(robots = [robot]) {
   const ids = Object.fromEntries([...html.matchAll(/id="([^"]+)"/g)].map((m) => [m[1], new Element()]));
   ids["btn-forget"].setAttribute("data-memory-mutation", "");
   ids["btn-checkpoint"].setAttribute("data-memory-mutation", "");
@@ -57,14 +58,19 @@ async function dashboard() {
   const timers = new Map();
   let nextTimer = 0;
   const posts = [];
+  const gets = [];
   const bridge = {
     inventory: [{ ...snapshot }],
     ready: async () => {},
-    apiGet: async (endpoint) => ({
-      overview: { total: 2, enabled: true, apply_mode: "hint", stats: {} },
+    apiGet: async (endpoint, params) => {
+      gets.push({ endpoint, params: { ...params } });
+      return ({
+      robots: { robots },
+      overview: { total: 2, enabled: true, apply_mode: "hint", stats: {}, robot_id: params.robot, robots },
       curve: { buckets: [] }, actions: { actions: [] }, episodes: { episodes: [] },
       checkpoints: { checkpoints: bridge.inventory, interval: 50, keep: 20 },
-    })[endpoint],
+      })[endpoint];
+    },
     apiPost: async (endpoint, payload) => {
       posts.push({ endpoint, payload: JSON.parse(JSON.stringify(payload)) });
       if (bridge.postHandler) return bridge.postHandler(endpoint, payload);
@@ -90,7 +96,7 @@ async function dashboard() {
   });
   vm.runInContext(source.replace(/\nmain\(\);\s*$/, "\nglobalThis.boot = main();"), context);
   await context.boot;
-  return { ids, bridge, posts, timers, document,
+  return { ids, bridge, posts, gets, timers, document,
     controls: () => ids.checkpoints.children[0].children[1].children,
   };
 }
@@ -108,7 +114,7 @@ test("form creates a named snapshot and reports the saved ID", async () => {
   const app = await dashboard();
   app.ids["checkpoint-name"].value = "  已验证  ";
   await app.ids["checkpoint-form"].emit("submit");
-  assert.deepEqual(app.posts, [{ endpoint: "checkpoint", payload: { name: "已验证" } }]);
+  assert.deepEqual(app.posts, [{ endpoint: "checkpoint", payload: { name: "已验证", robot: robot.id } }]);
   assert.equal(app.ids["checkpoint-name"].value, "");
   assert.match(app.ids["action-hint"].textContent, new RegExp(snapshot.id));
 });
@@ -120,7 +126,7 @@ test("rollback requires two clicks and includes explicit global confirmation", a
   assert.equal(app.posts.length, 0);
   assert.equal(button.textContent, "再次点击确认回退");
   await button.emit("click");
-  assert.deepEqual(app.posts, [{ endpoint: "rollback", payload: { id: snapshot.id, scope: "all", confirm: true } }]);
+  assert.deepEqual(app.posts, [{ endpoint: "rollback", payload: { id: snapshot.id, scope: "all", confirm: true, robot: robot.id } }]);
   assert.match(app.ids["action-hint"].textContent, new RegExp("b".repeat(32)));
 });
 
@@ -137,6 +143,7 @@ test("switching action and expiring confirmation cannot authorize deletion", asy
   assert.equal(app.posts.length, 0);
   await remove.emit("click");
   assert.equal(app.posts[0].endpoint, "checkpoint_delete");
+  assert.equal(app.posts[0].payload.robot, robot.id);
   assert.equal(app.ids.checkpoints.children[0].textContent.includes("还没有检查点"), true);
 });
 
@@ -176,5 +183,22 @@ test("clear retains two-step confirmation and explains recovery", async () => {
   assert.match(app.ids["action-hint"].textContent, /自动保存检查点/);
   await app.ids["btn-forget"].emit("click");
   assert.equal(app.posts[0].endpoint, "forget");
+  assert.equal(app.posts[0].payload.robot, robot.id);
   assert.match(app.ids["action-hint"].textContent, /删除前备份回退/);
+});
+
+test("every dashboard read is scoped to the selected robot", async () => {
+  const app = await dashboard();
+  assert.ok(app.gets.length >= 6);
+  assert.ok(app.gets.filter(({ endpoint }) => endpoint !== "robots").every(({ params }) => params.robot === robot.id));
+  assert.equal(app.ids["robot-select"].value, robot.id);
+});
+
+test("switching robots refreshes only the selected instance", async () => {
+  const second = { id: "robot-two", platform_name: "test", self_id: "bot-2", label: "test · bot-2" };
+  const app = await dashboard([robot, second]);
+  app.ids["robot-select"].value = second.id;
+  await app.ids["robot-select"].emit("change");
+  assert.equal(app.ids["robot-select"].value, second.id);
+  assert.ok(app.gets.filter(({ endpoint }) => endpoint !== "robots").slice(-5).every(({ params }) => params.robot === second.id));
 });

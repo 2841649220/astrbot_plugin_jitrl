@@ -122,7 +122,7 @@ def fixed_evaluator(monkeypatch, host, rewards):
 async def active_proposal(plugin, monkeypatch):
     """Provide a valid nonempty PRE snapshot without requiring model training."""
     plugin.cfg.neural = replace(plugin.cfg.neural, mode="active")
-    runtime = await plugin._ensure_neural()
+    runtime = await plugin._ensure_neural(Event())
     proposed = []
 
     async def prepare(state):
@@ -467,7 +467,7 @@ async def legacy_plugin(host):
 
 
 async def seed_legacy_memory(instance):
-    await instance._ensure_ready()
+    await instance._ensure_ready(Event())
     for tool, reward in (("search", 2.0), ("inspect", -2.0)):
         await _seed(instance._bank, "trusted task", tool, reward)
 
@@ -495,6 +495,51 @@ async def test_existing_config_uses_legacy_memory_and_temporary_injection(
     assert legacy_plugin._stats["biased"] == 1
     assert await legacy_plugin._bank.count("s1") == 2
     assert not legacy_plugin._neural_root.exists()
+
+
+async def test_neural_runtimes_are_isolated_by_robot(plugin):
+    first = Event(scope="shared-session", platform_id="platform-a", self_id="bot-a")
+    second = Event(scope="shared-session", platform_id="platform-a", self_id="bot-b")
+
+    first_runtime = await plugin._ensure_neural(first)
+    first_key = plugin._robot_key_for_event(first)
+    second_runtime = await plugin._ensure_neural(second)
+    second_key = plugin._robot_key_for_event(second)
+
+    assert first_key != second_key
+    assert first_runtime is not second_runtime
+    assert plugin._neural_roots[first_key] != plugin._neural_roots[second_key]
+    assert plugin._neural_roots[first_key].parent == plugin._robot_dir(first_key)
+    assert plugin._neural_roots[second_key].parent == plugin._robot_dir(second_key)
+    assert first_runtime.store.path != second_runtime.store.path
+    assert first_runtime.store.stats("shared-session") == {
+        "decisions": 0,
+        "executions": 0,
+        "settlements": 0,
+    }
+    assert second_runtime.store.stats("shared-session") == {
+        "decisions": 0,
+        "executions": 0,
+        "settlements": 0,
+    }
+
+
+async def test_legacy_neural_store_moves_to_the_first_robot(plugin):
+    from jitrl.neural.store import LensStore
+
+    legacy_root = plugin._legacy_neural_root
+    legacy_store = LensStore(legacy_root / "neural.sqlite3")
+    legacy_store.reset("legacy-session")
+    legacy_store.close()
+
+    event = Event(scope="new-session", platform_id="platform-a", self_id="first-bot")
+    robot_id = plugin._robot_key_for_event(event)
+    runtime = await plugin._ensure_neural(event)
+
+    assert not legacy_root.exists()
+    assert plugin._neural_roots[robot_id] == plugin._robot_dir(robot_id) / "neural"
+    assert runtime.store.epoch("legacy-session") == 1
+    assert runtime.store.path == plugin._neural_roots[robot_id] / "neural.sqlite3"
 
 
 async def test_existing_dashboard_route_names_and_verbs_are_preserved(legacy_plugin):
@@ -559,9 +604,14 @@ async def test_existing_command_registration_names_are_preserved(host):
     assert registrations["lens"] == "jitrl_lens"
 
 
-async def test_overview_adds_neural_without_changing_existing_payload(legacy_plugin):
+async def test_overview_adds_neural_without_changing_existing_payload(
+    legacy_plugin, host
+):
     await seed_legacy_memory(legacy_plugin)
     await legacy_plugin.on_llm_request(Event(), request())
+    host.web.request = SimpleNamespace(
+        query=SimpleNamespace(get=lambda key, default=None, type=None: default)
+    )
     response = await legacy_plugin._web_overview()
     assert response.status_code == 200
     payload = response.payload
@@ -656,7 +706,7 @@ async def test_lens_status_reads_only_the_callers_scope(plugin):
 async def test_lens_train_passes_exact_scope_and_reports_local_training_only(
     plugin, monkeypatch
 ):
-    runtime = await plugin._ensure_neural()
+    runtime = await plugin._ensure_neural(Event())
     scopes = []
 
     async def train(scope):
@@ -756,6 +806,10 @@ def settlement_history(plugin, scope):
         ]
 
 
+def feedback_key(plugin, scope):
+    return plugin._cache_scope(Event(scope=scope))
+
+
 @pytest.mark.parametrize(
     "verdict,rewards,returns",
     [
@@ -780,7 +834,7 @@ async def test_manual_neural_feedback_appends_history_and_uses_episode_gamma(
     text = await command(plugin.jitrl_feedback(Event(scope="private-a"), verdict))
     assert "2 个步骤" in text
     assert "追加结算" in text
-    assert "private-a" not in plugin._neural_last_episode
+    assert feedback_key(plugin, "private-a") not in plugin._neural_last_episode
 
     history = settlement_history(plugin, "private-a")
     assert [row for row in history if row["source"] == "heuristic"] == original
@@ -806,7 +860,7 @@ async def test_manual_neural_feedback_never_uses_another_scopes_last_episode(
     text = await command(plugin.jitrl_feedback(Event(scope="private-b"), "bad"))
     assert "0 个步骤" in text
     assert settlement_history(plugin, "private-a") == history
-    assert "private-a" in plugin._neural_last_episode
+    assert feedback_key(plugin, "private-a") in plugin._neural_last_episode
     assert plugin._neural.store.stats("private-b")["settlements"] == 0
     text = await command(plugin.jitrl_feedback(Event(scope="private-a"), "good"))
     assert "2 个步骤" in text
@@ -825,7 +879,7 @@ async def test_keyword_feedback_runs_once_at_start_of_next_neural_run(
     history = settlement_history(plugin, "private-a")
     user_events = [row for row in history if row["source"] == "user"]
     assert [row["reward"] for row in user_events] == expected_rewards
-    assert "private-a" not in plugin._neural_last_episode
+    assert feedback_key(plugin, "private-a") not in plugin._neural_last_episode
     assert (
         audit_rows(
             plugin,
@@ -852,7 +906,7 @@ async def test_keyword_feedback_is_scope_isolated_and_honors_disable(
     plugin.cfg.feedback.enabled = False
     await plugin.on_llm_request(Event(scope="private-a", text="谢谢"), request())
     assert settlement_history(plugin, "private-a") == history
-    assert "private-a" in plugin._neural_last_episode
+    assert feedback_key(plugin, "private-a") in plugin._neural_last_episode
     # This setting disables keyword detection; the existing explicit command
     # retains its legacy meaning and can still apply an authorized verdict.
     text = await command(plugin.jitrl_feedback(Event(scope="private-a"), "good"))
@@ -864,8 +918,9 @@ async def test_expired_neural_feedback_does_not_create_user_labels(
     plugin, host, monkeypatch, manual
 ):
     await completed_neural_episode(plugin, host, monkeypatch)
-    episode, timestamp, gamma, epoch = plugin._neural_last_episode["private-a"]
-    plugin._neural_last_episode["private-a"] = (
+    key = feedback_key(plugin, "private-a")
+    episode, timestamp, gamma, epoch = plugin._neural_last_episode[key]
+    plugin._neural_last_episode[key] = (
         episode,
         timestamp - plugin.cfg.feedback.window_seconds - 1,
         gamma,
@@ -878,7 +933,7 @@ async def test_expired_neural_feedback_does_not_create_user_labels(
     else:
         await plugin.on_llm_request(Event(scope="private-a", text="谢谢"), request())
     assert settlement_history(plugin, "private-a") == history
-    assert "private-a" not in plugin._neural_last_episode
+    assert key not in plugin._neural_last_episode
 
 
 @pytest.mark.parametrize("manual", [True, False])
@@ -894,7 +949,7 @@ async def test_neural_reset_rejects_cached_feedback_from_old_generation(
         assert "0 个步骤" in text
     else:
         await plugin.on_llm_request(Event(scope="private-a", text="不对"), request())
-    assert "private-a" not in plugin._neural_last_episode
+    assert feedback_key(plugin, "private-a") not in plugin._neural_last_episode
     assert plugin._neural.store.stats("private-a")["settlements"] == 0
     assert plugin._neural.store.replay("private-a") == []
 

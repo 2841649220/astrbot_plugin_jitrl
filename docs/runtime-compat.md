@@ -3,7 +3,7 @@
 Every host API this plugin touches, checked against the AstrBot source for the
 version range declared in `metadata.yaml` (`astrbot_version: ">=4.29,<5"`).
 
-**Verdict: 32/32 APIs OK, no MISMATCH, no UNVERIFIED item, and the declared
+**Verdict: 34/34 APIs OK, no MISMATCH, no UNVERIFIED item, and the declared
 version range is accurate.** Seven non-blocking follow-ups are listed in §5.
 
 ## 0. What was audited
@@ -77,8 +77,12 @@ cannot be settled from the source alone.
 | 30 | Bridge endpoint → URL mapping `/api/v1/plugins/extensions/{pluginName}/{endpoint}` and envelope handling (`{status:"error"}` ⇒ reject, otherwise `data?.data ?? data`) — [dashboard/src/views/PluginViewPage.vue:122](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/dashboard/src/views/PluginViewPage.vue#L122), [:382](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/dashboard/src/views/PluginViewPage.vue#L382) *(identical on master)* | `app.js:329` `apiGet("overview")`, `:337` `curve`, `:338` `actions`, `:339` `episodes`, `:340` `checkpoints`, `:285` `checkpoint`, `:314` `rollback`/`checkpoint_delete`, `:388` `forget`, `:354` `export` | **OK** | — (endpoints are plugin-relative and match the registered `/astrbot_plugin_jitrl/*` routes; `json_response` payloads arrive verbatim because they carry no `data` key) |
 | 31 | `from astrbot.api import logger` — `_PluginContextLogger` routes to the calling plugin's logger — [api/__init__.py:1](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/api/__init__.py#L1) *(identical on master)* | `main.py:43`, `jitrl/memory.py:27`, `jitrl/evaluator.py:45`, `jitrl/checkpoints.py:19`, `jitrl/reranker.py:25`; no stdlib `logging` anywhere in shipped sources (enforced by `tests/test_manifest.py:170`) | **OK** | — |
 | 32 | `astrbot_version` is parsed with `packaging.SpecifierSet` and must contain the running `VERSION` — [star_manager.py:674](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/star/star_manager.py#L674) | `metadata.yaml:6` `astrbot_version: ">=4.29,<5"` | **OK** | — (verified `4.29.0 ≤ v < 5`; `<5` is not vacuous because the dashboard/plugin-page contract is still evolving) |
+| 33 | `AstrMessageEvent.get_platform_id()` returns the unique platform-instance ID — [astr_message_event.py:1482](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/astr_message_event.py#L1482), [master:1696](https://github.com/AstrBotDevs/AstrBot/blob/master/astrbot/core/platform/astr_message_event.py#L1696) | `main.py:_robot_identity` combines this ID with `get_self_id()` | **OK** | — (source explicitly says multiple instances of the same adapter may run and their IDs are unique) |
+| 34 | `AstrMessageEvent.get_self_id()` returns the bot's own ID — [astr_message_event.py:1588](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/astr_message_event.py#L1588), [master:1802](https://github.com/AstrBotDevs/AstrBot/blob/master/astrbot/core/platform/astr_message_event.py#L1802) | `main.py:_robot_identity` incorporates this ID before hashing the robot key | **OK** | — (source returns the adapter message object's `self_id`) |
 
 **No MISMATCH and no UNVERIFIED row.**
+
+V0.2.1 delta: rows 33–34 were checked after adding robot-instance isolation. The pinned v4.29.0 API and current upstream `master` both expose these methods.
 
 ## 2. Dispatch semantics verified in the host source (not just signatures)
 

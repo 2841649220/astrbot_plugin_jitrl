@@ -1,9 +1,10 @@
 """JitRL legacy policy and an optional, locally trained Neural Lens.
 
-V0.2.0 adds a scope-isolated neural controller in jitrl.neural. The remote
-LLM remains frozen; only the local optional PyTorch model is trained. The
-legacy path described below is selected when neural.mode is off.
-The current V0.2.0 design makes all four local token-attention blocks genuine MiTA by default.
+V0.2.1 adds robot-instance isolation to both the legacy learner and optional
+neural controller in jitrl.neural. The remote LLM remains frozen; only the
+local optional PyTorch model is trained. The legacy path described below is
+selected when neural.mode is off. All four local token-attention blocks use
+genuine MiTA by default.
 
 This plugin implements *Just-In-Time Reinforcement Learning* (Li et al.,
 ICML 2026) on top of AstrBot's agent pipeline. The paper keeps the model
@@ -37,10 +38,13 @@ Hook wiring:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import random
 import time
 import uuid
 from collections import OrderedDict
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -186,25 +190,43 @@ class JitRLLearner(Star):
         super().__init__(context)
         self.cfg = JitRLConfig.from_raw(config)
         data_root = Path(get_astrbot_plugin_data_path()) / _PLUGIN_DATA_DIR
-        self._db_path = data_root / "memory.sqlite3"
-        self._neural_root = data_root / "neural"
-        self._neural: Any | None = None
+        self._data_root = data_root
+        self._legacy_db_path = data_root / "memory.sqlite3"
+        self._banks: dict[str, MemoryBank] = {}
+        self._bank_paths: dict[str, Path] = {}
+        self._robot_dirs: dict[str, Path] = {}
+        self._active_bank: ContextVar[MemoryBank | None] = ContextVar(
+            f"jitrl_bank_{id(self)}", default=None
+        )
+        self._active_robot_key: ContextVar[str | None] = ContextVar(
+            f"jitrl_robot_key_{id(self)}", default=None
+        )
+        self._last_bank: MemoryBank | None = None
+        self._last_db_path = self._legacy_db_path
+        self._neural_by_robot: dict[str, Any] = {}
+        self._neural_roots: dict[str, Path] = {}
+        self._active_neural_root: ContextVar[Path | None] = ContextVar(
+            f"jitrl_neural_root_{id(self)}", default=None
+        )
+        self._last_neural: Any | None = None
+        self._legacy_neural_root = data_root / "neural"
         self._neural_ready_lock = asyncio.Lock()
         self._neural_training: set[str] = set()
         self._neural_last_episode: dict[str, tuple[str, float, float, int]] = {}
-        self._bank: MemoryBank | None = None
         self._ready_lock = asyncio.Lock()
         self._background: set[asyncio.Task] = set()
-        self._rng = random.Random()
+        self._rng_by_robot: dict[str, random.Random] = {}
+        self._unscoped_rng = random.Random()
         self._last_episode: dict[str, tuple[str, float]] = {}
         self._last_decision: dict[str, tuple[float, PolicyDecision]] = {}
-        self._state_cache: OrderedDict[tuple[str, str, str], tuple[str, StateView]] = (
-            OrderedDict()
-        )
+        self._state_cache: OrderedDict[
+            tuple[str, str, str, str], tuple[str, StateView]
+        ] = OrderedDict()
         self._decision_cache: OrderedDict[tuple[Any, ...], _DecisionSnapshot] = (
             OrderedDict()
         )
-        self._stats: dict[str, int] = {
+        self._stats_by_robot: dict[str, dict[str, int]] = {}
+        self._unscoped_stats: dict[str, int] = {
             "requests": 0,
             "biased": 0,
             "episodes": 0,
@@ -213,39 +235,242 @@ class JitRLLearner(Star):
         }
         self._register_web_apis()
 
-    # ------------------------------------------------------------------
-    # lifecycle
-    # ------------------------------------------------------------------
-    async def _ensure_ready(self) -> None:
-        """Open the memory bank on first use.
+    @property
+    def _bank(self) -> MemoryBank | None:
+        robot_key = self._active_robot_key.get()
+        return self._banks.get(robot_key) if robot_key is not None else self._last_bank
 
-        Raises:
-            Exception: Whatever `MemoryBank.initialize` raises, so the caller
-                can record the failure in its own try/except block.
-        """
-        if self._bank is not None:
+    @property
+    def _db_path(self) -> Path:
+        robot_key = self._active_robot_key.get()
+        if robot_key is not None:
+            return self._bank_paths.get(
+                robot_key, self._robot_dir(robot_key) / "memory.sqlite3"
+            )
+        return self._last_db_path
+
+    @property
+    def _neural(self) -> Any | None:
+        robot_key = self._active_robot_key.get()
+        return (
+            self._neural_by_robot.get(robot_key)
+            if robot_key is not None
+            else self._last_neural
+        )
+
+    @property
+    def _neural_root(self) -> Path:
+        return self._active_neural_root.get() or self._legacy_neural_root
+
+    @property
+    def _stats(self) -> dict[str, int]:
+        robot_key = self._active_robot_key.get()
+        if robot_key is None:
+            return self._unscoped_stats
+        if robot_key not in self._stats_by_robot:
+            self._stats_by_robot[robot_key] = {
+                "requests": 0,
+                "biased": 0,
+                "episodes": 0,
+                "experiences": 0,
+                "failures": 0,
+            }
+        return self._stats_by_robot[robot_key]
+
+    @property
+    def _rng(self) -> random.Random:
+        robot_key = self._active_robot_key.get()
+        if robot_key is None:
+            return self._unscoped_rng
+        if robot_key not in self._rng_by_robot:
+            self._rng_by_robot[robot_key] = random.Random()
+        return self._rng_by_robot[robot_key]
+
+    @staticmethod
+    def _robot_key(identity: str) -> str:
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _robot_identity(event: AstrMessageEvent) -> str:
+        return f"{event.get_platform_id()}:{event.get_self_id()}"
+
+    def _robot_key_for_event(self, event: AstrMessageEvent) -> str:
+        return self._robot_key(self._robot_identity(event))
+
+    def _cache_scope(self, event: AstrMessageEvent) -> str:
+        return f"{self._robot_key_for_event(event)}:{event.unified_msg_origin}"
+
+    def _robot_dir(self, robot_key: str) -> Path:
+        return self._data_root / "robots" / robot_key
+
+    def _known_robots(self) -> list[dict[str, str]]:
+        robots = []
+        root = self._data_root / "robots"
+        if root.exists():
+            for directory in sorted(root.iterdir()):
+                metadata_path = directory / "robot.json"
+                if directory.is_dir() and metadata_path.exists():
+                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    robots.append({"id": directory.name, **metadata})
+        return robots
+
+    def _activate_robot(
+        self, robot_key: str, bank: MemoryBank, db_path: Path, robot_dir: Path
+    ) -> None:
+        self._active_bank.set(bank)
+        self._active_robot_key.set(robot_key)
+        self._active_neural_root.set(
+            self._neural_roots.get(robot_key, robot_dir / "neural")
+        )
+        self._last_bank = bank
+        self._last_db_path = db_path
+
+    def _migrate_legacy_data(self, robot_dir: Path, db_path: Path) -> None:
+        migration_marker = self._data_root / ".legacy-migration.json"
+        if migration_marker.exists():
             return
+
+        old_checkpoints = self._data_root / "checkpoints"
+        old_neural = self._data_root / "neural"
+        old_exports = [
+            *self._data_root.glob("export-*.json"),
+            self._data_root / "jitrl-export.json",
+        ]
+        has_legacy_data = (
+            any(
+                Path(f"{self._legacy_db_path}{suffix}").exists()
+                for suffix in ("", "-wal", "-shm")
+            )
+            or old_checkpoints.exists()
+            or old_neural.exists()
+            or any(source.exists() for source in old_exports)
+        )
+        if not has_legacy_data:
+            return
+
+        if self._legacy_db_path.exists():
+            if not db_path.exists():
+                for suffix in ("", "-wal", "-shm"):
+                    source = Path(f"{self._legacy_db_path}{suffix}")
+                    if source.exists():
+                        source.replace(Path(f"{db_path}{suffix}"))
+
+        if old_checkpoints.exists() and not (robot_dir / "checkpoints").exists():
+            old_checkpoints.replace(robot_dir / "checkpoints")
+        if old_neural.exists() and not (robot_dir / "neural").exists():
+            old_neural.replace(robot_dir / "neural")
+        for source in old_exports:
+            if source.exists():
+                target = robot_dir / source.name
+                if not target.exists():
+                    source.replace(target)
+
+        remaining = [
+            source.name
+            for source in (
+                self._legacy_db_path,
+                Path(f"{self._legacy_db_path}-wal"),
+                Path(f"{self._legacy_db_path}-shm"),
+                old_checkpoints,
+                old_neural,
+                *old_exports,
+            )
+            if source.exists()
+        ]
+        if remaining:
+            logger.warning(
+                "[JitRL] legacy data preserved at the shared path because the first robot already has matching files: %s",
+                ", ".join(remaining),
+            )
+
+        migration_marker.write_text(
+            json.dumps({"robot_id": robot_dir.name}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def _activate_robot_event(
+        self, event: AstrMessageEvent
+    ) -> tuple[str, Path, dict[str, str]]:
+        robot_key = self._robot_key_for_event(event)
+        robot_dir = self._robot_dir(robot_key)
+        robot_dir.mkdir(parents=True, exist_ok=True)
+        metadata = {
+            "platform_id": str(event.get_platform_id()),
+            "platform_name": str(event.get_platform_name()),
+            "self_id": str(event.get_self_id()),
+            "label": f"{event.get_platform_name()} · {event.get_self_id()}",
+        }
+        metadata_path = robot_dir / "robot.json"
+        if not metadata_path.exists():
+            metadata_path.write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        self._robot_dirs[robot_key] = robot_dir
+        self._active_robot_key.set(robot_key)
+        self._active_neural_root.set(robot_dir / "neural")
+        return robot_key, robot_dir, metadata
+
+    async def _ensure_ready(
+        self, event: AstrMessageEvent | None = None, *, robot_id: str | None = None
+    ) -> MemoryBank:
+        if event is not None:
+            robot_key, robot_dir, metadata = self._activate_robot_event(event)
+        elif robot_id is not None:
+            selected = next(
+                robot for robot in self._known_robots() if robot["id"] == robot_id
+            )
+            metadata = {key: value for key, value in selected.items() if key != "id"}
+            robot_key = robot_id
+        else:
+            active = self._active_bank.get()
+            if active is not None:
+                return active
+            raise RuntimeError("an AstrBot robot instance is required")
+
+        bank = self._banks.get(robot_key)
+        if bank is not None:
+            self._activate_robot(
+                robot_key,
+                bank,
+                self._bank_paths[robot_key],
+                self._robot_dirs[robot_key],
+            )
+            return bank
         async with self._ready_lock:
-            if self._bank is not None:
-                return
-            self._db_path.parent.mkdir(parents=True, exist_ok=True)
+            bank = self._banks.get(robot_key)
+            if bank is not None:
+                self._activate_robot(
+                    robot_key,
+                    bank,
+                    self._bank_paths[robot_key],
+                    self._robot_dirs[robot_key],
+                )
+                return bank
+            robot_dir = self._robot_dirs.get(robot_key, self._robot_dir(robot_key))
+            robot_dir.mkdir(parents=True, exist_ok=True)
+            db_path = robot_dir / "memory.sqlite3"
+            await asyncio.to_thread(self._migrate_legacy_data, robot_dir, db_path)
+            (robot_dir / "robot.json").write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
             bank = MemoryBank(
-                self._db_path,
+                db_path,
                 max_entries=self.cfg.memory.max_entries,
                 redact=self.cfg.memory.redact_secrets,
                 keep_episodes=self.cfg.memory.keep_episodes,
                 prune_strategy=self.cfg.memory.prune_strategy,
-                checkpoint_dir=self._db_path.parent / "checkpoints",
+                checkpoint_dir=robot_dir / "checkpoints",
                 checkpoint_interval=self.cfg.memory.checkpoint_interval,
                 keep_checkpoints=self.cfg.memory.keep_checkpoints,
             )
             await bank.initialize()
-            self._bank = bank
-            # Warm the retrieval index off the request path. Small banks are
-            # already indexed by initialize(); this covers the rest and is a
-            # no-op when the index is ready.
+            self._banks[robot_key] = bank
+            self._bank_paths[robot_key] = db_path
+            self._robot_dirs[robot_key] = robot_dir
+            self._activate_robot(robot_key, bank, db_path, robot_dir)
             self._spawn(bank.warm_index())
-            logger.info("[JitRL] memory bank ready at %s", self._db_path)
+            logger.info("[JitRL] memory bank ready for %s", metadata["platform_name"])
+            return bank
 
     async def terminate(self) -> None:
         """Release background work and close the database on unload."""
@@ -254,41 +479,89 @@ class JitRLLearner(Star):
         if self._background:
             await asyncio.gather(*self._background, return_exceptions=True)
         self._background.clear()
-        if self._neural is not None:
-            await self._neural.close()
-            self._neural = None
-        if self._bank is not None:
-            await self._bank.close()
-            self._bank = None
+        await asyncio.gather(
+            *(runtime.close() for runtime in self._neural_by_robot.values())
+        )
+        await asyncio.gather(*(bank.close() for bank in self._banks.values()))
+        self._neural_by_robot.clear()
+        self._neural_roots.clear()
+        self._banks.clear()
+        self._bank_paths.clear()
+        self._last_neural = None
+        self._last_bank = None
+        self._active_bank.set(None)
+        self._active_neural_root.set(None)
+        self._active_robot_key.set(None)
         logger.info("[JitRL] plugin terminated")
 
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
-    async def _ensure_neural(self) -> Any:
-        if self._neural is None:
-            async with self._neural_ready_lock:
-                if self._neural is None:
-                    from .jitrl.neural.runtime import LensRuntime
+    async def _ensure_neural(
+        self,
+        event: AstrMessageEvent | None = None,
+        *,
+        robot_id: str | None = None,
+    ) -> Any:
+        if event is not None:
+            robot_key, robot_dir, _metadata = self._activate_robot_event(event)
+        elif robot_id is not None:
+            if not any(robot["id"] == robot_id for robot in self._known_robots()):
+                raise ValueError("机器人实例不存在")
+            robot_key = robot_id
+            robot_dir = self._robot_dir(robot_key)
+            self._robot_dirs[robot_key] = robot_dir
+            self._active_robot_key.set(robot_key)
+        else:
+            robot_key = self._active_robot_key.get()
+            if robot_key is None:
+                raise RuntimeError("an AstrBot robot instance is required")
+            robot_dir = self._robot_dirs.get(robot_key, self._robot_dir(robot_key))
 
-                    self._neural = await asyncio.to_thread(
-                        LensRuntime, self._neural_root, self.cfg.neural
-                    )
-        return self._neural
+        runtime = self._neural_by_robot.get(robot_key)
+        if runtime is not None:
+            self._active_neural_root.set(self._neural_roots[robot_key])
+            self._last_neural = runtime
+            return runtime
+
+        async with self._neural_ready_lock:
+            runtime = self._neural_by_robot.get(robot_key)
+            if runtime is not None:
+                self._active_neural_root.set(self._neural_roots[robot_key])
+                self._last_neural = runtime
+                return runtime
+            from .jitrl.neural.runtime import LensRuntime
+
+            neural_root = robot_dir / "neural"
+            async with self._ready_lock:
+                await asyncio.to_thread(
+                    self._migrate_legacy_data,
+                    robot_dir,
+                    robot_dir / "memory.sqlite3",
+                )
+            if self._legacy_neural_root.exists() and not neural_root.exists():
+                await asyncio.to_thread(self._legacy_neural_root.replace, neural_root)
+            runtime = await asyncio.to_thread(LensRuntime, neural_root, self.cfg.neural)
+            self._neural_by_robot[robot_key] = runtime
+            self._neural_roots[robot_key] = neural_root
+            self._active_neural_root.set(neural_root)
+            self._last_neural = runtime
+            return runtime
 
     async def _neural_request(
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
         try:
-            runtime = await self._ensure_neural()
+            runtime = await self._ensure_neural(event)
             messages = provider_messages(req)
             calls, observation, events = observed_context(messages)
             run = event.get_extra(_NEURAL_KEY)
             if not isinstance(run, NeuralRun) or run.completed:
                 run = NeuralRun(baseline_calls=calls)
                 event.set_extra(_NEURAL_KEY, run)
+                cache_scope = self._cache_scope(event)
                 await self._maybe_apply_feedback(
-                    event.unified_msg_origin, event.get_message_str() or ""
+                    cache_scope, event.get_message_str() or ""
                 )
             new_calls = calls - run.baseline_calls
             if len(run.frames) >= 40:
@@ -358,6 +631,8 @@ class JitRLLearner(Star):
             "transitions": transitions,
             "call_ids": call_ids,
             "umo": event.unified_msg_origin,
+            "robot_id": self._robot_key_for_event(event),
+            "cache_scope": self._cache_scope(event),
             "final_text": final_text,
         }
         if self.cfg.learning.async_learn:
@@ -372,9 +647,11 @@ class JitRLLearner(Star):
         transitions: list[Any],
         call_ids: list[str],
         umo: str,
+        robot_id: str,
+        cache_scope: str,
         final_text: str,
     ) -> None:
-        runtime = await self._ensure_neural()
+        runtime = await self._ensure_neural(robot_id=robot_id)
         preceding: set[str] = set()
         executions = []
         for index, (transition, call_id) in enumerate(
@@ -444,7 +721,7 @@ class JitRLLearner(Star):
         self._stats["episodes"] += int(settled > 0)
         self._stats["experiences"] += settled
         if settled:
-            self._neural_last_episode[umo] = (
+            self._neural_last_episode[cache_scope] = (
                 run.episode_id,
                 time.time(),
                 self.cfg.learning.gamma,
@@ -452,19 +729,23 @@ class JitRLLearner(Star):
             )
             if len(self._neural_last_episode) > 512:
                 self._neural_last_episode.pop(next(iter(self._neural_last_episode)))
-        if self.cfg.neural.auto_train and settled and umo not in self._neural_training:
+        if (
+            self.cfg.neural.auto_train
+            and settled
+            and cache_scope not in self._neural_training
+        ):
             stats = await asyncio.to_thread(runtime.store.stats, umo)
             if (
                 stats["executions"] >= self.cfg.neural.min_samples
                 and stats["executions"] % self.cfg.neural.train_every < settled
             ):
-                self._neural_training.add(umo)
+                self._neural_training.add(cache_scope)
 
                 async def consolidate() -> None:
                     try:
                         await runtime.train(umo)
                     finally:
-                        self._neural_training.discard(umo)
+                        self._neural_training.discard(cache_scope)
 
                 self._spawn(consolidate())
 
@@ -696,7 +977,7 @@ class JitRLLearner(Star):
     # decision pipeline
     # ------------------------------------------------------------------
     def _state_for(
-        self, umo: str, user_text: str, surface: str
+        self, robot_key: str, umo: str, user_text: str, surface: str
     ) -> tuple[str, StateView]:
         """Return the redacted task and its abstracted state, memoised.
 
@@ -705,6 +986,7 @@ class JitRLLearner(Star):
         pipeline only has to run once per turn.
 
         Args:
+            robot_key: Robot instance ID, part of the cache key.
             umo: Unified message origin, part of the cache key.
             user_text: Raw user message.
             surface: Coarse retrieval partition.
@@ -712,7 +994,7 @@ class JitRLLearner(Star):
         Returns:
             A (task, state) pair: the redacted request and its retrieval state.
         """
-        key = (umo, surface, user_text)
+        key = (robot_key, umo, surface, user_text)
         cached = self._state_cache.get(key)
         if cached is not None:
             self._state_cache.move_to_end(key)
@@ -866,11 +1148,11 @@ class JitRLLearner(Star):
         )
         return cleaned
 
-    async def _maybe_apply_feedback(self, umo: str, user_text: str) -> None:
+    async def _maybe_apply_feedback(self, cache_scope: str, user_text: str) -> None:
         """Fold an explicit user verdict into the previous episode.
 
         Args:
-            umo: Unified message origin of the current request.
+            cache_scope: Robot-and-session key of the current request.
             user_text: Raw text of the current user message.
         """
         cfg = self.cfg.feedback
@@ -881,12 +1163,12 @@ class JitRLLearner(Star):
             if self.cfg.neural.mode != "off"
             else self._last_episode
         )
-        cached = cache.get(umo)
+        cached = cache.get(cache_scope)
         if not cached:
             return
         episode_id, created_at = cached[:2]
         if time.time() - created_at > cfg.window_seconds:
-            cache.pop(umo, None)
+            cache.pop(cache_scope, None)
             return
         normalised = self._normalise_feedback(user_text)
         if not normalised:
@@ -905,15 +1187,15 @@ class JitRLLearner(Star):
         if delta == 0.0:
             return
         if self.cfg.neural.mode != "off":
-            await self._apply_neural_feedback(umo, delta)
+            await self._apply_neural_feedback(cache_scope, delta)
             return
         if self._bank is None:
             return
         updated = await self._bank.apply_user_feedback(
             episode_id, delta, expected_generation=self._bank.generation
         )
-        self._last_episode.pop(umo, None)
-        self._decision_cache.clear()
+        self._last_episode.pop(cache_scope, None)
+        self._invalidate_decisions()
         logger.info(
             "[JitRL] user feedback applied: episode=%s delta=%+.1f rows=%d",
             episode_id,
@@ -921,16 +1203,17 @@ class JitRLLearner(Star):
             updated,
         )
 
-    async def _apply_neural_feedback(self, umo: str, delta: float) -> int:
-        cached = self._neural_last_episode.pop(umo, None)
+    async def _apply_neural_feedback(self, cache_scope: str, delta: float) -> int:
+        cached = self._neural_last_episode.pop(cache_scope, None)
         if not cached:
             return 0
-        runtime = await self._ensure_neural()
+        robot_id, _, scope = cache_scope.partition(":")
+        runtime = await self._ensure_neural(robot_id=robot_id)
         episode_id, created_at, gamma, epoch = cached
         if time.time() - created_at > self.cfg.feedback.window_seconds:
             return 0
         return await runtime.apply_user_feedback(
-            scope=umo,
+            scope=scope,
             episode_id=episode_id,
             delta=delta,
             gamma=gamma,
@@ -970,19 +1253,20 @@ class JitRLLearner(Star):
         if event.get_extra(_INJECTED_KEY):
             return
         try:
-            await self._ensure_ready()
+            await self._ensure_ready(event)
         except Exception:
             self._stats["failures"] += 1
             logger.warning("[JitRL] memory bank unavailable", exc_info=True)
             return
 
         umo = event.unified_msg_origin
+        cache_scope = self._cache_scope(event)
         generation = self._bank.generation
         event.set_extra(_GENERATION_KEY, generation)
         user_text = (event.get_message_str() or req.prompt or "").strip()
 
         try:
-            await self._maybe_apply_feedback(umo, user_text)
+            await self._maybe_apply_feedback(cache_scope, user_text)
         except Exception:
             logger.warning("[JitRL] feedback application failed", exc_info=True)
 
@@ -991,10 +1275,11 @@ class JitRLLearner(Star):
 
         try:
             surface = self._surface(event)
-            task, state = self._state_for(umo, user_text, surface)
+            robot_id = self._robot_key_for_event(event)
+            task, state = self._state_for(robot_id, umo, user_text, surface)
             tool_names = set(req.func_tool.names()) if req.func_tool else set()
             cache_key = (
-                umo,
+                cache_scope,
                 generation,
                 self.cfg.apply_mode,
                 tuple(sorted(tool_names)),
@@ -1032,7 +1317,7 @@ class JitRLLearner(Star):
                 self._apply_tool_gate(req, snapshot.probe)
 
             decision = snapshot.decision
-            self._last_decision[umo] = (time.time(), decision)
+            self._last_decision[cache_scope] = (time.time(), decision)
             if len(self._last_decision) > 512:
                 cutoff = time.time() - _LAST_EPISODE_TTL
                 self._last_decision = {
@@ -1090,7 +1375,7 @@ class JitRLLearner(Star):
                 logger.warning("[JitRL Lens] capture failed", exc_info=True)
             return
         try:
-            await self._ensure_ready()
+            await self._ensure_ready(event)
         except Exception:
             self._stats["failures"] += 1
             logger.warning("[JitRL] memory bank unavailable", exc_info=True)
@@ -1113,6 +1398,8 @@ class JitRLLearner(Star):
             generation = event.get_extra(_GENERATION_KEY)
             payload = {
                 "umo": umo,
+                "robot_id": self._robot_key_for_event(event),
+                "cache_scope": self._cache_scope(event),
                 "user_text": user_text,
                 "surface": surface,
                 "transitions": transitions,
@@ -1138,6 +1425,8 @@ class JitRLLearner(Star):
         transitions: list[Any],
         reply_text: str,
         generation: int | None = None,
+        cache_scope: str = "",
+        robot_id: str = "",
     ) -> None:
         """Score a trajectory, build an episode and persist it.
 
@@ -1149,6 +1438,8 @@ class JitRLLearner(Star):
             reply_text: Final assistant reply, used for success detection.
             generation: Memory epoch in which the request started.
         """
+        if robot_id:
+            await self._ensure_ready(robot_id=robot_id)
         if self._bank is None:
             return
         if generation is None:
@@ -1210,12 +1501,13 @@ class JitRLLearner(Star):
         written = await self._bank.add_episode(episode, expected_generation=generation)
         if not written or generation != self._bank.generation:
             return
+        cache_scope = cache_scope or f"{self._active_robot_key.get()}:{umo}"
         self._stats["episodes"] += 1
         self._stats["experiences"] += written
         # Fresh evidence invalidates every cached decision (the state cache is a
         # pure function of the message, so it stays).
-        self._decision_cache.clear()
-        self._last_episode[umo] = (episode.episode_id, time.time())
+        self._invalidate_decisions()
+        self._last_episode[cache_scope or umo] = (episode.episode_id, time.time())
         if len(self._last_episode) > 512:
             cutoff = time.time() - _LAST_EPISODE_TTL
             self._last_episode = {
@@ -1251,7 +1543,7 @@ class JitRLLearner(Star):
         if self.cfg.neural.mode != "off":
             return "Neural Lens uses private decision snapshots; legacy recall is disabled in neural mode."
         try:
-            await self._ensure_ready()
+            await self._ensure_ready(event)
             umo = event.unified_msg_origin
             state = abstract_state(
                 task=redact(query or event.get_message_str() or "")[:_TASK_CHAR_LIMIT],
@@ -1316,12 +1608,12 @@ class JitRLLearner(Star):
             yield event.plain_result(denied)
             return
         try:
-            await self._ensure_ready()
+            await self._ensure_ready(event)
             umo = event.unified_msg_origin
             total = await self._bank.count()
             scoped = await self._bank.count(umo)
             stats = self._stats
-            cached = self._last_decision.get(umo)
+            cached = self._last_decision.get(self._cache_scope(event))
             lines = [
                 "JitRL 持续学习状态",
                 f"· 开关：{('开' if self.cfg.enabled else '关')} / 应用模式：{self.cfg.apply_mode}",
@@ -1369,8 +1661,9 @@ class JitRLLearner(Star):
             )
             return
         try:
-            runtime = await self._ensure_neural()
+            runtime = await self._ensure_neural(event)
             scope = event.unified_msg_origin
+            cache_scope = self._cache_scope(event)
             if action == "train":
                 result = await runtime.train(scope)
                 if result["status"] == "trained":
@@ -1381,7 +1674,7 @@ class JitRLLearner(Star):
                     yield event.plain_result(f"本地训练未发布模型：{result}")
             elif action == "reset":
                 await runtime.reset(scope)
-                self._neural_last_episode.pop(scope, None)
+                self._neural_last_episode.pop(cache_scope, None)
                 yield event.plain_result(
                     "已重置当前会话的神经经验和权重；旧后台写入已失效。V0.1 经验库独立保留。"
                 )
@@ -1411,7 +1704,7 @@ class JitRLLearner(Star):
             yield event.plain_result(denied)
             return
         try:
-            await self._ensure_ready()
+            await self._ensure_ready(event)
             limit = max(1, min(limit, 50))
             rows = await self._bank.action_stats(limit=limit, min_count=1)
             if not rows:
@@ -1441,7 +1734,7 @@ class JitRLLearner(Star):
             yield event.plain_result(denied)
             return
         try:
-            await self._ensure_ready()
+            await self._ensure_ready(event)
             buckets = max(2, min(buckets, 30))
             rows = await self._bank.learning_curve(buckets=buckets)
             if not rows:
@@ -1492,7 +1785,7 @@ class JitRLLearner(Star):
             yield event.plain_result(denied)
             return
         try:
-            await self._ensure_ready()
+            await self._ensure_ready(event)
             scope = scope.strip().lower()
             if scope not in {"all", "session"}:
                 yield event.plain_result(
@@ -1526,20 +1819,22 @@ class JitRLLearner(Star):
             yield event.plain_result(denied)
             return
         try:
-            umo = event.unified_msg_origin
             if self.cfg.neural.mode != "off":
+                cache_scope = self._cache_scope(event)
+                await self._ensure_neural(event)
                 delta = (
                     -_FEEDBACK_DELTA
                     if verdict.strip().lower() == "bad"
                     else _FEEDBACK_DELTA
                 )
-                updated = await self._apply_neural_feedback(umo, delta)
+                updated = await self._apply_neural_feedback(cache_scope, delta)
                 yield event.plain_result(
                     f"已回填 {delta:+.1f} 用户反馈到上一轮神经经验的 {updated} 个步骤（追加结算，保留原始记录）。"
                 )
                 return
-            await self._ensure_ready()
-            cached = self._last_episode.get(umo)
+            await self._ensure_ready(event)
+            cache_scope = self._cache_scope(event)
+            cached = self._last_episode.get(cache_scope)
             if not cached:
                 yield event.plain_result("没有可回填的上一轮经验。")
                 return
@@ -1551,7 +1846,7 @@ class JitRLLearner(Star):
             updated = await self._bank.apply_user_feedback(
                 cached[0], delta, expected_generation=self._bank.generation
             )
-            self._last_episode.pop(umo, None)
+            self._last_episode.pop(cache_scope, None)
             yield event.plain_result(
                 f"已回填 {delta:+.1f} 奖励到上一轮经验的 {updated} 个步骤。"
             )
@@ -1567,7 +1862,7 @@ class JitRLLearner(Star):
             yield event.plain_result(denied)
             return
         try:
-            await self._ensure_ready()
+            await self._ensure_ready(event)
             payload = await self._bank.export_json()
             target = await asyncio.to_thread(
                 self._write_export, payload, f"export-{int(time.time())}.json"
@@ -1593,7 +1888,7 @@ class JitRLLearner(Star):
             yield event.plain_result(denied)
             return
         try:
-            await self._ensure_ready()
+            await self._ensure_ready(event)
             limit = max(1, min(limit, 20))
             rows = await self._bank.recent_episodes(limit=limit)
             if not rows:
@@ -1652,11 +1947,38 @@ class JitRLLearner(Star):
     # checkpoints
     # ------------------------------------------------------------------
     def _invalidate_memory_cache(self) -> None:
-        self._last_episode.clear()
-        self._last_decision.clear()
+        robot_key = self._active_robot_key.get()
+        if robot_key is None:
+            self._last_episode.clear()
+            self._last_decision.clear()
+            self._invalidate_decisions()
+            return
+        prefix = f"{robot_key}:"
+        self._last_episode = {
+            key: value
+            for key, value in self._last_episode.items()
+            if not key.startswith(prefix)
+        }
+        self._last_decision = {
+            key: value
+            for key, value in self._last_decision.items()
+            if not key.startswith(prefix)
+        }
         # Decisions embed advantage estimates and the rendered block, so they
         # must never outlive the memory they were computed from.
-        self._decision_cache.clear()
+        self._invalidate_decisions()
+
+    def _invalidate_decisions(self) -> None:
+        robot_key = self._active_robot_key.get()
+        if robot_key is None:
+            self._decision_cache.clear()
+            return
+        prefix = f"{robot_key}:"
+        self._decision_cache = OrderedDict(
+            (key, value)
+            for key, value in self._decision_cache.items()
+            if not str(key[0]).startswith(prefix)
+        )
 
     def _checkpoint_denied(self, event: AstrMessageEvent) -> str | None:
         denied = self._command_denied(event)
@@ -1673,7 +1995,7 @@ class JitRLLearner(Star):
             yield event.plain_result(denied)
             return
         try:
-            await self._ensure_ready()
+            await self._ensure_ready(event)
             info = await self._bank.create_checkpoint(name)
             yield event.plain_result(
                 f"已创建检查点：{info['id']}\n"
@@ -1693,7 +2015,7 @@ class JitRLLearner(Star):
             yield event.plain_result(denied)
             return
         try:
-            await self._ensure_ready()
+            await self._ensure_ready(event)
             rows = await self._bank.list_checkpoints()
             lines = ["JitRL 检查点（从新到旧；回退前会自动备份当前数据）"]
             for row in rows[: max(1, min(limit, 50))]:
@@ -1734,7 +2056,7 @@ class JitRLLearner(Star):
             )
             return
         try:
-            await self._ensure_ready()
+            await self._ensure_ready(event)
             result = await self._bank.restore_checkpoint(
                 checkpoint_id,
                 scope=None if scope == "all" else event.unified_msg_origin,
@@ -1768,7 +2090,7 @@ class JitRLLearner(Star):
             )
             return
         try:
-            await self._ensure_ready()
+            await self._ensure_ready(event)
             await self._bank.delete_checkpoint(checkpoint_id)
             yield event.plain_result("已删除指定检查点，当前记忆不受影响。")
         except (ValueError, FileNotFoundError) as exc:
@@ -1787,6 +2109,7 @@ class JitRLLearner(Star):
         web APIs must still load the plugin, so failures are only logged.
         """
         routes = (
+            ("/astrbot_plugin_jitrl/robots", self._web_robots, ["GET"], "robots"),
             ("/astrbot_plugin_jitrl/overview", self._web_overview, ["GET"], "overview"),
             ("/astrbot_plugin_jitrl/curve", self._web_curve, ["GET"], "curve"),
             ("/astrbot_plugin_jitrl/actions", self._web_actions, ["GET"], "actions"),
@@ -1828,6 +2151,27 @@ class JitRLLearner(Star):
             except Exception:
                 logger.warning("[JitRL] cannot register %s", route, exc_info=True)
 
+    async def _web_robots(self) -> Any:
+        from astrbot.api.web import json_response
+
+        return json_response({"robots": self._known_robots()})
+
+    def _select_web_robot(self, requested: str | None) -> str | None:
+        robots = self._known_robots()
+        if not robots:
+            return None
+        if requested:
+            if any(robot["id"] == requested for robot in robots):
+                return requested
+            raise ValueError("机器人实例不存在，请刷新面板后重试。")
+        if len(robots) == 1:
+            return robots[0]["id"]
+        raise ValueError("请选择要查看或管理的机器人实例。")
+
+    async def _ensure_web_bank(self, requested: str | None) -> MemoryBank | None:
+        robot_id = self._select_web_robot(requested)
+        return await self._ensure_ready(robot_id=robot_id) if robot_id else None
+
     async def _web_overview(self) -> Any:
         """Return the dashboard overview payload.
 
@@ -1835,16 +2179,39 @@ class JitRLLearner(Star):
             A JSON response with counters, hyperparameters and the last
             decision taken by this process.
         """
-        from astrbot.api.web import error_response, json_response
+        from astrbot.api.web import error_response, json_response, request
 
         try:
-            await self._ensure_ready()
-            total = await self._bank.count()
+            robot_id = self._select_web_robot(request.query.get("robot"))
+            bank = await self._ensure_ready(robot_id=robot_id) if robot_id else None
+            total = await bank.count() if bank else 0
+            runtime = self._neural_by_robot.get(robot_id) if robot_id else None
+            if runtime is not None:
+                neural_status = await runtime.status()
+            elif self.cfg.neural.mode == "off":
+                neural_status = {"mode": "off"}
+            else:
+                neural_status = {
+                    "mode": self.cfg.neural.mode,
+                    "attention_backend": self.cfg.neural.attention_backend,
+                    "device": self.cfg.neural.device,
+                    "mita_execution": self.cfg.neural.mita_execution,
+                    "mita_layers": 0
+                    if self.cfg.neural.attention_backend in {"legacy", "gqa"}
+                    else self.cfg.neural.blocks
+                    - int(self.cfg.neural.attention_backend == "hybrid"),
+                    "attention_layers": 1
+                    if self.cfg.neural.attention_backend == "legacy"
+                    else self.cfg.neural.blocks,
+                }
             last = None
-            if self._last_decision:
-                _, decision = max(
-                    self._last_decision.values(), key=lambda item: item[0]
-                )
+            decisions = [
+                item
+                for key, item in self._last_decision.items()
+                if robot_id and key.startswith(f"{robot_id}:")
+            ]
+            if decisions:
+                _, decision = max(decisions, key=lambda item: item[0])
                 last = {
                     "reason": decision.reason,
                     "chosen": decision.chosen.text if decision.chosen else "",
@@ -1856,26 +2223,12 @@ class JitRLLearner(Star):
             return json_response(
                 {
                     "enabled": self.cfg.enabled,
-                    "neural": await self._neural.status()
-                    if self._neural is not None
-                    else {"mode": "off"}
-                    if self.cfg.neural.mode == "off"
-                    else {
-                        "mode": self.cfg.neural.mode,
-                        "attention_backend": self.cfg.neural.attention_backend,
-                        "device": self.cfg.neural.device,
-                        "mita_execution": self.cfg.neural.mita_execution,
-                        "mita_layers": 0
-                        if self.cfg.neural.attention_backend in {"legacy", "gqa"}
-                        else self.cfg.neural.blocks
-                        - int(self.cfg.neural.attention_backend == "hybrid"),
-                        "attention_layers": 1
-                        if self.cfg.neural.attention_backend == "legacy"
-                        else self.cfg.neural.blocks,
-                    },
+                    "neural": neural_status,
                     "apply_mode": self.cfg.apply_mode,
                     "total": total,
                     "stats": dict(self._stats),
+                    "robot_id": robot_id or "",
+                    "robots": self._known_robots(),
                     "hyper": {
                         "k": self.cfg.retrieval.k,
                         "threshold": self.cfg.retrieval.similarity_threshold,
@@ -1889,9 +2242,11 @@ class JitRLLearner(Star):
                         "exploration": self.cfg.policy.exploration_estimate,
                     },
                     "last_decision": last,
-                    "db_path": str(self._db_path),
+                    "db_path": str(self._db_path) if bank else "",
                 }
             )
+        except ValueError as exc:
+            return error_response(str(exc))
         except Exception:
             logger.warning("[JitRL] overview endpoint failed", exc_info=True)
             return error_response("JitRL overview unavailable", status_code=500)
@@ -1905,12 +2260,16 @@ class JitRLLearner(Star):
         from astrbot.api.web import error_response, json_response, request
 
         try:
-            await self._ensure_ready()
+            bank = await self._ensure_web_bank(request.query.get("robot"))
             buckets = request.query.get("buckets", 12, type=int)
-            rows = await self._bank.learning_curve(
-                buckets=max(2, min(int(buckets), 60))
+            rows = (
+                await bank.learning_curve(buckets=max(2, min(int(buckets), 60)))
+                if bank
+                else []
             )
             return json_response({"buckets": rows})
+        except ValueError as exc:
+            return error_response(str(exc))
         except Exception:
             logger.warning("[JitRL] curve endpoint failed", exc_info=True)
             return error_response("JitRL curve unavailable", status_code=500)
@@ -1924,10 +2283,16 @@ class JitRLLearner(Star):
         from astrbot.api.web import error_response, json_response, request
 
         try:
-            await self._ensure_ready()
+            bank = await self._ensure_web_bank(request.query.get("robot"))
             limit = request.query.get("limit", 20, type=int)
-            rows = await self._bank.action_stats(limit=max(1, min(int(limit), 200)))
+            rows = (
+                await bank.action_stats(limit=max(1, min(int(limit), 200)))
+                if bank
+                else []
+            )
             return json_response({"actions": rows})
+        except ValueError as exc:
+            return error_response(str(exc))
         except Exception:
             logger.warning("[JitRL] actions endpoint failed", exc_info=True)
             return error_response("JitRL actions unavailable", status_code=500)
@@ -1941,27 +2306,35 @@ class JitRLLearner(Star):
         from astrbot.api.web import error_response, json_response, request
 
         try:
-            await self._ensure_ready()
+            bank = await self._ensure_web_bank(request.query.get("robot"))
             limit = request.query.get("limit", 10, type=int)
-            rows = await self._bank.recent_episodes(limit=max(1, min(int(limit), 100)))
+            rows = (
+                await bank.recent_episodes(limit=max(1, min(int(limit), 100)))
+                if bank
+                else []
+            )
             return json_response({"episodes": rows})
+        except ValueError as exc:
+            return error_response(str(exc))
         except Exception:
             logger.warning("[JitRL] episodes endpoint failed", exc_info=True)
             return error_response("JitRL episodes unavailable", status_code=500)
 
     async def _web_checkpoints(self) -> Any:
         """Return snapshot inventory and rotation settings for the dashboard."""
-        from astrbot.api.web import error_response, json_response
+        from astrbot.api.web import error_response, json_response, request
 
         try:
-            await self._ensure_ready()
+            bank = await self._ensure_web_bank(request.query.get("robot"))
             return json_response(
                 {
-                    "checkpoints": await self._bank.list_checkpoints(),
+                    "checkpoints": await bank.list_checkpoints() if bank else [],
                     "interval": self.cfg.memory.checkpoint_interval,
                     "keep": self.cfg.memory.keep_checkpoints,
                 }
             )
+        except ValueError as exc:
+            return error_response(str(exc))
         except Exception:
             logger.warning("[JitRL] checkpoints endpoint failed", exc_info=True)
             return error_response("读取检查点失败。", status_code=500)
@@ -1994,23 +2367,25 @@ class JitRLLearner(Star):
                     or not payload["umo"].strip()
                 ):
                     return error_response("会话回退必须提供非空的 umo。")
-            await self._ensure_ready()
+            bank = await self._ensure_web_bank(payload.get("robot"))
+            if bank is None:
+                return error_response("当前没有机器人实例可管理。")
             if action == "create":
                 return json_response(
                     {
-                        "checkpoint": await self._bank.create_checkpoint(
+                        "checkpoint": await bank.create_checkpoint(
                             payload.get("name", "")
                         )
                     }
                 )
             checkpoint_id = payload.get("id", "")
             if action == "restore":
-                result = await self._bank.restore_checkpoint(
+                result = await bank.restore_checkpoint(
                     checkpoint_id, scope=None if scope == "all" else payload["umo"]
                 )
                 self._invalidate_memory_cache()
                 return json_response(result)
-            await self._bank.delete_checkpoint(checkpoint_id)
+            await bank.delete_checkpoint(checkpoint_id)
             return json_response({"deleted": checkpoint_id})
         except FileNotFoundError as exc:
             return error_response(str(exc), status_code=404)
@@ -2031,7 +2406,6 @@ class JitRLLearner(Star):
         from astrbot.api.web import error_response, json_response, request
 
         try:
-            await self._ensure_ready()
             payload = await request.json(default={})
             if not isinstance(payload, dict):
                 return error_response("请求体必须是 JSON 对象。")
@@ -2039,15 +2413,20 @@ class JitRLLearner(Star):
                 # Same rule as the checkpoint routes: a destructive call must
                 # carry an explicit confirmation, never rely on the UI alone.
                 return error_response("清空记忆需要 confirm: true。")
+            bank = await self._ensure_web_bank(payload.get("robot"))
+            if bank is None:
+                return error_response("当前没有机器人实例可管理。")
             scope = str(payload.get("scope", "all")).strip().lower()
             if scope == "all":
-                removed = await self._bank.clear()
+                removed = await bank.clear()
             elif scope == "session" and payload.get("umo"):
-                removed = await self._bank.forget(scope=str(payload["umo"]))
+                removed = await bank.forget(scope=str(payload["umo"]))
             else:
                 return error_response("scope must be all, or session with umo")
             self._invalidate_memory_cache()
             return json_response({"removed": removed})
+        except ValueError as exc:
+            return error_response(str(exc))
         except Exception:
             logger.warning("[JitRL] forget endpoint failed", exc_info=True)
             return error_response("JitRL forget failed", status_code=500)
@@ -2060,11 +2439,13 @@ class JitRLLearner(Star):
         """
         import json
 
-        from astrbot.api.web import error_response, file_response
+        from astrbot.api.web import error_response, file_response, request
 
         try:
-            await self._ensure_ready()
-            payload = await self._bank.export_json()
+            bank = await self._ensure_web_bank(request.query.get("robot"))
+            if bank is None:
+                return error_response("当前没有机器人实例可导出。")
+            payload = await bank.export_json()
             target = self._db_path.parent / "jitrl-export.json"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(
@@ -2075,6 +2456,8 @@ class JitRLLearner(Star):
                 filename="jitrl-export.json",
                 content_type="application/json",
             )
+        except ValueError as exc:
+            return error_response(str(exc))
         except Exception:
             logger.warning("[JitRL] export endpoint failed", exc_info=True)
             return error_response("JitRL export failed", status_code=500)

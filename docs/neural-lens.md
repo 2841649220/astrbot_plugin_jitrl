@@ -1,6 +1,6 @@
-# V0.2.0 Neural Lens 使用与 API 兼容约定
+# V0.2.1 Neural Lens 使用与 API 兼容约定
 
-本分支在 V0.1.2 上增量搭建，分支为 `v0.2.0-neural-lens`。原来的插件名、`JitRLLearner` 入口、AstrBot 版本范围、两个事件钩子、`jitrl_recall` 工具、配置键和 Web 路由均保留。`neural.mode` 默认 `off`，旧配置无需修改，也不要求安装 PyTorch；其行为继续由 V0.1 的 `apply_mode`、`learning`、`retrieval`、`policy` 等控制。
+本分支以 V0.1.2 为神经扩展起点，分支名为 `v0.2.0-neural-lens`；V0.2.1 加入按机器人实例隔离。原来的插件名、`JitRLLearner` 入口、AstrBot 版本范围、两个事件钩子、`jitrl_recall` 工具、配置键和 Web 路由均保留。`neural.mode` 默认 `off`，旧配置无需修改，也不要求安装 PyTorch；其行为继续由 V0.1 的 `apply_mode`、`learning`、`retrieval`、`policy` 等控制。
 
 新增部分是研究性本地神经控制器，远端 LLM 始终冻结。这里的梯度更新只发生在本地 Neural Lens。论文依据、公式及效果边界见 [研究说明](neural-lens-research.md)。本版本没有真实任务提升的实验结论。
 
@@ -119,16 +119,18 @@ POST 使用 PRE 固定的快照与 checkpoint，不会静默切换到刚训练�
 
 ## 4. 采集、结算、删除与恢复
 
-运行时目录：`<AstrBot 插件数据目录>/astrbot_plugin_jitrl/neural/`。
+运行时目录：`<AstrBot 插件数据目录>/astrbot_plugin_jitrl/robots/<robot-hash>/`。`robot-hash` 是平台实例 ID 与机器人 `self_id` 的稳定 SHA-256 键；V0.1 与 Neural Lens 都在这个机器人目录内独立保存。
 
 | 对象 | 保存位置与语义 |
 |---|---|
-| V0.1 经验与检查点 | 原 `memory.sqlite3` 与原检查点目录，结构不变 |
-| 神经决策与事实 | `neural/neural.sqlite3`：独立 decisions、executions、settlements 和 checkpoint 元数据 |
-| 模型权重 | `neural/checkpoints/<scope-hash>/lens-*.pt`；原子写入、SHA-256、scope 与版本校验，`weights_only=True` 加载 |
+| V0.1 经验与检查点 | `robots/<robot-hash>/memory.sqlite3` 与该机器人目录下的 `checkpoints/` |
+| 神经决策与事实 | `robots/<robot-hash>/neural/neural.sqlite3`：独立 decisions、executions、settlements 和 checkpoint 元数据 |
+| 模型权重 | `robots/<robot-hash>/neural/checkpoints/<scope-hash>/lens-*.pt`；原子写入、SHA-256、scope 与版本校验，`weights_only=True` 加载 |
 | 原始输入 | 不保存完整网页、工具输出或密钥；只保存经过现有脱敏的有界目标/观测及结构事件 |
 
-一个会话的模型不使用其他会话私有经验。神经路径忽略 V0.1 的 global/hybrid 检索设置，不自动导入原数据库。状态与记忆同时绑定 environment、normalizer、embedding、hash、renderer 与模型结构版本。
+不同机器人实例使用不同目录、SQLite 连接、神经运行时、模型权重、统计计数、反馈缓存及决策缓存；同一实例内仍按 AstrBot 会话 scope 隔离神经经验。神经路径忽略 V0.1 的 global/hybrid 检索设置，不会跨机器人读取经验。状态与记忆同时绑定 environment、normalizer、embedding、hash、renderer 与模型结构版本。
+
+升级到机器人隔离实现时，原共享 `memory.sqlite3`、检查点目录和导出文件会在首个机器人实例打开 JitRL 时迁移到该实例目录；原共享 `neural/` 会在首个神经运行时初始化时迁移到该实例目录。迁移后，其他机器人实例从空库开始。插件不会复制旧共享数据到所有机器人。目标目录已有同名数据时，冲突源会留在原共享路径并记录日志，迁移标记会阻止后续机器人接管这些旧文件。
 
 请求时保存当时可见的完整检索快照；完成后从当前轮轨迹中只采集有匹配 tool result 的工具调用和实际最终回复。宿主的完成钩子决定了 PENDING 执行事实的落库时点；当前没有即时执行拦截器，不承诺在远端工具执行瞬间持久化。LLM/heuristic/fused 的回报保留来源及较低可靠性权重，不能当成环境真值。评估器关闭或失败而没有可用标签时，事实保持 PENDING。
 

@@ -1,15 +1,15 @@
 # JitRL 持续学习 · astrbot_plugin_jitrl
 
 [![CI](https://github.com/2841649220/astrbot_plugin_jitrl/actions/workflows/ci.yml/badge.svg)](https://github.com/2841649220/astrbot_plugin_jitrl/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.2.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.2.1-blue)](CHANGELOG.md)
 
-> 在 V0.1.2 经验学习基础上，增加可选的本地 Neural Lens。远端大模型始终冻结；神经扩展默认关闭，旧配置与旧 API 保持兼容。
+> V0.2.1 在 V0.1.3 经验学习基础上加入按机器人实例隔离的独立学习，并延续可选本地 Neural Lens。远端大模型始终冻结；神经扩展默认关闭，旧配置与旧 API 保持兼容。
 >
 > V0.1 路径无需训练；V0.2 神经路径使用可选 PyTorch 训练会话隔离的小模型。当前默认四层 token 注意力全部使用真正的 MiTA 压缩与路由机制，结合 JitRL 经验回报和 Engram 条件模式记忆。
 
-## V0.2.0 快速入口
+## V0.2.1 快速入口
 
-实验性开发分支：`v0.2.0-neural-lens`，基于 V0.1.2；没有合入 V0.1 分支。现有插件入口、配置键、指令、经验库、检查点及面板路由继续保留。`neural.mode: off` 为默认值，使用原来的行为，无需安装额外依赖。
+当前发布版本：`0.2.1`；实验性开发分支：`v0.2.0-neural-lens`。V0.2.1 按 AstrBot 平台实例 ID 与机器人 `self_id` 隔离 V0.1 经验库和 Neural Lens；V0.2 神经路径仍以 V0.1.3 兼容路径为基础，没有合入 V0.1 分支。现有插件入口、配置键、指令、经验库、检查点及面板路由继续保留。`neural.mode: off` 为默认值，无需安装额外依赖。
 
 - [神经架构的研究依据与论文边界](docs/neural-lens-research.md)
 - [MiTA 主干：公式落地、4/4 层替换与研究实验](docs/mita-backbone-research.md)
@@ -167,7 +167,7 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 
 **零第三方依赖**：只用 Python 标准库（`sqlite3` / `json` / `re` / `asyncio` / `math`），不需要 `pip install` 任何东西。
 
-数据库位置：`data/plugin_data/astrbot_plugin_jitrl/memory.sqlite3`。
+数据按机器人实例隔离，目录为 `data/plugin_data/astrbot_plugin_jitrl/robots/<robot-hash>/`；其中分别保存 V0.1 记忆库、检查点、导出文件和 Neural Lens 数据。实例键由 AstrBot 平台实例 ID 与机器人 `self_id` 计算。升级时，旧共享 `memory.sqlite3`、检查点和导出会迁移给第一个触发插件的机器人实例，其他机器人从独立空库开始。若目标实例已有同名数据，旧文件会留在原路径并记录日志，避免覆盖现有数据或让后续机器人误领。
 
 ---
 
@@ -258,7 +258,7 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 
 ### WebUI 面板
 
-插件自带一个可视化面板（`views/dashboard/`），在 WebUI「插件」页打开插件卡片即可进入。它通过 `context.register_web_api()` 注册的 10 个接口读写数据：
+插件自带一个可视化面板（`views/dashboard/`），在 WebUI「插件」页打开插件卡片即可进入。它通过 `context.register_web_api()` 注册的 11 个接口读写数据，并提供机器人实例选择器；每次读取、导出、检查点操作、回退或清空都会绑定到所选实例：
 
 | 面板区域 | 内容 |
 | --- | --- |
@@ -270,7 +270,7 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 | 检查点 | 名称、类型、完整 ID、时间、经验数、文件大小，支持创建、回退全库、删除快照 |
 | 操作 | 刷新、导出 JSON、带备份的清空记忆；回退、删除和清空均使用页内两步确认 |
 
-后端路由（`GET` 除注明外）：`/astrbot_plugin_jitrl/overview`、`/curve`、`/actions`、`/episodes`、`/export`，以及 `POST /forget`。
+后端路由（`GET` 除注明外）：`/astrbot_plugin_jitrl/robots`、`/overview`、`/curve`、`/actions`、`/episodes`、`/export`，以及 `POST /forget`。
 检查点路由同样使用 `/astrbot_plugin_jitrl` 前缀：`GET /checkpoints`、`POST /checkpoint`、
 `POST /rollback`、`POST /checkpoint_delete`。回退、删除检查点的请求必须提供 `confirm: true`。
 面板的回退操作针对全部会话；只回退当前会话请使用聊天指令。
@@ -440,7 +440,7 @@ astrbot_plugin_jitrl/
 
 ## 12. 版本
 
-当前版本 **0.2.0**（独立实验性神经分支；V0.1.2 仍是兼容基线，完整变更见
+当前版本 **0.2.1**（独立实验性神经分支；V0.1.3 仍是兼容基线，完整变更见
 [CHANGELOG.md](CHANGELOG.md)）。
 
 发布：`python scripts/build_release.py` 会校验四处版本号一致，再生成单根目录的

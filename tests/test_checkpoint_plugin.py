@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import logging
 import sys
 import uuid
@@ -18,6 +19,7 @@ import pytest
 import pytest_asyncio
 
 from jitrl.evaluator import RewardResult
+from jitrl.memory import MemoryBank
 from jitrl.state import abstract_state, normalize_action
 from jitrl.trajectory import (
     Transition,
@@ -44,11 +46,21 @@ MESSAGES = [
 
 
 class Event:
-    def __init__(self, *, admin=True, scope="s1", text="trusted task"):
+    def __init__(
+        self,
+        *,
+        admin=True,
+        scope="s1",
+        text="trusted task",
+        platform_id="platform-1",
+        self_id="bot-1",
+    ):
         self.unified_msg_origin = scope
         self.admin = admin
         self.text = text
         self.extra = {}
+        self.platform_id = platform_id
+        self.self_id = self_id
 
     def is_admin(self):
         return self.admin
@@ -58,6 +70,12 @@ class Event:
 
     def get_platform_name(self):
         return "test"
+
+    def get_platform_id(self):
+        return self.platform_id
+
+    def get_self_id(self):
+        return self.self_id
 
     def get_extra(self, key, default=None):
         return self.extra.get(key, default)
@@ -162,7 +180,7 @@ async def plugin(host):
     )
     plugin.routes = routes
     try:
-        await plugin._ensure_ready()
+        await plugin._ensure_ready(Event())
         yield plugin
     finally:
         await plugin.terminate()
@@ -176,11 +194,20 @@ async def web_call(host, plugin, method, payload):
     async def json_body(default=None):
         return payload
 
-    host.web.request = SimpleNamespace(json=json_body)
+    def query_get(key, default=None, type=None):
+        value = payload.get(key, default) if isinstance(payload, dict) else default
+        return type(value) if type and value is not None else value
+
+    host.web.request = SimpleNamespace(
+        json=json_body, query=SimpleNamespace(get=query_get)
+    )
     return await getattr(plugin, method)()
 
 
 async def learn(plugin, scope="s1"):
+    event = Event(scope=scope)
+    robot_id = plugin._robot_key_for_event(event)
+    await plugin._ensure_ready(event)
     await plugin._learn(
         umo=scope,
         user_text="trusted task",
@@ -189,6 +216,8 @@ async def learn(plugin, scope="s1"):
             messages=MESSAGES, user_text="trusted task", surface="test"
         ),
         reply_text="ok",
+        cache_scope=plugin._cache_scope(event),
+        robot_id=robot_id,
     )
 
 
@@ -286,6 +315,175 @@ async def test_web_checkpoint_restore_and_delete_flow(host, plugin):
         host, plugin, "_web_checkpoint_delete", {"id": saved["id"], "confirm": True}
     )
     assert response.payload["deleted"] == saved["id"]
+
+
+async def test_robot_instances_use_independent_banks_stats_and_feedback(plugin):
+    first = Event(platform_id="platform-a", self_id="bot-a")
+    second = Event(platform_id="platform-a", self_id="bot-b")
+    first_bank = await plugin._ensure_ready(first)
+    await _seed(first_bank, "trusted task", "search", 2.0)
+    first_key = plugin._robot_key_for_event(first)
+    first_scope = plugin._cache_scope(first)
+    plugin._stats["requests"] = 4
+    plugin._last_episode[first_scope] = ("first-episode", 1.0)
+
+    second_bank = await plugin._ensure_ready(second)
+    second_key = plugin._robot_key_for_event(second)
+    second_scope = plugin._cache_scope(second)
+    assert second_bank is not first_bank
+    assert plugin._bank_paths[second_key] != plugin._bank_paths[first_key]
+    assert await second_bank.count() == 0
+    assert await first_bank.count() == 1
+    assert plugin._stats["requests"] == 0
+    assert second_scope not in plugin._last_episode
+    plugin._stats["requests"] = 2
+    plugin._last_episode[second_scope] = ("second-episode", 1.0)
+
+    await plugin._ensure_ready(first)
+    assert plugin._stats["requests"] == 4
+    assert plugin._last_episode[first_scope][0] == "first-episode"
+    assert plugin._state_for(
+        first_key, "s1", "same task", "test"
+    ) is not plugin._state_for(second_key, "s1", "same task", "test")
+    assert first_scope != second_scope
+    assert await first_bank.count() == 1
+    assert await second_bank.count() == 0
+
+
+async def test_concurrent_robot_requests_keep_their_context_across_awaits(
+    plugin, monkeypatch
+):
+    first = Event(platform_id="platform-a", self_id="bot-a")
+    second = Event(platform_id="platform-a", self_id="bot-b")
+    await plugin._ensure_ready(first)
+    await plugin._ensure_ready(second)
+    paths = {
+        plugin._robot_key_for_event(event): plugin._bank_paths[
+            plugin._robot_key_for_event(event)
+        ]
+        for event in (first, second)
+    }
+    observed = []
+
+    async def interleaved_decide(**kwargs):
+        before = plugin._db_path
+        await asyncio.sleep(0)
+        after = plugin._db_path
+        observed.append((before, after))
+        return None
+
+    monkeypatch.setattr(plugin, "_decide", interleaved_decide)
+    first_request = SimpleNamespace(
+        prompt="first task", func_tool=None, extra_user_content_parts=[]
+    )
+    second_request = SimpleNamespace(
+        prompt="second task", func_tool=None, extra_user_content_parts=[]
+    )
+    await asyncio.gather(
+        plugin.on_llm_request(first, first_request),
+        plugin.on_llm_request(second, second_request),
+    )
+
+    expected = set(paths.values())
+    assert len(observed) == 2
+    assert all(before == after and before in expected for before, after in observed)
+    assert {before for before, _after in observed} == expected
+
+
+async def test_legacy_bank_and_checkpoints_move_to_first_robot(host, tmp_path):
+    data_root = (
+        Path(host.module.get_astrbot_plugin_data_path()) / "astrbot_plugin_jitrl"
+    )
+    legacy_path = data_root / "memory.sqlite3"
+    legacy = MemoryBank(legacy_path, checkpoint_dir=data_root / "checkpoints")
+    await legacy.initialize()
+    await _seed(legacy, "old trusted task", "search", 2.0)
+    saved = await legacy.create_checkpoint("legacy")
+    await legacy.close()
+
+    instance = host.module.JitRLLearner(
+        SimpleNamespace(register_web_api=lambda *args: None),
+        {"memory": {"checkpoint_interval": 0}},
+    )
+    try:
+        event = Event(self_id="first-after-upgrade")
+        bank = await instance._ensure_ready(event)
+        assert await bank.count() == 1
+        assert saved["id"] in {row["id"] for row in await bank.list_checkpoints()}
+        assert not legacy_path.exists()
+        assert instance._bank_paths[instance._robot_key_for_event(event)] == (
+            instance._robot_dir(instance._robot_key_for_event(event)) / "memory.sqlite3"
+        )
+    finally:
+        await instance.terminate()
+
+
+async def test_legacy_auxiliary_data_moves_when_robot_database_already_exists(plugin):
+    first_robot_dir = plugin._robot_dir("b" * 64)
+    first_robot_dir.mkdir(parents=True)
+    robot_db = first_robot_dir / "memory.sqlite3"
+    robot_db.write_bytes(b"existing robot database")
+    plugin._legacy_db_path.write_bytes(b"legacy shared database")
+    legacy_checkpoints = plugin._data_root / "checkpoints"
+    legacy_checkpoints.mkdir()
+    (legacy_checkpoints / "snapshot.json").write_text("snapshot", encoding="utf-8")
+    legacy_neural = plugin._data_root / "neural"
+    legacy_neural.mkdir()
+    (legacy_neural / "neural.sqlite3").write_bytes(b"neural")
+    legacy_export = plugin._data_root / "export-legacy.json"
+    legacy_export.write_text("{}", encoding="utf-8")
+
+    plugin._migrate_legacy_data(first_robot_dir, robot_db)
+
+    assert robot_db.read_bytes() == b"existing robot database"
+    assert plugin._legacy_db_path.read_bytes() == b"legacy shared database"
+    assert (first_robot_dir / "checkpoints" / "snapshot.json").read_text(
+        encoding="utf-8"
+    ) == "snapshot"
+    assert (first_robot_dir / "neural" / "neural.sqlite3").read_bytes() == b"neural"
+    assert (first_robot_dir / legacy_export.name).read_text(encoding="utf-8") == "{}"
+
+    second_robot_dir = plugin._robot_dir("c" * 64)
+    second_robot_dir.mkdir(parents=True)
+    plugin._migrate_legacy_data(second_robot_dir, second_robot_dir / "memory.sqlite3")
+    assert not (second_robot_dir / "memory.sqlite3").exists()
+    assert json.loads(
+        (plugin._data_root / ".legacy-migration.json").read_text(encoding="utf-8")
+    ) == {"robot_id": first_robot_dir.name}
+
+
+async def test_web_robot_selection_prevents_cross_instance_management(host, plugin):
+    first = Event(platform_id="platform-a", self_id="bot-a")
+    second = Event(platform_id="platform-a", self_id="bot-b")
+    first_bank = await plugin._ensure_ready(first)
+    second_bank = await plugin._ensure_ready(second)
+    await _seed(first_bank, "trusted task", "search", 1.0)
+    await _seed(second_bank, "trusted task", "inspect", 2.0)
+
+    robots = (await plugin._web_robots()).payload["robots"]
+    assert {row["id"] for row in robots} >= {
+        plugin._robot_key_for_event(first),
+        plugin._robot_key_for_event(second),
+    }
+    missing = await web_call(
+        host, plugin, "_web_forget", {"scope": "all", "confirm": True}
+    )
+    assert missing.status_code == 400
+    assert await first_bank.count() == await second_bank.count() == 1
+
+    selected_id = plugin._robot_key_for_event(first)
+    overview = await web_call(host, plugin, "_web_overview", {"robot": selected_id})
+    assert overview.payload["robot_id"] == selected_id
+    assert overview.payload["total"] == 1
+    forgotten = await web_call(
+        host,
+        plugin,
+        "_web_forget",
+        {"robot": selected_id, "scope": "all", "confirm": True},
+    )
+    assert forgotten.payload["removed"] == 1
+    assert await first_bank.count() == 0
+    assert await second_bank.count() == 1
 
 
 @pytest.mark.parametrize("confirm", [None, False, "true", 1])
@@ -407,7 +605,7 @@ async def test_rerank_in_flight_cannot_inject_old_policy_after_restore(
 
 
 async def test_experience_block_rides_on_the_user_message(plugin):
-    await plugin._ensure_ready()
+    await plugin._ensure_ready(Event())
     for tool, reward in (("web_search", 2.0), ("bad_tool", -2.0)):
         await _seed(plugin._bank, "trusted task", tool, reward)
     event = Event()

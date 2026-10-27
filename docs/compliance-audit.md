@@ -8,6 +8,14 @@
 
 **结论摘要**：仓库**没有发现明确的「违规」项**。`metadata.yaml` / `_conf_schema.json` / 目录布局 / 发布 ZIP / 视图桥接 / 认证入口基本全部符合官方规范，且 `tests/test_manifest.py` 已把大部分契约变成可执行断言。发现 **6 项「风险」**（其中 1 项直接影响市场可安装性：`astrbot_version` 下限）与 5 项可选增强，逐项见第 2 节。
 
+## V0.2.1 隔离功能与发布包复核（2026-10-27）
+
+本节补充本次机器人隔离实现的审核证据；上文的静态行号和仓库版本描述属于早期快照，若与此节冲突，以当前源码、`docs/runtime-compat.md` 和发布构建输出为准。
+
+- 机器人身份只使用 AstrBot `AstrMessageEvent.get_platform_id()` 与 `get_self_id()`；官方 v4.29.0 与当前 master 都实现这两个方法。前者区分同类型平台适配器实例，后者返回机器人自身 ID。详见 [v4.29.0 事件 API](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/astr_message_event.py#L1482) 与 [master 事件 API](https://github.com/AstrBotDevs/AstrBot/blob/master/astrbot/core/platform/astr_message_event.py#L1696)。
+- `metadata.yaml` 使用语义化版本字段并保留规范要求的名称、作者、GitHub 仓库、版本范围、描述和可选市场标签；AstrBot 官方要求发布前将代码推送到 GitHub，插件包不得超过 16 MB，市场提交由 AstrBot Cloud 发布页单独完成。详见[官方发布说明](https://docs.astrbot.app/dev/star/plugin-publish.html)。
+- 发布构建通过 `python scripts/build_release.py` 生成单根目录 ZIP 并校验版本链；完整测试与包体积结果记录在本次交付说明中。
+
 > 说明：标「未验证」的地方表示我**没有**在官方文档或源码中找到可引用的明文规定，不替官方「补规则」。市场的人工/自动审核清单（拒稿理由、CI 自动检查项）目前**没有公开发布**，只能从发布页、市场 JSON 规范与宿主源码的强制行为反推。
 
 ---

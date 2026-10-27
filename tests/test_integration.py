@@ -75,7 +75,13 @@ class FakeEvent:
     dependency on the event surface shows up as an ``AttributeError`` here.
     """
 
-    def __init__(self, text: str = TASK, umo: str = UMO) -> None:
+    def __init__(
+        self,
+        text: str = TASK,
+        umo: str = UMO,
+        platform_id: str = "platform-1",
+        self_id: str = "bot-1",
+    ) -> None:
         """Create a fake event.
 
         Args:
@@ -83,6 +89,8 @@ class FakeEvent:
             umo: Unified message origin.
         """
         self.unified_msg_origin = umo
+        self.platform_id = platform_id
+        self.self_id = self_id
         self._text = text
         self._extras: dict[str, Any] = {}
         self.results: list[str] = []
@@ -125,6 +133,12 @@ class FakeEvent:
             Always ``"aiocqhttp"``.
         """
         return "aiocqhttp"
+
+    def get_platform_id(self) -> str:
+        return self.platform_id
+
+    def get_self_id(self) -> str:
+        return self.self_id
 
     def is_admin(self) -> bool:
         """Report whether the sender is an AstrBot admin.
@@ -311,7 +325,9 @@ def plugin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
         lambda: str(tmp_path),
     )
     instance = JitRLLearner(FakeContext(), dict(CONFIG))
-    assert instance._db_path == tmp_path / "astrbot_plugin_jitrl" / "memory.sqlite3"
+    assert instance._legacy_db_path == (
+        tmp_path / "astrbot_plugin_jitrl" / "memory.sqlite3"
+    )
     return instance
 
 
@@ -387,7 +403,7 @@ async def test_request_without_memory_does_not_touch_prompt(plugin: Any) -> None
 
 async def test_request_injects_advantage_ranked_block(plugin: Any) -> None:
     """Retrieval must yield a signed, number-carrying preference block."""
-    await plugin._ensure_ready()
+    await plugin._ensure_ready(FakeEvent())
     await _seed(plugin._bank, TASK, "web_search", 2.0)
     await _seed(plugin._bank, TASK, "bad_tool", -2.0)
 
@@ -424,7 +440,7 @@ async def test_injected_block_is_temporary_and_keeps_the_cache_prefix(
     cache hit rate. The injected part must also be marked provider-only so it is
     never written into the persisted conversation history.
     """
-    await plugin._ensure_ready()
+    await plugin._ensure_ready(FakeEvent())
     await _seed(plugin._bank, TASK, "web_search", 2.0)
     await _seed(plugin._bank, TASK, "bad_tool", -2.0)
 
@@ -442,7 +458,7 @@ async def test_injected_block_is_temporary_and_keeps_the_cache_prefix(
 
 async def test_request_is_injected_at_most_once(plugin: Any) -> None:
     """A second hook call on the same event must not duplicate the block."""
-    await plugin._ensure_ready()
+    await plugin._ensure_ready(FakeEvent())
     await _seed(plugin._bank, TASK, "web_search", 2.0)
     event = FakeEvent()
     request = _request()
@@ -458,7 +474,7 @@ async def test_tool_gate_masks_confidently_negative_tool(plugin: Any) -> None:
     plugin.cfg.policy.tool_gate = True
     plugin.cfg.policy.tool_gate_min_count = 1
     plugin.cfg.policy.tool_gate_threshold = -0.3
-    await plugin._ensure_ready()
+    await plugin._ensure_ready(FakeEvent())
     await _seed(plugin._bank, TASK, "web_search", 2.0)
     await _seed(plugin._bank, TASK, "bad_tool", -2.0)
 
@@ -552,7 +568,7 @@ async def test_recall_tool_returns_report(plugin: Any) -> None:
     empty = await plugin.jitrl_recall(FakeEvent(), "完全陌生的情景 xyz")
     assert "No relevant experience" in empty
 
-    await plugin._ensure_ready()
+    await plugin._ensure_ready(FakeEvent())
     await _seed(plugin._bank, TASK, "web_search", 2.0)
     await _seed(plugin._bank, TASK, "bad_tool", -2.0)
     report = await plugin.jitrl_recall(FakeEvent(), TASK)
@@ -562,7 +578,7 @@ async def test_recall_tool_returns_report(plugin: Any) -> None:
 
 async def test_forget_command_clears_scope(plugin: Any) -> None:
     """The forget command must remove the current scope's memory."""
-    await plugin._ensure_ready()
+    await plugin._ensure_ready(FakeEvent())
     await _seed(plugin._bank, TASK, "web_search", 2.0)
     assert await plugin._bank.count() == 1
     results = [chunk async for chunk in plugin.jitrl_forget(FakeEvent(), "session")]
@@ -572,7 +588,7 @@ async def test_forget_command_clears_scope(plugin: Any) -> None:
 
 async def test_terminate_closes_the_bank(plugin: Any) -> None:
     """Unloading the plugin must release the database handle."""
-    await plugin._ensure_ready()
+    await plugin._ensure_ready(FakeEvent())
     assert plugin._bank is not None
     await plugin.terminate()
     assert plugin._bank is None
@@ -581,7 +597,7 @@ async def test_terminate_closes_the_bank(plugin: Any) -> None:
 async def test_apply_mode_off_never_injects(plugin: Any) -> None:
     """Mode ``off`` still learns but must not bias requests."""
     plugin.cfg.apply_mode = "off"
-    await plugin._ensure_ready()
+    await plugin._ensure_ready(FakeEvent())
     await _seed(plugin._bank, TASK, "web_search", 2.0)
     request = _request()
     original = request.system_prompt
@@ -695,6 +711,7 @@ async def test_web_apis_are_registered(plugin: Any) -> None:
     """All dashboard routes must be registered on the context."""
     routes = {entry[0] for entry in plugin.context.registered_web_apis}
     assert routes == {
+        "/astrbot_plugin_jitrl/robots",
         "/astrbot_plugin_jitrl/overview",
         "/astrbot_plugin_jitrl/curve",
         "/astrbot_plugin_jitrl/actions",
@@ -714,7 +731,7 @@ async def test_web_apis_are_registered(plugin: Any) -> None:
 
 async def test_web_overview_reports_state(plugin: Any) -> None:
     """The overview endpoint must expose counters and hyperparameters."""
-    await plugin._ensure_ready()
+    await plugin._ensure_ready(FakeEvent())
     await _seed(plugin._bank, TASK, "web_search", 2.0)
     data = _payload(await _call_web(plugin, "_web_overview", _FakeHttpRequest()))
     assert data["total"] == 1
@@ -725,7 +742,7 @@ async def test_web_overview_reports_state(plugin: Any) -> None:
 
 async def test_web_curve_and_actions_return_lists(plugin: Any) -> None:
     """Curve, actions and episodes endpoints must return JSON lists."""
-    await plugin._ensure_ready()
+    await plugin._ensure_ready(FakeEvent())
     await _seed(plugin._bank, TASK, "web_search", 2.0)
     curve = _payload(
         await _call_web(plugin, "_web_curve", _FakeHttpRequest(query={"buckets": "4"}))
@@ -741,7 +758,7 @@ async def test_web_curve_and_actions_return_lists(plugin: Any) -> None:
 
 async def test_web_forget_all_clears_memory(plugin: Any) -> None:
     """The forget endpoint must clear the bank when scope is all."""
-    await plugin._ensure_ready()
+    await plugin._ensure_ready(FakeEvent())
     await _seed(plugin._bank, TASK, "web_search", 2.0)
     data = _payload(
         await _call_web(
@@ -756,7 +773,7 @@ async def test_web_forget_all_clears_memory(plugin: Any) -> None:
 
 async def test_web_forget_rejects_bad_scope(plugin: Any) -> None:
     """An invalid scope must return the error envelope, not raise."""
-    await plugin._ensure_ready()
+    await plugin._ensure_ready(FakeEvent())
     data = _payload(
         await _call_web(
             plugin,
@@ -774,7 +791,7 @@ async def test_learning_prefers_the_rewarding_action(plugin: Any) -> None:
     request-time estimate must assign a positive advantage to the action that
     historically paid off and a negative one to the action that did not.
     """
-    await plugin._ensure_ready()
+    await plugin._ensure_ready(FakeEvent())
     for _ in range(4):
         await _seed(plugin._bank, TASK, "web_search", 3.0)
         await _seed(plugin._bank, TASK, "bad_tool", -3.0)
@@ -795,7 +812,7 @@ async def test_learning_prefers_the_rewarding_action(plugin: Any) -> None:
 
 async def test_advantage_normalisation_bounds_the_update(plugin: Any) -> None:
     """Eq. 25 must keep every normalised advantage inside [-1, 1]."""
-    await plugin._ensure_ready()
+    await plugin._ensure_ready(FakeEvent())
     await _seed(plugin._bank, TASK, "web_search", 9.0)
     await _seed(plugin._bank, TASK, "bad_tool", -1.0)
     event = FakeEvent()
@@ -808,7 +825,7 @@ async def test_advantage_normalisation_bounds_the_update(plugin: Any) -> None:
 
 async def test_learning_curve_is_time_ordered(plugin: Any) -> None:
     """Buckets must be ordered from the oldest to the newest episode."""
-    await plugin._ensure_ready()
+    await plugin._ensure_ready(FakeEvent())
     await _seed(plugin._bank, TASK, "web_search", -3.0)
     await _seed(plugin._bank, TASK, "web_search", 3.0)
     rows = await plugin._bank.learning_curve(buckets=2)
@@ -845,7 +862,7 @@ async def test_logit_mode_uses_verbalized_confidences(plugin: Any) -> None:
     plugin.context.provider = FakeProvider(
         '{"scores": [{"id": 1, "confidence": 100}, {"id": 2, "confidence": 50}], "best": 1}'
     )
-    await plugin._ensure_ready()
+    await plugin._ensure_ready(FakeEvent())
     await _seed(plugin._bank, TASK, "web_search", 3.0)
     await _seed(plugin._bank, TASK, "bad_tool", -3.0)
 
@@ -870,7 +887,7 @@ async def test_logit_mode_survives_a_broken_reranker(plugin: Any) -> None:
     """A garbage model answer must degrade to a neutral prior, not crash."""
     plugin.cfg.apply_mode = "logit"
     plugin.context.provider = FakeProvider("sorry, I cannot answer that")
-    await plugin._ensure_ready()
+    await plugin._ensure_ready(FakeEvent())
     await _seed(plugin._bank, TASK, "web_search", 3.0)
 
     event = FakeEvent()
@@ -893,7 +910,7 @@ async def test_logit_mode_without_provider_keeps_zero_prior(plugin: Any) -> None
     """With no provider the reranker must be skipped and z(s, a) stays 0."""
     plugin.cfg.apply_mode = "logit"
     plugin.context.provider = None
-    await plugin._ensure_ready()
+    await plugin._ensure_ready(FakeEvent())
     await _seed(plugin._bank, TASK, "web_search", 3.0)
 
     event = FakeEvent()
