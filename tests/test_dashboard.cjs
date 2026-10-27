@@ -46,7 +46,7 @@ class Element {
   }
 }
 
-async function dashboard() {
+async function dashboard(robots = [robot, robot2]) {
   const ids = Object.fromEntries([...html.matchAll(/id="([^"]+)"/g)].map((m) => [m[1], new Element()]));
   ids["btn-forget"].setAttribute("data-memory-mutation", "");
   ids["btn-checkpoint"].setAttribute("data-memory-mutation", "");
@@ -66,8 +66,8 @@ async function dashboard() {
     apiGet: async (endpoint, params) => {
       gets.push({ endpoint, params: JSON.parse(JSON.stringify(params)) });
       return ({
-        robots: { robots: [robot, robot2] },
-        overview: { total: 2, enabled: true, apply_mode: "hint", stats: {}, robot_id: params.robot || robot.id, robots: [robot, robot2] },
+        robots: { robots },
+        overview: { total: 2, enabled: true, apply_mode: "hint", stats: {}, robot_id: params.robot || (robots[0] && robots[0].id), robots },
         curve: { buckets: [] }, actions: { actions: [] }, episodes: { episodes: [] },
         checkpoints: { checkpoints: bridge.inventory, interval: 50, keep: 20 },
       })[endpoint];
@@ -193,4 +193,17 @@ test("clear retains two-step confirmation and explains recovery", async () => {
   await app.ids["btn-forget"].emit("click");
   assert.equal(app.posts[0].endpoint, "forget");
   assert.match(app.ids["action-hint"].textContent, /删除前备份回退/);
+});
+
+test("unlabeled legacy robot falls back to the platform instance id", async () => {
+  const legacy = {
+    id: "robot-legacy",
+    platform_name: "qq_official",
+    platform_id: "爱弥斯",
+    self_id: "unknown_selfid",
+  };
+  const app = await dashboard([legacy]);
+  const options = app.ids["robot-select"].children;
+  assert.equal(options.length, 1);
+  assert.equal(options[0].textContent, "qq_official · 爱弥斯");
 });

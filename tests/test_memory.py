@@ -590,6 +590,50 @@ async def test_export_import_roundtrip(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_export_limit_none_returns_every_row(tmp_path) -> None:
+    """Migration must be able to read a bank without a truncating row cap."""
+    bank = MemoryBank(tmp_path / "memory.db")
+    await bank.initialize()
+    for index in range(3):
+        await bank.add_episode(build_episode(f"e{index}", [1.0]))
+    limited = await bank.export_json(limit=2)
+    assert len(limited["experiences"]) == 2
+    assert len(limited["episodes"]) == 2
+    full = await bank.export_json(limit=None)
+    assert len(full["experiences"]) == 3
+    assert len(full["episodes"]) == 3
+    await bank.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_json_is_idempotent_and_preserves_existing_episodes(
+    tmp_path,
+) -> None:
+    """Merging an export twice imports only genuinely new episodes."""
+    source = MemoryBank(tmp_path / "source.db")
+    await source.initialize()
+    await source.add_episode(build_episode("e1", [1.0, 2.0], user_text="legacy"))
+    await source.add_episode(build_episode("e2", [3.0]))
+    payload = await source.export_json()
+
+    target = MemoryBank(tmp_path / "target.db")
+    await target.initialize()
+    await target.add_episode(build_episode("e1", [9.0], user_text="canonical"))
+    assert await target.merge_json(payload) == 1
+    assert await target.count() == 2
+    assert await target.merge_json(payload) == 0
+    assert await target.count() == 2
+    exported = await target.export_json()
+    headers = {row["episode_id"]: row for row in exported["episodes"]}
+    assert headers["e1"]["user_text"] == "canonical"
+    assert [
+        row["reward"] for row in exported["experiences"] if row["episode_id"] == "e1"
+    ] == [9.0]
+    await source.close()
+    await target.close()
+
+
+@pytest.mark.asyncio
 async def test_import_skips_corrupt_rows(tmp_path) -> None:
     """Corrupt token payloads are stored but never break retrieval."""
     source = MemoryBank(tmp_path / "source.db")

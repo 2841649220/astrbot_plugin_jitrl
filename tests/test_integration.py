@@ -462,6 +462,7 @@ async def test_request_is_injected_at_most_once(plugin: Any) -> None:
     """A second hook call on the same event must not duplicate the block."""
     await plugin._ensure_ready(FakeEvent())
     await _seed(plugin._bank, TASK, "web_search", 2.0)
+    await _seed(plugin._bank, TASK, "bad_tool", -2.0)
     event = FakeEvent()
     request = _request()
     await plugin.on_llm_request(event, request)
@@ -882,7 +883,7 @@ async def test_logit_mode_uses_verbalized_confidences(plugin: Any) -> None:
     assert logits[0] == pytest.approx(math.log(0.5), abs=1e-6)
     assert logits[1] == pytest.approx(0.0, abs=1e-6)
     assert decision.chosen is not None
-    assert "按闭式更新后的策略采样" in _injected_text(request)
+    assert "闭式更新后采样倾向" in _injected_text(request)
 
 
 async def test_logit_mode_survives_a_broken_reranker(plugin: Any) -> None:
@@ -891,6 +892,7 @@ async def test_logit_mode_survives_a_broken_reranker(plugin: Any) -> None:
     plugin.context.provider = FakeProvider("sorry, I cannot answer that")
     await plugin._ensure_ready(FakeEvent())
     await _seed(plugin._bank, TASK, "web_search", 3.0)
+    await _seed(plugin._bank, TASK, "bad_tool", -3.0)
 
     event = FakeEvent()
     request = _request()

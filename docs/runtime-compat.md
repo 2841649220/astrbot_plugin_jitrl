@@ -80,6 +80,25 @@ cannot be settled from the source alone.
 
 **No MISMATCH and no UNVERIFIED row.**
 
+**V0.1.3 re-release delta: robot identity.** `main.py:_robot_identity` now keys a robot on
+`get_platform_id()` alone — `self.platform_meta.id`, i.e. the platform entry's unique
+`config["id"]` ([v4.29.0:133](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/astr_message_event.py#L133),
+[master:184](https://github.com/AstrBotDevs/AstrBot/blob/master/astrbot/core/platform/astr_message_event.py#L184)) —
+and records `get_self_id()` as `robot.json` metadata only. `get_self_id()` is a bare
+`getattr(message_obj, "self_id", "")`
+([v4.29.0:199](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/astr_message_event.py#L199),
+[master:250](https://github.com/AstrBotDevs/AstrBot/blob/master/astrbot/core/platform/astr_message_event.py#L250));
+adapters fill it themselves and `qq_official` derives it from message content (group: first
+bot mention or literal `qq_official`; C2C: `unknown_selfid`; guild: `mentions[0].id`).
+Hashing it created a new `robots/<hash>` directory per message shape and split the learned
+memory. On start-up the plugin now promotes the richest legacy `robots/<platform_id:self_id>/`
+directory, archives the rest under `robots/.legacy/<hash>/`, and merges episodes idempotently.
+The earlier `#L1482`/`#L1588` anchors in this document do not exist in the pinned tag; the
+anchors above are the correct ones. Known boundary: `aiocqhttp`/`satori` can multiplex
+several bot accounts behind one platform instance; the supported deployment is one platform
+entry per bot account.
+
+
 ## 2. Dispatch semantics verified in the host source (not just signatures)
 
 1. **Hook argument order/count.** `call_event_hook(event, hook_type, *args)` awaits

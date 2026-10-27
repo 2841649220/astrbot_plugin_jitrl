@@ -8,6 +8,8 @@
 
 **结论摘要**：仓库**没有发现明确的「违规」项**。`metadata.yaml` / `_conf_schema.json` / 目录布局 / 发布 ZIP / 视图桥接 / 认证入口基本全部符合官方规范，且 `tests/test_manifest.py` 已把大部分契约变成可执行断言。发现 **6 项「风险」**（其中 1 项直接影响市场可安装性：`astrbot_version` 下限）与 5 项可选增强，逐项见第 2 节。
 
+> **V0.1.3 重发（2026-10-27）补充**：机器人身份只使用 AstrBot 平台实例 ID（`get_platform_id()` → 配置中的平台条目 `id`，宿主保证唯一且稳定），`get_self_id()` 仅写入 `robots/<hash>/robot.json` 供展示与排查，不再参与实例键。原因是 `qq_official` 等适配器按消息内容派生 `self_id`（群聊取首个机器人 mention 或 `qq_official`、C2C 取 `unknown_selfid`、频道取 `mentions[0].id`），把消息形态当成机器人会导致经验库分裂。升级时插件按 `robot.json` 的 `platform_id` 合并旧 `robots/<platform_id:self_id>/`：最丰富目录提升为规范目录，其余归档到 `robots/.legacy/<hash>/` 并幂等合并 episode，归档数据不删除。已知边界：`aiocqhttp`/`satori` 可在同一平台实例后挂多个机器人账号；约定一个平台条目对应一个机器人账号。
+
 > 说明：标「未验证」的地方表示我**没有**在官方文档或源码中找到可引用的明文规定，不替官方「补规则」。市场的人工/自动审核清单（拒稿理由、CI 自动检查项）目前**没有公开发布**，只能从发布页、市场 JSON 规范与宿主源码的强制行为反推。
 
 ---

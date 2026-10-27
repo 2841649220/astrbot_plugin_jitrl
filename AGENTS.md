@@ -2,7 +2,7 @@
 
 - For routine features and fixes, increment only the patch (last) version number.
 - Increment the middle version number only for large architectural improvements.
-- The current release is `0.1.1` (re-released with the market fixes); `0.1.0` was the first public version.
+- The current release is `0.1.3`, re-released on 2026-10-27 with the robot-identity fix (key on the platform instance id, not `self_id`, and consolidate legacy directories); `0.1.2` added retrieval and checkpoint improvements, `0.1.1` was re-released with market fixes, and `0.1.0` was the first public version.
 - Market review rules to keep satisfying: log only through `from astrbot.api import logger`
   (never the standard library `logging`), and never rewrite `req.system_prompt` per request —
   injected context goes to `req.extra_user_content_parts` and is marked `mark_as_temp()` so it

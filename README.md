@@ -94,9 +94,9 @@ AstrBot 的对话是黑盒 API，拿不到原始 logits。论文 §5.1 正好给
 
 ### 2.3 多机器人独立学习
 
-每个 AstrBot 机器人账号使用独立的 SQLite 记忆库、检查点、导出文件与运行统计。插件按平台实例 ID 和机器人 `self_id` 识别机器人；`retrieval.scope_isolation` 的 `global` 只代表当前机器人内跨会话共享，任何模式都不会让不同机器人互相检索或训练。WebUI 面板可切换机器人，并且只会查看或管理当前选择的实例。
+每个 AstrBot 机器人账号使用独立的 SQLite 记忆库、检查点、导出文件与运行统计。插件只按平台实例 ID 识别机器人；适配器返回的 `self_id` 仅写入 `robot.json` 作为排查元数据，不参与实例键（QQ 官方机器人等适配器会按消息内容改变 `self_id`，不能作为身份）。`retrieval.scope_isolation` 的 `global` 只代表当前机器人内跨会话共享，任何模式都不会让不同机器人互相检索或训练。WebUI 面板可切换机器人，并且只会查看或管理当前选择的实例。
 
-升级时，旧版 `memory.sqlite3` 与检查点会迁移给第一个触发 JitRL 的机器人，其他机器人从空记忆开始；之后不会再次迁移旧库。
+升级时，旧版 `memory.sqlite3` 与检查点会迁移给第一个触发 JitRL 的机器人，其他机器人从空记忆开始；之后不会再次迁移旧库。本次 0.1.3 重发会自动合并旧版 `robots/<platform_id:self_id>/` 目录：数据最丰富的目录提升为规范目录，其余归档到 `robots/.legacy/<robot-hash>/`，并按 episode 幂等合并经验；归档数据不会删除。
 
 ### 2.4 相对论文的工程改进（算法与执行效率）
 
@@ -424,7 +424,7 @@ astrbot_plugin_jitrl/
 
 ## 12. 版本
 
-当前版本 **0.1.3**（完整变更见 [CHANGELOG.md](CHANGELOG.md)）。
+当前版本 **0.1.3**（2026-10-27 重发；完整变更见 [CHANGELOG.md](CHANGELOG.md)）。
 
 发布：`python scripts/build_release.py` 会校验四处版本号一致，再生成单根目录的
 `dist/astrbot_plugin_jitrl-v<版本>.zip` 并输出 SHA-256（超过 16 MB 直接失败）。

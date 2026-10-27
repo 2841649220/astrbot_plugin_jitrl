@@ -33,8 +33,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import random
+import sqlite3
+import threading
 import time
 import uuid
 from collections import OrderedDict
@@ -42,6 +45,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -62,6 +66,9 @@ from .jitrl.trajectory import build_episode, extract_transitions, infer_success
 
 _PLUGIN_DATA_DIR = "astrbot_plugin_jitrl"
 """Subdirectory of AstrBot's plugin data root owned by this plugin."""
+
+_ROBOT_ARCHIVE_DIR = ".legacy"
+"""Subdirectory of robots/ holding superseded per-self_id data."""
 
 _EVENT_EXTRA_KEY = "_jitrl_context"
 """Key under which the decision context travels from request to agent done."""
@@ -130,6 +137,32 @@ def _make_temporary_part(text: str) -> Any | None:
         return None
 
 
+def _event_text(event: Any, accessor: str) -> str:
+    """Read a string-returning AstrBot event accessor defensively.
+
+    Older host builds and third-party adapters do not all implement every
+    accessor, and an adapter may return None. Identity building must never
+    raise from inside a message hook.
+
+    Args:
+        event: AstrBot message event.
+        accessor: Name of the accessor method, for example get_platform_id.
+
+    Returns:
+        The stripped string value, or an empty string.
+    """
+    method = getattr(event, accessor, None)
+    if method is None:
+        return ""
+    try:
+        value = method()
+    except Exception:
+        return ""
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
 @dataclass(slots=True)
 class _DecisionSnapshot:
     """Everything on_llm_request needs for one (state, scope, tools) triple.
@@ -177,6 +210,7 @@ class JitRLLearner(Star):
         self._legacy_db_path = data_root / "memory.sqlite3"
         self._banks: dict[str, MemoryBank] = {}
         self._bank_paths: dict[str, Path] = {}
+        self._robot_dirs: dict[str, Path] = {}
         self._active_bank: ContextVar[MemoryBank | None] = ContextVar(
             f"jitrl_bank_{id(self)}", default=None
         )
@@ -198,6 +232,7 @@ class JitRLLearner(Star):
         }
         self._ready_lock = asyncio.Lock()
         self._background: set[asyncio.Task] = set()
+        self._background_coroutines: dict[asyncio.Task, Any] = {}
         self._rng_by_robot: dict[str, random.Random] = {}
         self._unscoped_rng = random.Random()
         self._last_episode: dict[str, tuple[str, float]] = {}
@@ -208,6 +243,9 @@ class JitRLLearner(Star):
         self._decision_cache: OrderedDict[tuple[Any, ...], _DecisionSnapshot] = (
             OrderedDict()
         )
+        self._layout_ready = False
+        self._layout_lock = threading.Lock()
+        self._ensure_layout()
         self._register_web_apis()
 
     @property
@@ -256,8 +294,20 @@ class JitRLLearner(Star):
 
     @staticmethod
     def _robot_identity(event: AstrMessageEvent) -> str:
-        """Combine the AstrBot platform instance and adapter robot account IDs."""
-        return f"{event.get_platform_id()}:{event.get_self_id()}"
+        """Return the stable isolation identity for the bot behind an event.
+
+        AstrBot's platform-instance ID is unique per configured adapter and is
+        stored in the platform configuration, so it identifies one bot across
+        restarts. The self ID is deliberately not part of the key: several
+        adapters derive it from the message itself, so including it created a
+        new robot directory for every message shape. The self ID is still
+        persisted as informational dashboard metadata.
+        """
+        platform_id = _event_text(event, "get_platform_id")
+        if platform_id:
+            return f"platform:{platform_id}"
+        platform_name = _event_text(event, "get_platform_name")
+        return f"adapter:{platform_name or 'unknown'}"
 
     def _robot_key_for_event(self, event: AstrMessageEvent) -> str:
         return self._robot_key(self._robot_identity(event))
@@ -267,6 +317,234 @@ class JitRLLearner(Star):
 
     def _robot_dir(self, robot_key: str) -> Path:
         return self._data_root / "robots" / robot_key
+
+    def _robot_metadata(self, event: AstrMessageEvent) -> dict[str, str]:
+        """Build the robot.json payload for one event."""
+        platform_id = _event_text(event, "get_platform_id")
+        platform_name = _event_text(event, "get_platform_name")
+        self_id = _event_text(event, "get_self_id")
+        if platform_id:
+            label = f"{platform_name} · {platform_id}" if platform_name else platform_id
+        else:
+            label = f"{platform_name or 'AstrBot'} · {self_id or 'unknown'}"
+        return {
+            "platform_id": platform_id,
+            "platform_name": platform_name,
+            "self_id": self_id,
+            "identity": self._robot_identity(event),
+            "label": label,
+        }
+
+    @staticmethod
+    def _read_robot_metadata(robot_dir: Path) -> dict[str, str] | None:
+        """Read robot.json without raising on corrupt or missing data."""
+        try:
+            data = json.loads((robot_dir / "robot.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        return {
+            str(key): "" if value is None else str(value)
+            for key, value in data.items()
+            if isinstance(value, str | int | float | bool) or value is None
+        }
+
+    @staticmethod
+    def _write_robot_metadata(robot_dir: Path, metadata: dict[str, str]) -> None:
+        """Atomically replace robot.json so a crash cannot corrupt it."""
+        robot_dir.mkdir(parents=True, exist_ok=True)
+        if JitRLLearner._read_robot_metadata(robot_dir) == metadata:
+            return
+        temporary = robot_dir / f".robot.json.{uuid.uuid4().hex}.tmp"
+        temporary.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        temporary.replace(robot_dir / "robot.json")
+
+    @staticmethod
+    def _canonical_metadata(
+        metadata: dict[str, str], platform_id: str
+    ) -> dict[str, str]:
+        """Normalize legacy metadata into the platform-instance format."""
+        platform_name = metadata.get("platform_name", "").strip()
+        self_id = metadata.get("self_id", "").strip()
+        if platform_id:
+            identity = f"platform:{platform_id}"
+            label = f"{platform_name} · {platform_id}" if platform_name else platform_id
+        else:
+            platform_name = platform_name or "unknown"
+            identity = f"adapter:{platform_name}"
+            label = f"{platform_name} · {self_id or 'unknown'}"
+        return {
+            "platform_id": platform_id,
+            "platform_name": platform_name,
+            "self_id": self_id,
+            "identity": identity,
+            "label": label,
+        }
+
+    @staticmethod
+    def _canonical_identity(metadata: dict[str, str]) -> str | None:
+        """Return the canonical identity a metadata file maps to."""
+        platform_id = metadata.get("platform_id", "").strip()
+        if platform_id:
+            return f"platform:{platform_id}"
+        platform_name = metadata.get("platform_name", "").strip()
+        return f"adapter:{platform_name}" if platform_name else None
+
+    @staticmethod
+    def _robot_richness(robot_dir: Path) -> tuple[int, int, int, float]:
+        """Rank legacy robot directories by how much data they hold."""
+        db_path = robot_dir / "memory.sqlite3"
+        rows = -1
+        size = 0
+        modified = 0.0
+        if db_path.is_file():
+            try:
+                stat = db_path.stat()
+                size = stat.st_size
+                modified = stat.st_mtime
+            except OSError:
+                size = 0
+            try:
+                uri = f"file:{quote(db_path.as_posix(), safe='/:')}?mode=ro"
+                conn = sqlite3.connect(uri, uri=True)
+                try:
+                    row = conn.execute("SELECT COUNT(*) FROM experiences").fetchone()
+                    rows = int(row[0]) if row is not None else 0
+                finally:
+                    conn.close()
+            except sqlite3.Error:
+                rows = -1
+        return rows, size, 0, modified
+
+    def _archive_robot_dir(self, robot_dir: Path, canonical_key: str) -> None:
+        """Move a superseded robot directory out of the dashboard scan path."""
+        archive_root = self._data_root / "robots" / _ROBOT_ARCHIVE_DIR / canonical_key
+        try:
+            archive_root.mkdir(parents=True, exist_ok=True)
+            target = archive_root / robot_dir.name
+            if target.exists():
+                target = archive_root / f"{robot_dir.name}-{int(time.time() * 1000)}"
+            robot_dir.replace(target)
+            note = target / "migration.json"
+            note.write_text(
+                json.dumps(
+                    {
+                        "merged_into": canonical_key,
+                        "archived_at": time.time(),
+                        "source_layout": "0.1.3 platform_id:self_id",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            logger.info("[JitRL] archived legacy robot directory %s", robot_dir.name)
+        except OSError:
+            logger.warning(
+                "[JitRL] cannot archive legacy robot directory %s",
+                robot_dir,
+                exc_info=True,
+            )
+
+    def _heal_robot_layout(self) -> None:
+        """Consolidate legacy per-self_id robot dirs into platform-instance dirs."""
+        root = self._data_root / "robots"
+        if not root.is_dir():
+            return
+        try:
+            entries = sorted(root.iterdir())
+        except OSError:
+            logger.warning("[JitRL] cannot scan robot directories", exc_info=True)
+            return
+        groups: dict[str, list[tuple[Path, dict[str, str]]]] = {}
+        for directory in entries:
+            if not directory.is_dir() or directory.name.startswith("."):
+                continue
+            metadata = self._read_robot_metadata(directory)
+            if metadata is None:
+                logger.warning(
+                    "[JitRL] robot directory %s has no readable robot.json; left untouched",
+                    directory.name,
+                )
+                continue
+            identity = self._canonical_identity(metadata)
+            if identity is None:
+                logger.warning(
+                    "[JitRL] robot directory %s has no platform id or adapter name; left untouched",
+                    directory.name,
+                )
+                continue
+            key = self._robot_key(identity)
+            if directory.name == key:
+                continue
+            groups.setdefault(key, []).append((directory, metadata))
+        for key, legacy in groups.items():
+            canonical_dir = root / key
+            remaining = legacy
+            source: dict[str, str] = {}
+            if not canonical_dir.exists():
+                primary_dir, primary_metadata = max(
+                    legacy, key=lambda item: self._robot_richness(item[0])
+                )
+                try:
+                    primary_dir.replace(canonical_dir)
+                except OSError:
+                    logger.warning(
+                        "[JitRL] cannot promote legacy robot directory %s",
+                        primary_dir,
+                        exc_info=True,
+                    )
+                    continue
+                source = primary_metadata
+                remaining = [item for item in legacy if item[0] != primary_dir]
+            canonical_metadata = self._read_robot_metadata(canonical_dir) or source
+            fallback_metadata = remaining[0][1] if remaining else {}
+            for field in ("platform_id", "platform_name", "self_id"):
+                if not canonical_metadata.get(field):
+                    canonical_metadata[field] = fallback_metadata.get(field, "")
+            if self._canonical_identity(canonical_metadata) is None:
+                continue
+            try:
+                self._write_robot_metadata(
+                    canonical_dir,
+                    self._canonical_metadata(
+                        canonical_metadata,
+                        canonical_metadata.get("platform_id", "").strip(),
+                    ),
+                )
+            except OSError:
+                logger.warning(
+                    "[JitRL] cannot write robot metadata in %s",
+                    canonical_dir,
+                    exc_info=True,
+                )
+            for legacy_dir, _metadata in remaining:
+                self._archive_robot_dir(legacy_dir, key)
+            if remaining:
+                logger.info(
+                    "[JitRL] consolidated %d legacy robot directories into %s",
+                    len(remaining),
+                    key,
+                )
+
+    def _ensure_layout(self) -> None:
+        """Run the robot-directory consolidation at most once per process."""
+        if self._layout_ready:
+            return
+        with self._layout_lock:
+            if self._layout_ready:
+                return
+            try:
+                self._heal_robot_layout()
+            except Exception:
+                logger.warning(
+                    "[JitRL] robot directory consolidation failed", exc_info=True
+                )
+            finally:
+                self._layout_ready = True
 
     def _migrate_legacy_data(self, robot_dir: Path, db_path: Path) -> None:
         """Move the pre-isolation bank and its snapshots to the first robot."""
@@ -285,17 +563,147 @@ class JitRLLearner(Star):
                 if source.exists():
                     source.replace(robot_dir / source.name)
 
+    def _with_previous_metadata(
+        self, robot_dir: Path, metadata: dict[str, str]
+    ) -> dict[str, str]:
+        """Keep earlier identity fields when an event omits them."""
+        previous = self._read_robot_metadata(robot_dir) or {}
+        for field in ("platform_id", "platform_name", "self_id"):
+            if not metadata.get(field) and previous.get(field):
+                metadata[field] = previous[field]
+        if not metadata.get("platform_id"):
+            metadata["label"] = (
+                f"{metadata.get('platform_name') or 'AstrBot'} · "
+                f"{metadata.get('self_id') or 'unknown'}"
+            )
+        return metadata
+
+    def _activate_robot(
+        self, robot_key: str, bank: MemoryBank, db_path: Path, robot_dir: Path
+    ) -> None:
+        """Select one robot's bank for the current async context."""
+        self._active_bank.set(bank)
+        self._active_db_path.set(db_path)
+        self._active_robot_key.set(robot_key)
+        self._last_bank = bank
+        self._last_db_path = db_path
+        self._robot_dirs[robot_key] = robot_dir
+
+    def _activate_robot_event(
+        self, event: AstrMessageEvent
+    ) -> tuple[str, Path, dict[str, str]]:
+        """Resolve, create and activate the canonical robot for one event."""
+        self._ensure_layout()
+        metadata = self._robot_metadata(event)
+        robot_key = self._robot_key(metadata["identity"])
+        robot_dir = self._robot_dir(robot_key)
+        robot_dir.mkdir(parents=True, exist_ok=True)
+        metadata = self._with_previous_metadata(robot_dir, metadata)
+        try:
+            self._write_robot_metadata(robot_dir, metadata)
+        except OSError:
+            logger.warning(
+                "[JitRL] cannot persist robot metadata in %s",
+                robot_dir,
+                exc_info=True,
+            )
+        self._robot_dirs[robot_key] = robot_dir
+        self._active_robot_key.set(robot_key)
+        return robot_key, robot_dir, metadata
+
+    @staticmethod
+    def _mark_archive_merged(archive: Path, db_path: Path) -> bool:
+        """Rename an archived database after its rows were merged."""
+        try:
+            db_path.replace(archive / "memory.sqlite3.merged")
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(f"{db_path}{suffix}")
+                if sidecar.is_file():
+                    sidecar.replace(archive / f"memory.sqlite3.merged{suffix}")
+        except OSError:
+            return False
+        return True
+
+    async def _merge_archived_robot_banks(
+        self, bank: MemoryBank, robot_key: str
+    ) -> None:
+        """Merge archived legacy memory into the canonical bank."""
+        archive_root = self._data_root / "robots" / _ROBOT_ARCHIVE_DIR / robot_key
+        if not archive_root.is_dir():
+            return
+        try:
+            archives = sorted(archive_root.iterdir())
+        except OSError:
+            logger.warning(
+                "[JitRL] cannot scan archived robot directories", exc_info=True
+            )
+            return
+        for archive in archives:
+            if not archive.is_dir():
+                continue
+            db_path = archive / "memory.sqlite3"
+            if not db_path.is_file():
+                continue
+            legacy = MemoryBank(
+                db_path,
+                checkpoint_dir=archive / "checkpoints",
+                checkpoint_interval=0,
+            )
+            try:
+                await legacy.initialize()
+                try:
+                    payload = await legacy.export_json(limit=None)
+                finally:
+                    await legacy.close()
+            except Exception:
+                logger.warning(
+                    "[JitRL] cannot read archived memory in %s",
+                    archive,
+                    exc_info=True,
+                )
+                continue
+            try:
+                imported = await bank.merge_json(payload)
+            except Exception:
+                logger.warning(
+                    "[JitRL] cannot merge archived memory from %s",
+                    archive,
+                    exc_info=True,
+                )
+                continue
+            marked = await asyncio.to_thread(
+                self._mark_archive_merged, archive, db_path
+            )
+            if not marked:
+                logger.warning(
+                    "[JitRL] merged archived memory but cannot mark it in %s",
+                    archive,
+                )
+                continue
+            logger.info(
+                "[JitRL] merged %d archived experiences from %s",
+                imported,
+                archive.name,
+            )
+
     def _known_robots(self) -> list[dict[str, str]]:
-        """Read the robot instances that already have an isolated memory bank."""
-        robots = []
+        """List robot instances that own data, in a stable display order."""
+        robots: list[dict[str, str]] = []
         root = self._data_root / "robots"
-        if not root.exists():
+        try:
+            entries = sorted(root.iterdir())
+        except OSError:
             return robots
-        for directory in sorted(root.iterdir()):
-            metadata_path = directory / "robot.json"
-            if directory.is_dir() and metadata_path.exists():
-                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-                robots.append({"id": directory.name, **metadata})
+        for directory in entries:
+            if not directory.is_dir() or directory.name.startswith("."):
+                continue
+            metadata = self._read_robot_metadata(directory)
+            if metadata is None:
+                continue
+            if not metadata.get("label") and not self._canonical_identity(metadata):
+                metadata["label"] = f"unrecognized · {directory.name[:12]}"
+            robots.append({"id": directory.name, **metadata})
+        robots.sort(key=lambda row: (row.get("label") or row["id"], row["id"]))
         return robots
 
     async def _ensure_ready(
@@ -310,23 +718,19 @@ class JitRLLearner(Star):
             Exception: Whatever `MemoryBank.initialize` raises, so the caller
                 can record the failure in its own try/except block.
         """
+        self._ensure_layout()
         if event is not None:
-            platform_id = str(event.get_platform_id())
-            self_id = str(event.get_self_id())
-            identity = self._robot_identity(event)
-            metadata = {
-                "platform_id": platform_id,
-                "platform_name": str(event.get_platform_name()),
-                "self_id": self_id,
-                "label": f"{event.get_platform_name()} · {self_id}",
-            }
-            robot_key = self._robot_key(identity)
+            robot_key, robot_dir, metadata = self._activate_robot_event(event)
         elif robot_id is not None:
             known = next(
-                robot for robot in self._known_robots() if robot["id"] == robot_id
+                (robot for robot in self._known_robots() if robot["id"] == robot_id),
+                None,
             )
+            if known is None:
+                raise ValueError("机器人实例不存在")
             metadata = {key: value for key, value in known.items() if key != "id"}
             robot_key = robot_id
+            robot_dir = self._robot_dirs.get(robot_key, self._robot_dir(robot_key))
         else:
             active_bank = self._active_bank.get()
             if active_bank is not None:
@@ -335,31 +739,38 @@ class JitRLLearner(Star):
 
         bank = self._banks.get(robot_key)
         if bank is not None:
-            self._active_bank.set(bank)
-            self._active_db_path.set(self._bank_paths[robot_key])
-            self._active_robot_key.set(robot_key)
-            self._last_bank = bank
-            self._last_db_path = self._bank_paths[robot_key]
+            self._activate_robot(
+                robot_key,
+                bank,
+                self._bank_paths[robot_key],
+                self._robot_dirs[robot_key],
+            )
             return bank
 
         async with self._ready_lock:
             bank = self._banks.get(robot_key)
             if bank is not None:
-                self._active_bank.set(bank)
-                self._active_db_path.set(self._bank_paths[robot_key])
-                self._active_robot_key.set(robot_key)
-                self._last_bank = bank
-                self._last_db_path = self._bank_paths[robot_key]
+                self._activate_robot(
+                    robot_key,
+                    bank,
+                    self._bank_paths[robot_key],
+                    self._robot_dirs[robot_key],
+                )
                 return bank
-            robot_dir = self._robot_dir(robot_key)
+            robot_dir = self._robot_dirs.get(robot_key, robot_dir)
             robot_dir.mkdir(parents=True, exist_ok=True)
             db_path = robot_dir / "memory.sqlite3"
             # Give an existing pre-isolation database to the first robot that
             # uses the upgraded plugin; later robot instances start empty.
             await asyncio.to_thread(self._migrate_legacy_data, robot_dir, db_path)
-            (robot_dir / "robot.json").write_text(
-                json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            try:
+                self._write_robot_metadata(robot_dir, metadata)
+            except OSError:
+                logger.warning(
+                    "[JitRL] cannot persist robot metadata in %s",
+                    robot_dir,
+                    exc_info=True,
+                )
             bank = MemoryBank(
                 db_path,
                 max_entries=self.cfg.memory.max_entries,
@@ -371,27 +782,34 @@ class JitRLLearner(Star):
                 keep_checkpoints=self.cfg.memory.keep_checkpoints,
             )
             await bank.initialize()
+            await self._merge_archived_robot_banks(bank, robot_key)
             self._banks[robot_key] = bank
             self._bank_paths[robot_key] = db_path
-            self._active_bank.set(bank)
-            self._active_db_path.set(db_path)
-            self._active_robot_key.set(robot_key)
-            self._last_bank = bank
-            self._last_db_path = db_path
+            self._activate_robot(robot_key, bank, db_path, robot_dir)
             # Warm the retrieval index off the request path. Small banks are
             # already indexed by initialize(); this covers the rest and is a
             # no-op when the index is ready.
             self._spawn(bank.warm_index())
-            logger.info("[JitRL] memory bank ready for %s", metadata["platform_name"])
+            logger.info(
+                "[JitRL] memory bank ready for %s",
+                metadata.get("label")
+                or metadata.get("platform_name")
+                or metadata.get("platform_id")
+                or robot_key,
+            )
             return bank
 
     async def terminate(self) -> None:
         """Release background work and close the database on unload."""
-        for task in list(self._background):
+        tasks = list(self._background)
+        for task in tasks:
             task.cancel()
-        if self._background:
-            await asyncio.gather(*self._background, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for task in tasks:
+            self._background_done(task)
         self._background.clear()
+        self._background_coroutines.clear()
         await asyncio.gather(*(bank.close() for bank in self._banks.values()))
         self._banks.clear()
         self._bank_paths.clear()
@@ -422,7 +840,18 @@ class JitRLLearner(Star):
 
         task = asyncio.create_task(_runner())
         self._background.add(task)
-        task.add_done_callback(self._background.discard)
+        self._background_coroutines[task] = coroutine
+        task.add_done_callback(self._background_done)
+
+    def _background_done(self, task: asyncio.Task) -> None:
+        """Forget a finished background task and close an unstarted coroutine."""
+        self._background.discard(task)
+        coroutine = self._background_coroutines.pop(task, None)
+        if (
+            coroutine is not None
+            and inspect.getcoroutinestate(coroutine) == inspect.CORO_CREATED
+        ):
+            coroutine.close()
 
     async def _llm_text(
         self,
