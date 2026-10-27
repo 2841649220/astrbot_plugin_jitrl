@@ -418,7 +418,7 @@ async def test_legacy_bank_and_checkpoints_move_to_first_robot(host, tmp_path):
         await instance.terminate()
 
 
-async def test_legacy_auxiliary_data_moves_when_robot_database_already_exists(plugin):
+async def test_legacy_conflicts_are_preserved_and_never_reassigned(plugin):
     first_robot_dir = plugin._robot_dir("b" * 64)
     first_robot_dir.mkdir(parents=True)
     robot_db = first_robot_dir / "memory.sqlite3"
@@ -437,11 +437,11 @@ async def test_legacy_auxiliary_data_moves_when_robot_database_already_exists(pl
 
     assert robot_db.read_bytes() == b"existing robot database"
     assert plugin._legacy_db_path.read_bytes() == b"legacy shared database"
-    assert (first_robot_dir / "checkpoints" / "snapshot.json").read_text(
+    assert (legacy_checkpoints / "snapshot.json").read_text(
         encoding="utf-8"
     ) == "snapshot"
     assert (first_robot_dir / "neural" / "neural.sqlite3").read_bytes() == b"neural"
-    assert (first_robot_dir / legacy_export.name).read_text(encoding="utf-8") == "{}"
+    assert legacy_export.read_text(encoding="utf-8") == "{}"
 
     second_robot_dir = plugin._robot_dir("c" * 64)
     second_robot_dir.mkdir(parents=True)
@@ -450,6 +450,25 @@ async def test_legacy_auxiliary_data_moves_when_robot_database_already_exists(pl
     assert json.loads(
         (plugin._data_root / ".legacy-migration.json").read_text(encoding="utf-8")
     ) == {"robot_id": first_robot_dir.name}
+
+
+async def test_legacy_database_migration_resumes_after_sidecar_move(plugin):
+    first_robot_dir = plugin._robot_dir("d" * 64)
+    first_robot_dir.mkdir(parents=True)
+    robot_db = first_robot_dir / "memory.sqlite3"
+    plugin._legacy_db_path.write_bytes(b"legacy database")
+    legacy_wal = plugin._legacy_db_path.parent / "memory.sqlite3-wal"
+    target_wal = robot_db.parent / "memory.sqlite3-wal"
+    legacy_wal.write_bytes(b"legacy wal")
+    legacy_wal.replace(target_wal)
+
+    plugin._migrate_legacy_data(first_robot_dir, robot_db)
+
+    assert robot_db.read_bytes() == b"legacy database"
+    assert target_wal.read_bytes() == b"legacy wal"
+    assert not legacy_wal.exists()
+    assert not plugin._legacy_db_path.exists()
+    assert (plugin._data_root / ".legacy-migration.json").exists()
 
 
 async def test_web_robot_selection_prevents_cross_instance_management(host, plugin):

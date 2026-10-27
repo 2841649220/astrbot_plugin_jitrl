@@ -348,22 +348,33 @@ class JitRLLearner(Star):
         if not has_legacy_data:
             return
 
-        if self._legacy_db_path.exists():
-            if not db_path.exists():
-                for suffix in ("", "-wal", "-shm"):
-                    source = Path(f"{self._legacy_db_path}{suffix}")
-                    if source.exists():
-                        source.replace(Path(f"{db_path}{suffix}"))
+        database_files = (
+            (self._legacy_db_path, db_path),
+            (Path(f"{self._legacy_db_path}-wal"), Path(f"{db_path}-wal")),
+            (Path(f"{self._legacy_db_path}-shm"), Path(f"{db_path}-shm")),
+        )
+        database_conflict = any(
+            source.exists() and target.exists() for source, target in database_files
+        )
+        if not database_conflict:
+            for source, target in (*database_files[1:], database_files[0]):
+                if source.exists():
+                    source.replace(target)
 
-        if old_checkpoints.exists() and not (robot_dir / "checkpoints").exists():
+        if (
+            old_checkpoints.exists()
+            and not database_conflict
+            and not (robot_dir / "checkpoints").exists()
+        ):
             old_checkpoints.replace(robot_dir / "checkpoints")
         if old_neural.exists() and not (robot_dir / "neural").exists():
             old_neural.replace(robot_dir / "neural")
-        for source in old_exports:
-            if source.exists():
-                target = robot_dir / source.name
-                if not target.exists():
-                    source.replace(target)
+        if not database_conflict:
+            for source in old_exports:
+                if source.exists():
+                    target = robot_dir / source.name
+                    if not target.exists():
+                        source.replace(target)
 
         remaining = [
             source.name
@@ -379,7 +390,7 @@ class JitRLLearner(Star):
         ]
         if remaining:
             logger.warning(
-                "[JitRL] legacy data preserved at the shared path because the first robot already has matching files: %s",
+                "[JitRL] legacy data preserved at the shared path because the first robot already has conflicting files: %s",
                 ", ".join(remaining),
             )
 
