@@ -77,7 +77,12 @@ function renderRobotSelector(robots, selected) {
   for (const robot of robots || []) {
     const option = document.createElement("option");
     option.value = robot.id;
-    option.textContent = robot.label || (robot.platform_name + " · " + robot.self_id);
+    // Older robot.json files have no label. Prefer the stable platform
+    // instance id over self_id, which some adapters change per message.
+    option.textContent = robot.label
+      || [robot.platform_name, robot.platform_id].filter(Boolean).join(" · ")
+      || robot.self_id
+      || robot.id;
     robotSelect.append(option);
   }
   selectedRobotId = selected || "";

@@ -202,3 +202,16 @@ test("switching robots refreshes only the selected instance", async () => {
   assert.equal(app.ids["robot-select"].value, second.id);
   assert.ok(app.gets.filter(({ endpoint }) => endpoint !== "robots").slice(-5).every(({ params }) => params.robot === second.id));
 });
+
+test("unlabeled legacy robot falls back to the platform instance id", async () => {
+  const legacy = {
+    id: "robot-legacy",
+    platform_name: "qq_official",
+    platform_id: "爱弥斯",
+    self_id: "unknown_selfid",
+  };
+  const app = await dashboard([legacy]);
+  const options = app.ids["robot-select"].children;
+  assert.equal(options.length, 1);
+  assert.equal(options[0].textContent, "qq_official · 爱弥斯");
+});

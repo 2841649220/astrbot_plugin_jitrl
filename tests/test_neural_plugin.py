@@ -499,7 +499,7 @@ async def test_existing_config_uses_legacy_memory_and_temporary_injection(
 
 async def test_neural_runtimes_are_isolated_by_robot(plugin):
     first = Event(scope="shared-session", platform_id="platform-a", self_id="bot-a")
-    second = Event(scope="shared-session", platform_id="platform-a", self_id="bot-b")
+    second = Event(scope="shared-session", platform_id="platform-b", self_id="bot-a")
 
     first_runtime = await plugin._ensure_neural(first)
     first_key = plugin._robot_key_for_event(first)

@@ -3,13 +3,13 @@
 [![CI](https://github.com/2841649220/astrbot_plugin_jitrl/actions/workflows/ci.yml/badge.svg)](https://github.com/2841649220/astrbot_plugin_jitrl/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/version-0.2.1-blue)](CHANGELOG.md)
 
-> V0.2.1 在 V0.1.3 经验学习基础上加入按机器人实例隔离的独立学习，并延续可选本地 Neural Lens。远端大模型始终冻结；神经扩展默认关闭，旧配置与旧 API 保持兼容。
+> V0.2.1（2026-10-27 重发）修正机器人实例识别并保留独立学习与可选本地 Neural Lens：实例键只使用 AstrBot 平台实例 ID，`self_id` 仅作为展示元数据。远端大模型始终冻结；神经扩展默认关闭，旧配置与旧 API 保持兼容。
 >
 > V0.1 路径无需训练；V0.2 神经路径使用可选 PyTorch 训练会话隔离的小模型。当前默认四层 token 注意力全部使用真正的 MiTA 压缩与路由机制，结合 JitRL 经验回报和 Engram 条件模式记忆。
 
 ## V0.2.1 快速入口
 
-当前发布版本：`0.2.1`；实验性开发分支：`v0.2.0-neural-lens`。V0.2.1 按 AstrBot 平台实例 ID 与机器人 `self_id` 隔离 V0.1 经验库和 Neural Lens；V0.2 神经路径仍以 V0.1.3 兼容路径为基础，没有合入 V0.1 分支。现有插件入口、配置键、指令、经验库、检查点及面板路由继续保留。`neural.mode: off` 为默认值，无需安装额外依赖。
+当前发布版本：`0.2.1`（2026-10-27 重发）；实验性开发分支：`v0.2.0-neural-lens`。本次重发只按 AstrBot 平台实例 ID 隔离 V0.1 经验库和 Neural Lens；平台适配器返回的 `self_id` 会写入 `robot.json` 供排查，但不再参与实例键。V0.2 神经路径仍以 V0.1.3 兼容路径为基础，没有合入 V0.1 分支。现有插件入口、配置键、指令、经验库、检查点及面板路由继续保留。`neural.mode: off` 为默认值，无需安装额外依赖。
 
 - [神经架构的研究依据与论文边界](docs/neural-lens-research.md)
 - [MiTA 主干：公式落地、4/4 层替换与研究实验](docs/mita-backbone-research.md)
@@ -161,13 +161,13 @@ git clone https://github.com/2841649220/astrbot_plugin_jitrl.git
 Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot_version`
 阻止加载。
 
-也可从 [v0.1.2 Release](https://github.com/2841649220/astrbot_plugin_jitrl/releases/tag/v0.1.2)
-下载 `astrbot_plugin_jitrl-v0.1.2.zip`，在 AstrBot 插件管理页选择「从文件安装」。
+也可从 [v0.2.1 Release](https://github.com/2841649220/astrbot_plugin_jitrl/releases/tag/v0.2.1)
+下载 `astrbot_plugin_jitrl-v0.2.1.zip`，在 AstrBot 插件管理页选择「从文件安装」。
 安装包包含单个插件根目录，以及完整的代码、配置和面板资源。
 
 **零第三方依赖**：只用 Python 标准库（`sqlite3` / `json` / `re` / `asyncio` / `math`），不需要 `pip install` 任何东西。
 
-数据按机器人实例隔离，目录为 `data/plugin_data/astrbot_plugin_jitrl/robots/<robot-hash>/`；其中分别保存 V0.1 记忆库、检查点、导出文件和 Neural Lens 数据。实例键由 AstrBot 平台实例 ID 与机器人 `self_id` 计算。升级时，旧共享 `memory.sqlite3`、检查点和导出会迁移给第一个触发插件的机器人实例，其他机器人从独立空库开始。若目标实例已有同名数据，旧文件会留在原路径并记录日志，避免覆盖现有数据或让后续机器人误领。
+数据按机器人实例隔离，目录为 `data/plugin_data/astrbot_plugin_jitrl/robots/<robot-hash>/`；其中分别保存 V0.1 记忆库、检查点、导出文件和 Neural Lens 数据。实例键只由 AstrBot 平台实例 ID 计算；`self_id` 仅写入 `robot.json` 作为排查元数据（QQ 官方机器人等适配器会按消息内容改变 `self_id`，不能作为实例身份）。从使用 `platform_id:self_id` 键的旧版本（0.1.3 与 0.2.1 初版）升级时，旧的 `robots/<platform_id:self_id>/` 目录会在插件启动时合并：数据最丰富的目录提升为规范目录，其余归档到 `robots/.legacy/<robot-hash>/`，并在首次使用时按 episode 幂等合并 V0.1 经验；检查点、导出与 Neural Lens 权重保留在提升后的目录；若规范目录还没有神经数据，会采纳归档目录中数据量最大、写入最新的 Neural Lens 存储。归档数据不会删除。旧共享 `memory.sqlite3`、检查点和导出仍迁移给第一个触发插件的机器人实例；若目标实例已有同名数据，旧文件会留在原路径并记录日志。
 
 ---
 

@@ -2,7 +2,7 @@
 
 - For routine features and fixes, increment only the patch (last) version number.
 - Increment the middle version number only for large architectural improvements.
-- This branch targets patch release `0.2.1` on the `0.2.0` architecture; keep neural and MiTA work under `0.2.1` until the user explicitly requests another version. Its V0.1 compatibility baseline is `0.1.3`; `0.1.2` added retrieval and checkpoint improvements, `0.1.1` was re-released with market fixes, and `0.1.0` was the first public version.
+- This branch targets patch release `0.2.1` on the `0.2.0` architecture; keep neural and MiTA work under `0.2.1` until the user explicitly requests another version. `0.1.3` and the original `0.2.1` build introduced robot-instance isolation with a `platform_id:self_id` key; the re-released `0.2.1` fixes the key to the platform instance alone and consolidates the legacy directories. Its V0.1 compatibility baseline is `0.1.3`; `0.1.2` added retrieval and checkpoint improvements, `0.1.1` was re-released with market fixes, and `0.1.0` was the first public version.
 - Keep V0.2 neural work on `v0.2.0-neural-lens`; do not merge it into the V0.1 line without an explicit request.
 - Neural training is optional and scope-isolated. Preserve exact historical retrieval snapshots, exclude pending rewards from supervised targets, and never claim local candidate scores are remote logits or causal uplift.
 - The default neural backbone uses actual MiTA in all four token-attention blocks. Keep landmark compression, reusable top-k KV experts and jointly normalized routing intact; GQA/hybrid/legacy are explicit comparisons, not silent substitutions.

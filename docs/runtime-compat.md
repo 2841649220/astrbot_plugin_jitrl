@@ -77,12 +77,94 @@ cannot be settled from the source alone.
 | 30 | Bridge endpoint → URL mapping `/api/v1/plugins/extensions/{pluginName}/{endpoint}` and envelope handling (`{status:"error"}` ⇒ reject, otherwise `data?.data ?? data`) — [dashboard/src/views/PluginViewPage.vue:122](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/dashboard/src/views/PluginViewPage.vue#L122), [:382](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/dashboard/src/views/PluginViewPage.vue#L382) *(identical on master)* | `app.js:329` `apiGet("overview")`, `:337` `curve`, `:338` `actions`, `:339` `episodes`, `:340` `checkpoints`, `:285` `checkpoint`, `:314` `rollback`/`checkpoint_delete`, `:388` `forget`, `:354` `export` | **OK** | — (endpoints are plugin-relative and match the registered `/astrbot_plugin_jitrl/*` routes; `json_response` payloads arrive verbatim because they carry no `data` key) |
 | 31 | `from astrbot.api import logger` — `_PluginContextLogger` routes to the calling plugin's logger — [api/__init__.py:1](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/api/__init__.py#L1) *(identical on master)* | `main.py:43`, `jitrl/memory.py:27`, `jitrl/evaluator.py:45`, `jitrl/checkpoints.py:19`, `jitrl/reranker.py:25`; no stdlib `logging` anywhere in shipped sources (enforced by `tests/test_manifest.py:170`) | **OK** | — |
 | 32 | `astrbot_version` is parsed with `packaging.SpecifierSet` and must contain the running `VERSION` — [star_manager.py:674](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/star/star_manager.py#L674) | `metadata.yaml:6` `astrbot_version: ">=4.29,<5"` | **OK** | — (verified `4.29.0 ≤ v < 5`; `<5` is not vacuous because the dashboard/plugin-page contract is still evolving) |
-| 33 | `AstrMessageEvent.get_platform_id()` returns the unique platform-instance ID — [astr_message_event.py:1482](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/astr_message_event.py#L1482), [master:1696](https://github.com/AstrBotDevs/AstrBot/blob/master/astrbot/core/platform/astr_message_event.py#L1696) | `main.py:_robot_identity` combines this ID with `get_self_id()` | **OK** | — (source explicitly says multiple instances of the same adapter may run and their IDs are unique) |
-| 34 | `AstrMessageEvent.get_self_id()` returns the bot's own ID — [astr_message_event.py:1588](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/astr_message_event.py#L1588), [master:1802](https://github.com/AstrBotDevs/AstrBot/blob/master/astrbot/core/platform/astr_message_event.py#L1802) | `main.py:_robot_identity` incorporates this ID before hashing the robot key | **OK** | — (source returns the adapter message object's `self_id`) |
+| 33 | `AstrMessageEvent.get_platform_id()` returns the platform-instance ID (`self.platform_meta.id`) — [astr_message_event.py:133](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/astr_message_event.py#L133), [master:184](https://github.com/AstrBotDevs/AstrBot/blob/master/astrbot/core/platform/astr_message_event.py#L184) | `main.py:_robot_identity` keys the robot on this ID alone; `_robot_key` hashes it into `robots/<hash>` | **OK** | — (docstring: several adapters of the same type may run at once and "ID 是唯一的"; the value is the platform entry's unique `id` — every bundled adapter's `meta().id` is `config["id"]` — [platform_metadata.py:10](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/platform_metadata.py#L10)) |
+| 34 | `AstrMessageEvent.get_self_id()` returns `getattr(self.message_obj, "self_id", "")` — [astr_message_event.py:199](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/astr_message_event.py#L199), [master:250](https://github.com/AstrBotDevs/AstrBot/blob/master/astrbot/core/platform/astr_message_event.py#L250) | `main.py` records it in the robot's `robot.json` as display/diagnostic metadata; it no longer contributes to the robot key | **OK** | — (the accessor exists and returns `str`, but the value is adapter-defined and is **not** a stable bot identity — `qq_official` derives it from message content; see the V0.2.1 delta note) |
 
 **No MISMATCH and no UNVERIFIED row.**
 
-V0.2.1 delta: rows 33–34 were checked after adding robot-instance isolation. The pinned v4.29.0 API and current upstream `master` both expose these methods.
+V0.2.1 delta (2026-10-27 re-release): rows 33–34 were revised when the robot-isolation key
+changed from `platform_id:self_id` (the 0.1.3 and original 0.2.1 behavior) to the AstrBot
+platform instance ID alone. The pinned v4.29.0
+API and current upstream `master` both expose the two accessors, but the earlier
+`#L1482`/`#L1588`/`#L1696`/`#L1802` anchors matched neither tree (the file is 535
+lines in v4.29.0 and 599 on `master`); the anchors above are the real ones. The same
+code was confirmed in the AstrBot 4.29.3 checkout installed on this machine
+(`D:\AstrBot\astrbot\__init__.py` → `4.29.3`; the "no installation on this machine"
+note in §0 predates that install), but the tree does not sit at the same line for every
+file (`tg_adapter.py`, for example, is at `:571` there and `:561` in v4.29.0), so the
+links here stay pinned to the tag.
+
+**`get_self_id()` is not a bot identity.** `AstrBotMessage.self_id` is only declared, never
+initialised by the host ([astrbot_message.py:57](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/astrbot_message.py#L57); `__init__` sets no default), so each adapter
+decides what to put there and `get_self_id()` is a bare `getattr`
+([astr_message_event.py:199](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/astr_message_event.py#L199)). `qq_official` derives the value from message
+content, so one bot instance presents as several robots: the first bot mention's id, or the
+literal `qq_official`, for group messages
+([:876](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/sources/qqofficial/qqofficial_platform_adapter.py#L876)),
+the literal `unknown_selfid` for C2C messages
+([:890](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/sources/qqofficial/qqofficial_platform_adapter.py#L890)),
+`str(message.mentions[0].id)` for guild messages — the *first* mention, which is not
+necessarily the bot
+([:903](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/sources/qqofficial/qqofficial_platform_adapter.py#L903)),
+and the `qq_official` fallback
+([:937](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/sources/qqofficial/qqofficial_platform_adapter.py#L937)).
+`qq_official_webhook` reuses the same `_parse_from_qqofficial` parser
+([qo_webhook_adapter.py:37](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/sources/qqofficial_webhook/qo_webhook_adapter.py#L37))
+and inherits all of it. Hashing `platform_id:self_id` therefore opened a new
+`robots/<hash>` directory for every message shape of a single bot; keying on the platform
+instance ID collapses those back into one robot.
+
+**The platform instance ID is the stable key.** It is `platform_meta.id`
+([:133](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/astr_message_event.py#L133)), i.e. the `id` field of the platform entry in the
+AstrBot config, documented as "平台的唯一标识符，用于配置中识别特定平台"
+([platform_metadata.py:10](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/platform_metadata.py#L10)).
+`PlatformManager` refuses to load a platform whose `id` is empty and rewrites `:`/`!`
+([manager.py:125–142](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/manager.py#L125)); the ID is persisted in the config, so it survives restarts,
+and the host itself keys conversation state on it
+([session_status_check/stage.py:37](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/pipeline/session_status_check/stage.py#L37)).
+Uniqueness is maintained by the config and the WebUI (a conflicting ID requires explicit
+confirmation) rather than generated cryptographically, and `weixin_oc` even uses
+`self.meta().id` as its `self_id`
+([weixin_oc_adapter.py:1558](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/sources/weixin_oc/weixin_oc_adapter.py#L1558)) — the host's own notion of
+"which bot" is the platform instance, not `self_id`.
+
+**Adapters disagree on what `self_id` means.** Some return a real bot account ID
+(`aiocqhttp` QQ number,
+[aiocqhttp_platform_adapter.py:146](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/sources/aiocqhttp/aiocqhttp_platform_adapter.py#L146);
+`discord` bot user id, `kook` `client.bot_id`, `mattermost`/`misskey`/`slack` self user
+id, `lark` bot `open_id`), some a human-readable name (`telegram` bot username,
+[tg_adapter.py:561](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/sources/telegram/tg_adapter.py#L561)
+— which changes if the account is renamed — and `wecom_ai_bot` `wecom_ai_bot_name`,
+[wecomai_adapter.py:529](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/sources/wecom_ai_bot/wecomai_adapter.py#L529)),
+and `webchat` the constant `"webchat"`. No adapter contract promises stability, which is
+why the plugin does not use it as a key.
+
+**Residual risk: adapters that multiplex bot accounts.** `aiocqhttp` accepts several OneBot
+reverse-WebSocket clients on one endpoint: the pinned `aiocqhttp` 1.4.4 registers every
+client under its `X-Self-ID` (`aiocqhttp/__init__.py:569–570`) and routes each action to
+the matching socket (`api_impl.py:131–139`), and AstrBot passes the event's `self_id` in
+the action payload ([aiocqhttp_message_event.py:103–105](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/sources/aiocqhttp/aiocqhttp_message_event.py#L103)). Likewise `satori` keeps the
+whole `logins` list from READY and takes `self_id` from each event's own `login`
+([satori_adapter.py:263](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/sources/satori/satori_adapter.py#L263),
+[:309](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/sources/satori/satori_adapter.py#L309),
+[:366](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/platform/sources/satori/satori_adapter.py#L366)).
+Two bot accounts behind one platform instance therefore share one `robots/<hash>`
+directory. That is the deliberate trade: the alternative splits **every** `qq_official`
+instance into several directories, which is the bug this delta fixes. The supported
+deployment is one platform entry per bot account, so each robot keeps its own directory;
+operators who multiplex accounts on one adapter instance should split the platform entries
+(AstrBot keys its own conversations by platform ID for the same reason).
+
+**Upgrade path for legacy directories (0.1.3/0.2.1).** Because those releases keyed directories as
+`sha256(platform_id:self_id)`, start-up consolidation groups every `robots/*/robot.json`
+by its recorded `platform_id`: the richest directory becomes the canonical
+platform-instance directory, the others are moved to
+`robots/.legacy/<canonical-key>/`, and their V0.1 episodes are merged into the canonical
+bank on first use. `MemoryBank.merge_json` deduplicates by episode ID, so an interrupted
+merge is retried safely; archived directories and their checkpoints, exports and Neural
+Lens weights are preserved, never deleted. If the canonical robot has no neural store,
+the archived store with the most data and newest write is adopted so a lens trained
+in a non-richest directory is not silently left behind.
 
 ## 2. Dispatch semantics verified in the host source (not just signatures)
 

@@ -992,37 +992,11 @@ class MemoryBank:
                 for item in episodes:
                     if not isinstance(item, Mapping):
                         continue
-                    episode_id = str(item.get("episode_id") or "")
-                    if not episode_id:
+                    row = self._episode_row_from_json(item)
+                    if row is None:
                         continue
-                    meta = item.get("meta")
-                    meta_json = (
-                        json.dumps(
-                            meta, ensure_ascii=False, sort_keys=True, default=str
-                        )
-                        if isinstance(meta, Mapping)
-                        else "{}"
-                    )
-                    success = item.get("success")
-                    conn.execute(
-                        "DELETE FROM episodes WHERE episode_id = ?", (episode_id,)
-                    )
-                    conn.execute(
-                        _INSERT_EPISODE_SQL,
-                        (
-                            episode_id,
-                            str(item.get("scope") or ""),
-                            str(item.get("task_family") or ""),
-                            redact(str(item.get("user_text") or ""))
-                            if self.redact_secrets
-                            else str(item.get("user_text") or ""),
-                            None if success is None else int(bool(success)),
-                            _as_float(item.get("created_at"), time.time()),
-                            _as_float(item.get("gamma"), _DEFAULT_GAMMA),
-                            str(item.get("reward_source") or ""),
-                            meta_json,
-                        ),
-                    )
+                    conn.execute("DELETE FROM episodes WHERE episode_id = ?", (row[0],))
+                    conn.execute(_INSERT_EPISODE_SQL, row)
                 for item in experiences:
                     if not isinstance(item, Mapping):
                         continue
@@ -1039,6 +1013,120 @@ class MemoryBank:
                     pass
                 raise
             if imported:
+                self._row_count = None
+                self._invalidate_index_locked()
+        return imported
+
+    def _episode_row_from_json(self, item: Mapping[str, Any]) -> tuple[Any, ...] | None:
+        """Flatten one exported episode mapping into an insert tuple.
+
+        Args:
+            item: Mapping with the exported episode fields.
+
+        Returns:
+            A 9-element row tuple, or None when the row has no episode ID.
+        """
+        episode_id = str(item.get("episode_id") or "")
+        if not episode_id:
+            return None
+        meta = item.get("meta")
+        meta_json = (
+            json.dumps(meta, ensure_ascii=False, sort_keys=True, default=str)
+            if isinstance(meta, Mapping)
+            else "{}"
+        )
+        success = item.get("success")
+        user_text = str(item.get("user_text") or "")
+        if self.redact_secrets:
+            user_text = redact(user_text)
+        return (
+            episode_id,
+            str(item.get("scope") or ""),
+            str(item.get("task_family") or ""),
+            user_text,
+            None if success is None else int(bool(success)),
+            _as_float(item.get("created_at"), time.time()),
+            _as_float(item.get("gamma"), _DEFAULT_GAMMA),
+            str(item.get("reward_source") or ""),
+            meta_json,
+        )
+
+    async def merge_json(self, data: Mapping[str, Any]) -> int:
+        """Merge an export payload without duplicating known episodes.
+
+        Unlike import_json(), which appends every exported experience row, this
+        method treats episode_id as the unit of identity: episodes already
+        present in the bank are left untouched and their experience rows are
+        skipped. It is therefore safe to retry a partially completed migration
+        (for example after a crash between the import and its bookkeeping).
+
+        Args:
+            data: Mapping with "episodes" and "experiences" lists.
+
+        Returns:
+            The number of experience rows added.
+
+        Raises:
+            RuntimeError: When the bank is not initialized.
+        """
+        return await asyncio.to_thread(self._merge_sync, data)
+
+    def _merge_sync(self, data: Mapping[str, Any]) -> int:
+        """Merge an export payload inside one transaction (worker thread).
+
+        Args:
+            data: Mapping with "episodes" and "experiences" lists.
+
+        Returns:
+            The number of experience rows added.
+        """
+        if not isinstance(data, Mapping):
+            return 0
+        raw_episodes = data.get("episodes")
+        raw_experiences = data.get("experiences")
+        episodes = raw_episodes if isinstance(raw_episodes, list) else []
+        experiences = raw_experiences if isinstance(raw_experiences, list) else []
+        if not episodes and not experiences:
+            return 0
+        with self._lock:
+            conn = self._require_conn()
+            existing = {
+                str(row[0]) for row in conn.execute("SELECT episode_id FROM episodes")
+            }
+            added: set[str] = set()
+            imported = 0
+            try:
+                for item in episodes:
+                    if not isinstance(item, Mapping):
+                        continue
+                    row = self._episode_row_from_json(item)
+                    if row is None:
+                        continue
+                    episode_id = str(row[0])
+                    if episode_id in existing:
+                        continue
+                    conn.execute(_INSERT_EPISODE_SQL, row)
+                    existing.add(episode_id)
+                    added.add(episode_id)
+                for item in experiences:
+                    if not isinstance(item, Mapping):
+                        continue
+                    row = self._experience_row_from_json(item)
+                    if row is None:
+                        continue
+                    episode_id = str(row[0])
+                    if episode_id in existing and episode_id not in added:
+                        continue
+                    conn.execute(_INSERT_EXPERIENCE_SQL, row)
+                    imported += 1
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+            if imported or added:
                 self._row_count = None
                 self._invalidate_index_locked()
         return imported
@@ -1586,13 +1674,15 @@ class MemoryBank:
         return episodes
 
     async def export_json(
-        self, *, scope: str | None = None, limit: int = 100000
+        self, *, scope: str | None = None, limit: int | None = 100000
     ) -> dict:
         """Export stored memory as a JSON-safe mapping.
 
         Args:
             scope: Optional scope filter.
-            limit: Maximum number of rows exported per table.
+            limit: Maximum number of rows exported per table; None exports
+                every row. Migration uses None so a large archive can never be
+                silently truncated before it is marked as merged.
 
         Returns:
             A mapping with "version", "exported_at", "episodes" and
@@ -1603,32 +1693,35 @@ class MemoryBank:
         """
         return await asyncio.to_thread(self._export_sync, scope, limit)
 
-    def _export_sync(self, scope: str | None, limit: int) -> dict:
+    def _export_sync(self, scope: str | None, limit: int | None) -> dict:
         """Read both tables for export (worker thread).
 
         Args:
             scope: Optional scope filter.
-            limit: Maximum number of rows per table.
+            limit: Maximum number of rows per table; None means unlimited.
 
         Returns:
             The export payload.
         """
-        max_rows = max(1, _as_int(limit, 100000))
+        max_rows = None if limit is None else max(1, _as_int(limit, 100000))
         where = ""
         params: list[Any] = []
         if scope is not None:
             where = " WHERE scope = ?"
             params.append(str(scope))
+        row_limit = "" if max_rows is None else " LIMIT ?"
+        row_params: list[Any] = [] if max_rows is None else [max_rows]
         with self._lock:
             conn = self._require_conn()
             episode_rows = conn.execute(
                 f"SELECT {_EPISODE_COLUMNS} FROM episodes{where}"
-                " ORDER BY created_at ASC, id ASC LIMIT ?",
-                [*params, max_rows],
+                f" ORDER BY created_at ASC, id ASC{row_limit}",
+                [*params, *row_params],
             ).fetchall()
             experience_rows = conn.execute(
-                f"{_SELECT_EXPERIENCE_SQL}{where} ORDER BY created_at ASC, id ASC LIMIT ?",
-                [*params, max_rows],
+                f"{_SELECT_EXPERIENCE_SQL}{where} ORDER BY created_at ASC, id ASC"
+                f"{row_limit}",
+                [*params, *row_params],
             ).fetchall()
 
         episodes: list[dict] = []

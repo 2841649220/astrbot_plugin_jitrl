@@ -7,9 +7,11 @@ tests exercise plugin behaviour and races on every CI run, using the real bank.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
 import json
 import logging
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -319,7 +321,7 @@ async def test_web_checkpoint_restore_and_delete_flow(host, plugin):
 
 async def test_robot_instances_use_independent_banks_stats_and_feedback(plugin):
     first = Event(platform_id="platform-a", self_id="bot-a")
-    second = Event(platform_id="platform-a", self_id="bot-b")
+    second = Event(platform_id="platform-b", self_id="bot-a")
     first_bank = await plugin._ensure_ready(first)
     await _seed(first_bank, "trusted task", "search", 2.0)
     first_key = plugin._robot_key_for_event(first)
@@ -354,7 +356,7 @@ async def test_concurrent_robot_requests_keep_their_context_across_awaits(
     plugin, monkeypatch
 ):
     first = Event(platform_id="platform-a", self_id="bot-a")
-    second = Event(platform_id="platform-a", self_id="bot-b")
+    second = Event(platform_id="platform-b", self_id="bot-a")
     await plugin._ensure_ready(first)
     await plugin._ensure_ready(second)
     paths = {
@@ -473,7 +475,7 @@ async def test_legacy_database_migration_resumes_after_sidecar_move(plugin):
 
 async def test_web_robot_selection_prevents_cross_instance_management(host, plugin):
     first = Event(platform_id="platform-a", self_id="bot-a")
-    second = Event(platform_id="platform-a", self_id="bot-b")
+    second = Event(platform_id="platform-b", self_id="bot-a")
     first_bank = await plugin._ensure_ready(first)
     second_bank = await plugin._ensure_ready(second)
     await _seed(first_bank, "trusted task", "search", 1.0)
@@ -503,6 +505,350 @@ async def test_web_robot_selection_prevents_cross_instance_management(host, plug
     assert forgotten.payload["removed"] == 1
     assert await first_bank.count() == 0
     assert await second_bank.count() == 1
+
+
+async def test_one_platform_instance_is_one_robot_although_self_id_varies(plugin):
+    """qq_official changes self_id per message shape; the robot must not."""
+    self_ids = [
+        "qq_official",
+        "unknown_selfid",
+        "C3DC36F1480C2129659672A89D9D04FD",
+        "",
+    ]
+    events = [Event(platform_id="爱弥斯", self_id=self_id) for self_id in self_ids]
+    keys = {plugin._robot_key_for_event(event) for event in events}
+    assert len(keys) == 1
+    for event in events:
+        await plugin._ensure_ready(event)
+
+    robot_key = keys.pop()
+    robots = {row["id"]: row for row in plugin._known_robots()}
+    assert robot_key in robots
+    assert robots[robot_key]["label"] == "test · 爱弥斯"
+    assert robots[robot_key]["platform_id"] == "爱弥斯"
+    assert robots[robot_key]["self_id"] == self_ids[-2]
+
+    metadata = json.loads(
+        (plugin._robot_dir(robot_key) / "robot.json").read_text(encoding="utf-8")
+    )
+    assert metadata["identity"] == "platform:爱弥斯"
+    assert metadata["self_id"] == self_ids[-2], "an empty self_id must not erase it"
+    assert await plugin._bank.count() == 0
+
+
+async def test_missing_platform_id_falls_back_without_self_id(plugin):
+    """A degenerate adapter id falls back to the adapter type, not self_id."""
+    anonymous = Event(platform_id="", self_id="bot-x")
+    other = Event(platform_id="", self_id="bot-y")
+    assert plugin._robot_key_for_event(anonymous) == plugin._robot_key("adapter:test")
+    assert plugin._robot_key_for_event(other) == plugin._robot_key("adapter:test")
+
+
+async def test_robot_richness_reads_db_paths_containing_hash(host, tmp_path):
+    """URI quoting must not let a '#' in the data path skew promotion."""
+    directory = tmp_path / "hash#dir"
+    directory.mkdir()
+    bank = MemoryBank(
+        directory / "memory.sqlite3",
+        checkpoint_dir=directory / "checkpoints",
+        checkpoint_interval=0,
+    )
+    await bank.initialize()
+    await _seed(bank, "hash path", "search", 1.0)
+    await bank.close()
+    rows, size, has_neural, _modified = host.module.JitRLLearner._robot_richness(
+        directory
+    )
+    assert rows == 1
+    assert size > 0
+    assert has_neural == 0
+
+
+async def test_known_robots_ignores_hidden_corrupt_and_metadata_free_dirs(plugin):
+    """Only real robot directories may appear in the dashboard selector."""
+    robots_root = plugin._data_root / "robots"
+    hidden = robots_root / ".legacy" / "archived"
+    hidden.mkdir(parents=True)
+    (hidden / "robot.json").write_text("{}", encoding="utf-8")
+    corrupt = robots_root / "corrupt"
+    corrupt.mkdir()
+    (corrupt / "robot.json").write_text("{not json", encoding="utf-8")
+    metadata_free = robots_root / "no-metadata"
+    metadata_free.mkdir()
+    identity_free = robots_root / "solo-copy"
+    identity_free.mkdir()
+    (identity_free / "robot.json").write_text('{"self_id": "solo"}', encoding="utf-8")
+
+    robots = {row["id"]: row for row in plugin._known_robots()}
+    assert plugin._robot_key_for_event(Event()) in robots
+    assert "corrupt" not in robots
+    assert "no-metadata" not in robots
+    assert ".legacy" not in robots
+    assert robots["solo-copy"]["label"] == "unrecognized · solo-copy"
+
+
+async def test_legacy_per_self_id_directories_are_consolidated_and_merged(host):
+    """Legacy platform_id:self_id dirs for one instance become one merged bank."""
+    data_root = (
+        Path(host.module.get_astrbot_plugin_data_path()) / "astrbot_plugin_jitrl"
+    )
+    robots_root = data_root / "robots"
+    platform_id = "爱弥斯"
+    self_ids = ("qq_official", "unknown_selfid", "C3DC36F1480C2129659672A89D9D04FD")
+    for index, self_id in enumerate(self_ids):
+        legacy_key = hashlib.sha256(f"{platform_id}:{self_id}".encode()).hexdigest()
+        directory = robots_root / legacy_key
+        directory.mkdir(parents=True)
+        (directory / "robot.json").write_text(
+            json.dumps(
+                {
+                    "platform_id": platform_id,
+                    "platform_name": "qq_official",
+                    "self_id": self_id,
+                    "label": f"qq_official · {self_id}",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        bank = MemoryBank(
+            directory / "memory.sqlite3",
+            checkpoint_dir=directory / "checkpoints",
+            checkpoint_interval=0,
+        )
+        await bank.initialize()
+        await _seed(
+            bank, f"task {index}", f"tool-{index}", float(index + 1), scope=f"s{index}"
+        )
+        await bank.close()
+
+    instance = host.module.JitRLLearner(
+        SimpleNamespace(register_web_api=lambda *args: None),
+        {"memory": {"checkpoint_interval": 0}},
+    )
+    try:
+        canonical_key = instance._robot_key_for_event(
+            Event(platform_id=platform_id, self_id=self_ids[0])
+        )
+        canonical_dir = robots_root / canonical_key
+        assert canonical_dir.is_dir()
+        assert (canonical_dir / "robot.json").is_file()
+        assert [row["id"] for row in instance._known_robots()] == [canonical_key]
+
+        bank = await instance._ensure_ready(
+            Event(platform_id=platform_id, self_id=self_ids[1])
+        )
+        assert await bank.count() == len(self_ids)
+        payload = await bank.export_json()
+        assert {row["episode_id"] for row in payload["experiences"]} == {
+            row["episode_id"] for row in payload["episodes"]
+        }
+        assert len(payload["episodes"]) == len(self_ids)
+
+        archive_root = robots_root / ".legacy" / canonical_key
+        archived = sorted(path for path in archive_root.iterdir() if path.is_dir())
+        assert len(archived) == len(self_ids) - 1
+        assert all((path / "memory.sqlite3.merged").is_file() for path in archived)
+
+        retry = host.module.JitRLLearner(
+            SimpleNamespace(register_web_api=lambda *args: None),
+            {"memory": {"checkpoint_interval": 0}},
+        )
+        try:
+            again = await retry._ensure_ready(
+                Event(platform_id=platform_id, self_id=self_ids[2])
+            )
+            assert await again.count() == len(self_ids)
+            assert len(await again.recent_episodes(limit=10)) == len(self_ids)
+        finally:
+            await retry.terminate()
+    finally:
+        await instance.terminate()
+
+
+async def test_archived_neural_store_is_adopted_when_canonical_has_none(host):
+    """A lens trained in a non-richest legacy dir must not disappear."""
+    data_root = (
+        Path(host.module.get_astrbot_plugin_data_path()) / "astrbot_plugin_jitrl"
+    )
+    robots_root = data_root / "robots"
+    platform_id = "爱弥斯"
+    legacy_keys = {}
+    for index, (self_id, episodes, has_neural) in enumerate(
+        (("rich", 2, False), ("with-lens", 1, True))
+    ):
+        legacy_key = hashlib.sha256(f"{platform_id}:{self_id}".encode()).hexdigest()
+        legacy_keys[self_id] = legacy_key
+        directory = robots_root / legacy_key
+        directory.mkdir(parents=True)
+        (directory / "robot.json").write_text(
+            json.dumps(
+                {
+                    "platform_id": platform_id,
+                    "platform_name": "qq_official",
+                    "self_id": self_id,
+                    "label": f"qq_official · {self_id}",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        bank = MemoryBank(
+            directory / "memory.sqlite3",
+            checkpoint_dir=directory / "checkpoints",
+            checkpoint_interval=0,
+        )
+        await bank.initialize()
+        for step in range(episodes):
+            await _seed(bank, f"task {index}-{step}", f"tool-{step}", 1.0)
+        await bank.close()
+        if has_neural:
+            neural = directory / "neural"
+            neural.mkdir()
+            (neural / "neural.sqlite3").write_bytes(b"trained lens")
+
+    instance = host.module.JitRLLearner(
+        SimpleNamespace(register_web_api=lambda *args: None),
+        {"memory": {"checkpoint_interval": 0}},
+    )
+    try:
+        canonical_key = instance._robot_key_for_event(
+            Event(platform_id=platform_id, self_id="rich")
+        )
+        canonical_dir = robots_root / canonical_key
+        assert (canonical_dir / "neural").exists() is False
+        bank = await instance._ensure_ready(Event(platform_id=platform_id))
+        assert await bank.count() == 3
+        adopted = canonical_dir / "neural" / "neural.sqlite3"
+        assert adopted.read_bytes() == b"trained lens"
+        archived_lens = (
+            robots_root / ".legacy" / canonical_key / legacy_keys["with-lens"]
+        )
+        assert not (archived_lens / "neural").exists()
+    finally:
+        await instance.terminate()
+
+
+async def test_newest_archived_neural_store_is_adopted(host):
+    """Two archived lenses: the largest/newest store wins, not name order."""
+    data_root = (
+        Path(host.module.get_astrbot_plugin_data_path()) / "astrbot_plugin_jitrl"
+    )
+    robots_root = data_root / "robots"
+    platform_id = "爱弥斯"
+    specs = (
+        ("rich", 2, None),
+        ("old-lens", 1, (b"old lens", 1_600_000_000)),
+        ("new-lens", 1, (b"new lens", 1_700_000_000)),
+    )
+    legacy_keys = {}
+    for index, (self_id, episodes, lens) in enumerate(specs):
+        legacy_key = hashlib.sha256(f"{platform_id}:{self_id}".encode()).hexdigest()
+        legacy_keys[self_id] = legacy_key
+        directory = robots_root / legacy_key
+        directory.mkdir(parents=True)
+        (directory / "robot.json").write_text(
+            json.dumps(
+                {
+                    "platform_id": platform_id,
+                    "platform_name": "qq_official",
+                    "self_id": self_id,
+                    "label": f"qq_official · {self_id}",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        bank = MemoryBank(
+            directory / "memory.sqlite3",
+            checkpoint_dir=directory / "checkpoints",
+            checkpoint_interval=0,
+        )
+        await bank.initialize()
+        for step in range(episodes):
+            await _seed(bank, f"task {index}-{step}", f"tool-{step}", 1.0)
+        await bank.close()
+        if lens is not None:
+            payload, modified = lens
+            neural = directory / "neural"
+            neural.mkdir()
+            store = neural / "neural.sqlite3"
+            store.write_bytes(payload)
+            os.utime(store, (modified, modified))
+
+    instance = host.module.JitRLLearner(
+        SimpleNamespace(register_web_api=lambda *args: None),
+        {"memory": {"checkpoint_interval": 0}},
+    )
+    try:
+        canonical_key = instance._robot_key_for_event(
+            Event(platform_id=platform_id, self_id="rich")
+        )
+        bank = await instance._ensure_ready(Event(platform_id=platform_id))
+        assert await bank.count() == 4
+        canonical_lens = robots_root / canonical_key / "neural" / "neural.sqlite3"
+        assert canonical_lens.read_bytes() == b"new lens"
+
+        archive_root = robots_root / ".legacy" / canonical_key
+        old_archive = archive_root / legacy_keys["old-lens"]
+        new_archive = archive_root / legacy_keys["new-lens"]
+        assert (old_archive / "neural" / "neural.sqlite3").read_bytes() == b"old lens"
+        assert not (new_archive / "neural").exists()
+    finally:
+        await instance.terminate()
+
+
+async def test_legacy_dirs_without_platform_id_are_merged_by_adapter(host):
+    """Degenerate adapters without an ID are consolidated by adapter type."""
+    data_root = (
+        Path(host.module.get_astrbot_plugin_data_path()) / "astrbot_plugin_jitrl"
+    )
+    robots_root = data_root / "robots"
+    for index, self_id in enumerate(("s1", "s2")):
+        legacy_key = hashlib.sha256(f":{self_id}".encode()).hexdigest()
+        directory = robots_root / legacy_key
+        directory.mkdir(parents=True)
+        (directory / "robot.json").write_text(
+            json.dumps(
+                {
+                    "platform_id": "",
+                    "platform_name": "test",
+                    "self_id": self_id,
+                    "label": f"test · {self_id}",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        bank = MemoryBank(
+            directory / "memory.sqlite3",
+            checkpoint_dir=directory / "checkpoints",
+            checkpoint_interval=0,
+        )
+        await bank.initialize()
+        await _seed(bank, f"task {index}", f"tool-{index}", 1.0, scope=self_id)
+        await bank.close()
+
+    instance = host.module.JitRLLearner(
+        SimpleNamespace(register_web_api=lambda *args: None),
+        {"memory": {"checkpoint_interval": 0}},
+    )
+    try:
+        canonical_key = instance._robot_key("adapter:test")
+        assert (robots_root / canonical_key).is_dir()
+        bank = await instance._ensure_ready(Event(platform_id="", self_id="s3"))
+        assert await bank.count() == 2
+        robots = instance._known_robots()
+        assert [row["id"] for row in robots] == [canonical_key]
+        assert robots[0]["identity"] == "adapter:test"
+        assert robots[0]["label"] == "test · s3"
+
+        archive_root = robots_root / ".legacy" / canonical_key
+        archived = [path for path in archive_root.iterdir() if path.is_dir()]
+        assert len(archived) == 1
+        assert (archived[0] / "memory.sqlite3.merged").is_file()
+    finally:
+        await instance.terminate()
 
 
 @pytest.mark.parametrize("confirm", [None, False, "true", 1])
