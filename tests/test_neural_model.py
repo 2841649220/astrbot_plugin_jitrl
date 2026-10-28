@@ -86,6 +86,40 @@ def records():
     return state, snapshot
 
 
+def test_shared_feature_interning_preserves_row_specific_snapshots(cfg, monkeypatch):
+    import jitrl.neural.model as module
+
+    state, snapshot = records()
+    memory = snapshot.memories[0]
+    revised = replace(
+        snapshot, memories=(replace(memory, return_g=-3, reliability=0.25),)
+    )
+    original = module.frozen_embedding
+    calls = []
+
+    def track(text, dimension):
+        calls.append(text)
+        return original(text, dimension)
+
+    monkeypatch.setattr(module, "frozen_embedding", track)
+    batch = make_batch(
+        [state, state],
+        [snapshot, revised],
+        [["tool:search"], ["tool:search"]],
+        ["NO_OP", "SELECT_EVIDENCE"],
+        cfg,
+    )
+    assert len(calls) == len(set(calls))
+    assert torch.equal(batch["memory_states"][0], batch["memory_states"][1])
+    assert batch["memory_meta"][0, 0, 0] == memory.return_g / cfg.return_scale
+    assert batch["memory_meta"][1, 0, 0] == -3 / cfg.return_scale
+    assert batch["memory_meta"][1, 0, 1] == 0.25
+    assert batch["pre_index"].tolist() == [0, 1]
+    batch["state"].fill_(999)
+    fresh = make_batch([state], [snapshot], [["tool:search"]], ["NO_OP"], cfg)
+    assert torch.isfinite(fresh["state"]).all() and fresh["state"].abs().max() <= 1
+
+
 def test_deterministic_initialization_preserves_host_rng(cfg):
     torch.manual_seed(123)
     original = torch.get_rng_state().clone()

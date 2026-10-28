@@ -1,0 +1,80 @@
+{
+  "reference": "v0.2.2",
+  "torch": "2.8.0+cu128",
+  "encoding_cases": [
+    {
+      "dtype": "torch.float32",
+      "rows": [
+        0
+      ],
+      "all_fields_byte_identical": true
+    },
+    {
+      "dtype": "torch.float32",
+      "rows": [
+        3
+      ],
+      "all_fields_byte_identical": true
+    },
+    {
+      "dtype": "torch.float32",
+      "rows": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "all_fields_byte_identical": true
+    },
+    {
+      "dtype": "torch.float64",
+      "rows": [
+        0
+      ],
+      "all_fields_byte_identical": true
+    },
+    {
+      "dtype": "torch.float64",
+      "rows": [
+        3
+      ],
+      "all_fields_byte_identical": true
+    },
+    {
+      "dtype": "torch.float64",
+      "rows": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "all_fields_byte_identical": true
+    }
+  ],
+  "outputs": [
+    {
+      "device": "cpu",
+      "max_abs_output_error": 0.0,
+      "reference_state_dict_loads_strictly": true,
+      "attention": {
+        "backend": "mita",
+        "mita_layers": 4,
+        "gqa_layers": 0,
+        "total_attention_layers": 4
+      }
+    },
+    {
+      "device": "cuda",
+      "max_abs_output_error": 4.76837158203125e-07,
+      "reference_state_dict_loads_strictly": true,
+      "attention": {
+        "backend": "mita",
+        "mita_layers": 4,
+        "gqa_layers": 0,
+        "total_attention_layers": 4
+      }
+    }
+  ],
+  "mita_kernel_sources_unchanged": true,
+  "boundary": "identical historical inputs and checkpoint weights; retrieval/gating policies intentionally changed"
+}

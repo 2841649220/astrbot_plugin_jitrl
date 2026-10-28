@@ -132,6 +132,140 @@ def execute(
     return trace, experience
 
 
+@pytest.mark.parametrize("budget", [1, 3, 8])
+def test_overlapping_coarse_pools_fill_the_budget(store, cfg, budget):
+    cfg = replace(cfg, coarse_limit=budget, memory_tokens=budget, max_memory=budget)
+    experiences = [execute(store, f"past-{i}", at=10 + i)[1] for i in range(12)]
+    snapshot = store.retrieve(state(), cfg)
+    assert [memory.experience_id for memory in snapshot.memories] == sorted(
+        experiences
+    )[:budget]
+
+
+def test_retrieval_projection_preserves_complete_replay(store, cfg):
+    execute(store)
+    projected = store._settled_rows("scope-a", 100.0, 10, replay=False)[0]
+    assert "state_json" in projected.keys()
+    assert (
+        "snapshot_json" not in projected.keys() and "rendered" not in projected.keys()
+    )
+    original = store._settled_rows("scope-a", 100.0, 10)[0]
+    assert "snapshot_json" in original.keys() and "rendered" in original.keys()
+    assert store.replay("scope-a", cutoff=100.0)[0].decision.snapshot.memories == ()
+
+
+def test_feature_cache_is_bounded_scoped_and_never_caches_rewards(
+    store, cfg, monkeypatch
+):
+    import jitrl.neural.store as module
+
+    monkeypatch.setattr(module, "_FEATURE_CACHE_LIMIT", 2)
+    _, experience = execute(store, "old", at=10)
+    execute(store, "another", at=13)
+    execute(store, "third", at=16)
+    before = store.retrieve(state(at=40), cfg)
+    assert len(store._state_features) <= 2
+    assert store.settle(
+        experience,
+        reward=-2,
+        return_g=-2,
+        source="user",
+        expected_epoch=0,
+        settled_at=50,
+    )
+    after = store.retrieve(state(at=60), cfg)
+    assert (
+        next(
+            memory for memory in after.memories if memory.experience_id == experience
+        ).return_g
+        == -2
+    )
+    assert store.retrieve(state(at=40), cfg) == before
+    execute(store, "foreign", scope="scope-b")
+    store.retrieve(state(scope="scope-b"), cfg)
+    store.reset("scope-a")
+    assert store._state_features
+    assert all(key[0] == "scope-b" for key in store._state_features)
+    preserved = store.stats()
+    with pytest.raises(ValueError, match="nonempty scope"):
+        store.reset("")
+    assert store.stats() == preserved and store._state_features
+    store.reset()
+    assert not store._state_features
+
+
+def test_late_feature_worker_cannot_repopulate_a_reset_scope(store, cfg, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    execute(store)
+    started, release = threading.Event(), threading.Event()
+    original = store._retrieval_features
+
+    def delayed(*args):
+        started.set()
+        assert release.wait(10)
+        return original(*args)
+
+    monkeypatch.setattr(store, "_retrieval_features", delayed)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(store.retrieve, state(), cfg)
+        try:
+            assert started.wait(10)
+            store.reset("scope-a")
+        finally:
+            release.set()
+        pending.result(timeout=10)
+    assert not store._state_features
+
+
+def test_episode_weighting_does_not_turn_repeated_steps_into_more_votes(store, cfg):
+    from jitrl.neural.runtime import _episode_value
+
+    execute(store, "good")
+    execute(store, "bad")
+    memories = store.retrieve(state(), cfg).memories
+    good = replace(memories[0], return_g=3, reliability=1.0, similarity=1.0)
+    bad = replace(memories[1], return_g=-3, reliability=0.25, similarity=1.0)
+    reference = _episode_value([good, bad])
+    assert reference[0] == pytest.approx(1.8) and reference[1] == 2
+    repeated = [replace(good, experience_id=f"step-{i}") for i in range(100)]
+    assert _episode_value(repeated + [bad]) == pytest.approx(reference)
+    assert _episode_value([replace(good, reliability=0)]) == (0.0, 0)
+
+
+def test_live_replay_includes_just_committed_feedback_but_historical_cutoffs_stay_strict(
+    store, monkeypatch
+):
+    import jitrl.neural.store as module
+
+    trace, experience = execute(store, return_g=3)
+    monkeypatch.setattr(module.time, "time", lambda: 100.0)
+    assert (
+        store.apply_user_feedback(
+            scope="scope-a",
+            episode_id=trace.state.episode_id,
+            delta=-2,
+            gamma=0.5,
+            expected_epoch=0,
+        )
+        == 1
+    )
+    assert store.replay("scope-a")[0].return_g == 1
+    assert store.replay("scope-a", cutoff=100.0)[0].return_g == 3
+    assert store.replay("scope-a", cutoff=100.1)[0].return_g == 1
+    assert store.settle(
+        experience,
+        reward=2,
+        return_g=2,
+        source="user",
+        expected_epoch=0,
+        settled_at=101,
+        event_id="future-feedback",
+    )
+    assert store.replay("scope-a")[0].return_g == 1
+
+
 def test_pending_facts_never_enter_reward_retrieval_or_replay(store, cfg):
     _, experience = execute(store, settle=False)
     assert store.stats() == {"decisions": 1, "executions": 1, "settlements": 0}
@@ -979,6 +1113,104 @@ async def test_prepare_and_post_keep_checkpoint_snapshot_and_bound_adjustments(
         assert abs(scores[0].adjustment) <= cfg.max_adjustment
         assert scores[1].adjustment == 0 and scores[1].support == 0
         assert scores[2].adjustment == 0
+    finally:
+        await runtime.close()
+
+
+@needs_torch
+@pytest.mark.asyncio
+@pytest.mark.parametrize("correlated", [False, True])
+async def test_independent_episode_support_controls_pre_and_post(
+    tmp_path, cfg, monkeypatch, correlated
+):
+    import torch
+
+    runtime = LensRuntime(tmp_path, replace(cfg, min_support=3))
+    try:
+        seed_training(runtime)
+        current = state()
+        snapshot = runtime.store.retrieve(current, cfg)
+        if correlated:
+            snapshot = replace(
+                snapshot,
+                memories=tuple(
+                    replace(
+                        memory,
+                        state=replace(
+                            memory.state, episode_id="one-correlated-episode"
+                        ),
+                    )
+                    for memory in snapshot.memories
+                ),
+            )
+        monkeypatch.setattr(runtime.store, "retrieve", lambda *args: snapshot)
+        monkeypatch.setattr(
+            runtime, "_load_model", lambda *args, **kwargs: (object(), "trained")
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_forward",
+            lambda model, current, snapshot, actions, pre="NO_OP": {
+                "pre_uncertainty": torch.tensor([0.1]),
+                "relevance": torch.ones(1, len(snapshot.memories)) * 5,
+                "candidate_values": torch.ones(1, len(actions)) * 0.9,
+                "uncertainty": torch.ones(1, len(actions)) * 0.1,
+            },
+        )
+        trace, epoch = await runtime.prepare(current)
+        assert trace.intervention.kind == ("NO_OP" if correlated else "SELECT_EVIDENCE")
+        assert await runtime.commit(trace, epoch)
+        score = (
+            await runtime.score_candidates(
+                trace,
+                [CandidateSpec("candidate", "tool:search", "search", 0.2, "RANK_ONLY")],
+            )
+        )[0]
+        assert score.support == (1 if correlated else 4)
+        assert (score.adjustment == 0) is correlated
+    finally:
+        await runtime.close()
+
+
+@needs_torch
+@pytest.mark.asyncio
+async def test_pre_evidence_skips_unavailable_tools_and_repeated_episodes(
+    tmp_path, cfg, monkeypatch
+):
+    import torch
+
+    runtime = LensRuntime(tmp_path, cfg)
+    try:
+        seed_training(runtime)
+        current = state()
+        original = runtime.store.retrieve(current, cfg)
+        memories = list(original.memories)
+        memories[0] = replace(
+            memories[0], action_key="tool:removed", action_name="removed"
+        )
+        memories[2] = replace(
+            memories[2],
+            state=replace(memories[2].state, episode_id=memories[1].state.episode_id),
+        )
+        snapshot = replace(original, memories=tuple(memories))
+        monkeypatch.setattr(runtime.store, "retrieve", lambda *args: snapshot)
+        monkeypatch.setattr(
+            runtime, "_load_model", lambda *args, **kwargs: (object(), "trained")
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_forward",
+            lambda *args: {
+                "pre_uncertainty": torch.tensor([0.1]),
+                "relevance": torch.tensor([[9.0, 8.0, 7.0, 6.0]]),
+            },
+        )
+        trace, _ = await runtime.prepare(current)
+        assert trace.intervention.memory_ids == (
+            memories[1].experience_id,
+            memories[3].experience_id,
+        )
+        assert "removed" not in trace.rendered
     finally:
         await runtime.close()
 

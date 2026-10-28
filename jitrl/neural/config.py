@@ -18,7 +18,7 @@ class LensConfig:
     train_steps: int = 20
     batch_size: int = 16
     learning_rate: float = 0.0003
-    min_support: int = 3
+    min_support: int = 3  # Distinct settled episode IDs, rather than repeated steps.
     max_uncertainty: float = 0.5
     relevance_threshold: float = 0.6
     similarity_threshold: float = 0.25

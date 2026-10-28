@@ -1,5 +1,15 @@
 # JitRL 检索与估计基准（before / after）
 
+## V0.2.3 神经流水线
+
+`v023-pipeline-before.json` / `v023-pipeline-after.json` 比较神经库检索与固定输入编码：
+2048 条重复状态的热检索 p50 1990.73 → 132.60 ms；16 样本编码 2094.13 → 87.55 ms。
+另测了首次访问完全不同文本的冷路径，该场景没有显著加速。MiTA 内核保持原样。
+方法、候选数变化、缓存常驻成本和效果边界见
+[性能与证据记录](../docs/neural-pipeline-performance.md)。编码逐字段对照保存在
+`v023-encoder-equivalence.json`；CPU/CUDA 机械闭环分别在 `v023-neural-smoke-*.json`。
+
+
 ## V0.1.4 / V0.2.2 主线优化
 
 本次新增精确性与密集索引对照，完整方法和边界见

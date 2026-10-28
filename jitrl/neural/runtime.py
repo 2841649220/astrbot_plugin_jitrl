@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from .contracts import (
     CandidateSpec,
     Intervention,
     LensDecision,
+    MemoryRecord,
     RetrievalSnapshot,
     StateRecord,
 )
@@ -59,6 +61,35 @@ _ARCHITECTURE = (
 
 class IncompatibleArchitecture(ValueError):
     """Facts remain usable, but these parameters belong to another backbone."""
+
+
+def _episode_value(memories: Iterable[MemoryRecord]) -> tuple[float, int]:
+    """Kernel/source-weighted observations, with one mean per episode.
+
+    Repeated steps in one run are correlated evidence. They cannot manufacture
+    independent support or drown out other episodes by repeating one action.
+    """
+    groups: dict[str, tuple[float, float, int]] = {}
+    for memory in memories:
+        weight = memory.similarity * memory.reliability
+        if weight <= 0:
+            continue
+        mass, total, steps = groups.get(memory.state.episode_id, (0.0, 0.0, 0))
+        groups[memory.state.episode_id] = (
+            mass + weight,
+            total + weight * memory.return_g,
+            steps + 1,
+        )
+    count = len(groups)
+    # Mean mass per step retains source/kernel weighting across episodes;
+    # repeating an identical step cannot increase an episode's voting mass.
+    mass = sum(weight / steps for weight, _, steps in groups.values())
+    value = (
+        sum(total / steps for _, total, steps in groups.values()) / mass
+        if mass
+        else 0.0
+    )
+    return value, count
 
 
 def render_evidence(
@@ -275,13 +306,20 @@ class LensRuntime:
                     snapshot,
                     list(range(min(token_budget, len(snapshot.memories)))),
                 )
+            supported_episodes = {
+                memory.state.episode_id
+                for memory in snapshot.memories
+                if memory.reliability > 0
+                and memory.similarity > 0
+                and memory.action_name in state.allowed_actions
+            }
             if self.cfg.mode == "off":
                 pre = Intervention(reason="DISABLED_PURE_NO_OP")
             elif self.cfg.mode == "shadow":
                 pre = Intervention(reason="SHADOW_PURE_NO_OP")
             elif model is None:
                 pre = Intervention(reason="UNTRAINED")
-            elif len(snapshot.memories) < self.cfg.min_support:
+            elif len(supported_episodes) < self.cfg.min_support:
                 pre = Intervention(reason="LOW_SUPPORT")
             elif not self.cfg.pre_enabled:
                 pre = Intervention(reason="PRE_DISABLED")
@@ -292,12 +330,22 @@ class LensRuntime:
                     range(len(snapshot.memories)),
                     key=lambda i: (-relevance[i], snapshot.memories[i].experience_id),
                 )
-                selected = tuple(
-                    snapshot.memories[i].experience_id
-                    for i in order
-                    if relevance[i] >= self.cfg.relevance_threshold
-                    and snapshot.memories[i].reliability > 0
-                )[:2]
+                selected_ids = []
+                selected_episodes: set[str] = set()
+                for i in order:
+                    memory = snapshot.memories[i]
+                    if (
+                        relevance[i] >= self.cfg.relevance_threshold
+                        and memory.reliability > 0
+                        and memory.similarity > 0
+                        and memory.action_name in state.allowed_actions
+                        and memory.state.episode_id not in selected_episodes
+                    ):
+                        selected_ids.append(memory.experience_id)
+                        selected_episodes.add(memory.state.episode_id)
+                        if len(selected_ids) == 2:
+                            break
+                selected = tuple(selected_ids)
                 if selected and uncertainty <= self.cfg.max_uncertainty:
                     pre = Intervention(
                         "SELECT_EVIDENCE", selected, "OBSERVATIONAL_RELEVANCE_PROXY"
@@ -386,32 +434,31 @@ class LensRuntime:
                         decision.intervention.kind,
                     )
                     all_memories = decision.snapshot.memories
-                    baseline = (
-                        sum(m.return_g for m in all_memories)
-                        / max(1, len(all_memories))
-                        / self.cfg.return_scale
-                    )
+                    baseline, _ = _episode_value(all_memories)
+                    baseline /= self.cfg.return_scale
+                    groups: dict[tuple[str, str], list[MemoryRecord]] = {}
+                    for memory in all_memories:
+                        groups.setdefault(
+                            (memory.action_key, memory.action_name), []
+                        ).append(memory)
+                    action_values = {
+                        key: _episode_value(group) for key, group in groups.items()
+                    }
                     local = output["candidate_values"][0].tolist()
                     uncertainty = output["uncertainty"][0].tolist()
                     scores = []
                     for i, candidate in enumerate(candidates):
-                        support = [
-                            m
-                            for m in all_memories
-                            if m.action_key == candidate.action_key
-                        ]
+                        empirical, support = action_values.get(
+                            (candidate.action_key, candidate.action_name), (0.0, 0)
+                        )
                         adjustment = 0.0
                         code = "LOW_ACTION_SUPPORT"
                         if (
-                            len(support) >= self.cfg.min_support
+                            support >= self.cfg.min_support
                             and uncertainty[i] <= self.cfg.max_uncertainty
                             and candidate.provenance != "NONE"
                         ):
-                            empirical = (
-                                sum(m.return_g for m in support)
-                                / len(support)
-                                / self.cfg.return_scale
-                            )
+                            empirical /= self.cfg.return_scale
                             delta = 0.5 * (empirical - baseline) + 0.5 * (
                                 local[i] - baseline
                             )
@@ -426,7 +473,7 @@ class LensRuntime:
                                 adjustment,
                                 local[i],
                                 uncertainty[i],
-                                len(support),
+                                support,
                                 code,
                             )
                         )
@@ -440,6 +487,8 @@ class LensRuntime:
             {
                 "checkpoint_id": decision.checkpoint_id,
                 "snapshot_id": decision.snapshot.snapshot_id,
+                "support_unit": "distinct_episode",
+                "estimator": "episode-kernel-v1",
                 "scores": [asdict(score) for score in scores],
             },
         )

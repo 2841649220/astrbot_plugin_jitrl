@@ -544,9 +544,10 @@
         "default": 0.0003
       },
       "min_support": {
-        "description": "最少已结算邻居支持",
+        "description": "最少不同历史回合支持",
         "type": "int",
-        "default": 3
+        "default": 3,
+        "hint": "按具有正相似度与可靠度权重的独立 episode 计数；同一回合重复调用不会增加支持度。PRE 证据还要求对应动作当前可用。"
       },
       "max_uncertainty": {
         "description": "残差不确定性代理阈值",

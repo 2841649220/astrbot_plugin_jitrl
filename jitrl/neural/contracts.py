@@ -115,6 +115,8 @@ class CandidateSpec:
 
 @dataclass(frozen=True, slots=True)
 class CandidateScore:
+    """Support counts distinct settled episode IDs with positive kernel mass."""
+
     candidate: CandidateSpec
     adjustment: float
     local_value: float | None

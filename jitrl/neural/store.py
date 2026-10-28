@@ -11,6 +11,7 @@ import math
 import sqlite3
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,7 @@ from .contracts import (
     RetrievalSnapshot,
     StateRecord,
 )
-from .encoding import digest, state_embedding
+from .encoding import digest, state_embedding, state_feature_text
 
 SOURCE_RELIABILITY = {
     "environment": 1.0,
@@ -35,6 +36,8 @@ SOURCE_RELIABILITY = {
     "fused": 0.4,
     "heuristic": 0.25,
 }
+
+_FEATURE_CACHE_LIMIT = 4096
 
 
 def _json(value: Any) -> str:
@@ -86,6 +89,11 @@ class LensStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        # Pure frozen features only: settlements, rewards and snapshots are
+        # always read afresh. Scope and full immutable payload prevent aliases.
+        self._state_features: OrderedDict[
+            tuple[str, int, str], tuple[StateRecord, tuple[float, ...], frozenset[str]]
+        ] = OrderedDict()
         self._conn = sqlite3.connect(str(path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -124,6 +132,7 @@ class LensStore:
 
     def close(self) -> None:
         with self._lock:
+            self._state_features.clear()
             self._conn.close()
 
     def epoch(self, scope: str) -> int:
@@ -273,29 +282,76 @@ class LensStore:
             )
         return True
 
-    def _settled_rows(self, scope: str, cutoff: float, limit: int) -> list[sqlite3.Row]:
+    def _settled_rows(
+        self,
+        scope: str,
+        cutoff: float,
+        limit: int,
+        *,
+        replay: bool = True,
+        inclusive: bool = False,
+    ) -> list[sqlite3.Row]:
+        # Retrieval never consumes the historical snapshot/rendered block.
+        # Those large payloads remain mandatory for exact historical replay.
+        columns = "d.*" if replay else "d.state_json,d.intervention_json"
+        comparison = "<=" if inclusive else "<"
         return self._conn.execute(
-            """
-            SELECT x.experience_id,x.action_key,x.action_name,d.*,s.return_g,s.source,s.reliability,s.settled_at
+            f"""
+            SELECT x.experience_id,x.action_key,x.action_name,{columns},s.return_g,s.source,s.reliability,s.settled_at
             FROM executions x JOIN decisions d USING(decision_id)
             JOIN settlements s ON s.experience_id=x.experience_id
-            WHERE d.scope=? AND d.epoch=? AND d.created_at<? AND x.executed_at<?
-            AND s.settled_at<? AND s.valid=1 AND s.sequence=(
+            WHERE d.scope=? AND d.epoch=? AND d.created_at{comparison}? AND x.executed_at{comparison}?
+            AND s.settled_at{comparison}? AND s.valid=1 AND s.sequence=(
                 SELECT MAX(s2.sequence) FROM settlements s2
-                WHERE s2.experience_id=x.experience_id AND s2.settled_at<?)
+                WHERE s2.experience_id=x.experience_id AND s2.settled_at{comparison}?)
             ORDER BY s.settled_at DESC,x.experience_id LIMIT ?
         """,
             (scope, self.epoch(scope), cutoff, cutoff, cutoff, cutoff, limit),
         ).fetchall()
 
+    def _retrieval_features(
+        self,
+        scope: str,
+        payload: str,
+        dimension: int,
+        epoch: int,
+        vectors: dict[str, tuple[float, ...]],
+    ) -> tuple[StateRecord, tuple[float, ...], frozenset[str]]:
+        key = (scope, dimension, payload)
+        with self._lock:
+            cached = self._state_features.get(key)
+            if cached is not None:
+                self._state_features.move_to_end(key)
+                return cached
+        past = StateRecord.from_dict(json.loads(payload))
+        text = state_feature_text(past)
+        if text not in vectors:
+            vectors[text] = tuple(state_embedding(past, dimension))
+        result = (past, vectors[text], frozenset(past.events))
+        with self._lock:
+            # A reset may have occurred while hashing on another worker.
+            if self.epoch(scope) == epoch:
+                self._state_features[key] = result
+                self._state_features.move_to_end(key)
+                while len(self._state_features) > _FEATURE_CACHE_LIMIT:
+                    self._state_features.popitem(last=False)
+        return result
+
     def retrieve(self, state: StateRecord, cfg: LensConfig) -> RetrievalSnapshot:
         """Exact bounded lexical/structural coarse search; no ANN claim."""
         query = state_embedding(state, cfg.embedding_dim)
+        vectors = {state_feature_text(state): tuple(query)}
         with self._lock:
-            rows = self._settled_rows(state.scope, state.observed_at, cfg.replay_limit)
+            epoch = self.epoch(state.scope)
+            rows = self._settled_rows(
+                state.scope, state.observed_at, cfg.replay_limit, replay=False
+            )
+        query_events = frozenset(state.events)
         candidates: list[tuple[float, float, MemoryRecord]] = []
         for row in rows:
-            past = StateRecord.from_dict(json.loads(row["state_json"]))
+            past, vector, events = self._retrieval_features(
+                state.scope, row["state_json"], cfg.embedding_dim, epoch, vectors
+            )
             if (
                 past.environment != state.environment
                 or past.versions != state.versions
@@ -303,12 +359,10 @@ class LensStore:
                 or past.decision_id == state.decision_id
             ):
                 continue
-            vector = state_embedding(past, cfg.embedding_dim)
             lexical = max(
                 0.0, min(1.0, sum(a * b for a, b in zip(query, vector, strict=True)))
             )
-            a, b = set(state.events), set(past.events)
-            structural = len(a & b) / max(1, len(a | b))
+            structural = len(query_events & events) / max(1, len(query_events | events))
             similarity = 0.8 * lexical + 0.2 * structural
             if similarity < cfg.similarity_threshold:
                 continue
@@ -340,6 +394,14 @@ class LensStore:
                 )[:half]
             }
         )
+        # The two pools often overlap. Keep their diversity guarantee, then
+        # fill unused slots by the final similarity instead of halving recall.
+        for _, _, memory in sorted(
+            candidates, key=lambda item: (-item[2].similarity, item[2].experience_id)
+        ):
+            if len(union) >= cfg.coarse_limit:
+                break
+            union.setdefault(memory.experience_id, memory)
         memories = tuple(
             sorted(union.values(), key=lambda m: (-m.similarity, m.experience_id))[
                 : cfg.coarse_limit
@@ -357,9 +419,17 @@ class LensStore:
     def replay(
         self, scope: str, limit: int = 2048, cutoff: float | None = None
     ) -> list[ReplaySample]:
+        """Read settled facts; explicit historical/training cutoffs are strict.
+
+        A live read includes already committed facts stamped exactly 'now'.
+        Coarse wall clocks can otherwise hide a just-written user verdict.
+        """
         with self._lock:
             rows = self._settled_rows(
-                scope, time.time() if cutoff is None else cutoff, limit
+                scope,
+                time.time() if cutoff is None else cutoff,
+                limit,
+                inclusive=cutoff is None,
             )
         result = []
         for row in reversed(rows):
@@ -524,7 +594,14 @@ class LensStore:
 
     def reset(self, scope: str | None = None) -> list[str]:
         """Invalidate in-flight writers and remove facts and model references."""
+        if scope is not None and not scope:
+            raise ValueError("reset requires a nonempty scope or explicit None")
         with self._lock, self._conn:
+            self._state_features = OrderedDict(
+                (key, value)
+                for key, value in self._state_features.items()
+                if scope is not None and key[0] != scope
+            )
             if scope is None:
                 self._conn.execute(
                     "UPDATE store_meta SET global_epoch=global_epoch+1 WHERE id=1"

@@ -1,0 +1,67 @@
+{
+  "meta": {
+    "commit": "0e0a57ce6e993318987683cd7b5a86c96eb37a43",
+    "python": "3.13.12",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "source_label": "v0.2.2",
+    "source_sha256": "afe854d34647be992be4eb2ab04a619bfc02bd3f4ae20f9d6c707eccb214f5f6",
+    "repeats": 5,
+    "synthetic_only": true,
+    "threads_for_encoding_and_model": 1,
+    "retrieval_workload": "16 memories per historical snapshot; repeated text has 32 templates; unique text uses distinct report/section identifiers; default replay/coarse budgets"
+  },
+  "scenarios": [
+    {
+      "name": "retrieve",
+      "rows": 128,
+      "cold_ms": 123.9552,
+      "p50_ms": 128.1572,
+      "p95_ms": 129.8127,
+      "returned": 91,
+      "query_peak_bytes": 2853364
+    },
+    {
+      "name": "retrieve",
+      "rows": 2048,
+      "cold_ms": 1986.7323,
+      "p50_ms": 1990.7349,
+      "p95_ms": 2012.1514,
+      "returned": 98,
+      "query_peak_bytes": 41684470
+    },
+    {
+      "name": "retrieve_unique",
+      "rows": 2048,
+      "cold_ms": 2007.5967,
+      "p50_ms": 2019.4547,
+      "p95_ms": 2019.9361,
+      "returned": 125,
+      "query_peak_bytes": 41785444
+    },
+    {
+      "name": "make_batch",
+      "batch": 1,
+      "memories": 128,
+      "p50_ms": 131.0858,
+      "p95_ms": 131.5019
+    },
+    {
+      "name": "make_batch",
+      "batch": 16,
+      "memories": 128,
+      "p50_ms": 2094.1335,
+      "p95_ms": 2118.3529
+    },
+    {
+      "name": "model_preencoded_cpu",
+      "attention": {
+        "backend": "mita",
+        "mita_layers": 4,
+        "gqa_layers": 0,
+        "total_attention_layers": 4
+      },
+      "p50_ms": 33.6812,
+      "p95_ms": 33.8628
+    }
+  ]
+}

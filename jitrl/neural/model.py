@@ -17,7 +17,7 @@ from torch.nn import functional as F
 from .attention import GroupedSelfAttention, MiTAAttention
 from .config import LensConfig
 from .contracts import VERSIONS, RetrievalSnapshot, StateRecord
-from .encoding import engram_addresses, frozen_embedding, state_embedding
+from .encoding import engram_addresses, frozen_embedding, state_feature_text
 
 _PRE_INDEX = {"NO_OP": 0, "SELECT_EVIDENCE": 1}
 _META_DIM = 6
@@ -436,50 +436,77 @@ def make_batch(
     candidate_count = max(1, max(map(len, candidates)))
     if candidate_count > cfg.coarse_limit:
         raise ValueError("candidate set exceeds local budget")
-    addresses = [
-        engram_addresses(
-            s.events,
-            buckets=cfg.engram_buckets,
-            heads=cfg.engram_heads,
-            max_events=cfg.max_events,
-            seed=cfg.seed,
-        )
-        for s in states
-    ]
+    # Intern immutable features only inside this call. Replayed snapshots often
+    # share memories, events and actions; their labels/meta stay row-specific.
+    # No process-global text cache or cross-scope feature reuse is introduced.
+    features: dict[tuple[str, str], tuple[float, ...]] = {}
+
+    def embedding(scope: str, text: str) -> tuple[float, ...]:
+        key = (scope, text)
+        if key not in features:
+            features[key] = tuple(frozen_embedding(text, cfg.embedding_dim))
+        return features[key]
+
+    def state_vector(state: StateRecord) -> tuple[float, ...]:
+        return embedding(state.scope, state_feature_text(state))
+
+    address_cache: dict[tuple[str, tuple[str, ...]], list[list[int]]] = {}
+    addresses = []
+    for state in states:
+        key = (state.scope, state.events)
+        if key not in address_cache:
+            address_cache[key] = engram_addresses(
+                state.events,
+                buckets=cfg.engram_buckets,
+                heads=cfg.engram_heads,
+                max_events=cfg.max_events,
+                seed=cfg.seed,
+            )
+        addresses.append(address_cache[key])
     event_count = max(map(len, addresses))
-    batch = {
-        "state": torch.tensor(
-            [state_embedding(s, cfg.embedding_dim) for s in states], dtype=torch.float32
-        ),
-        "events": torch.zeros(
-            size, event_count, cfg.engram_heads * 2, dtype=torch.long
-        ),
-        "event_mask": torch.zeros(size, event_count, dtype=torch.bool),
-        "event_features": torch.zeros(size, event_count, cfg.embedding_dim),
-        "memory_states": torch.zeros(size, memory_count, cfg.embedding_dim),
-        "memory_actions": torch.zeros(size, memory_count, cfg.embedding_dim),
-        "memory_meta": torch.zeros(size, memory_count, _META_DIM),
-        "memory_mask": torch.zeros(size, memory_count, dtype=torch.bool),
-        "candidates": torch.zeros(size, candidate_count, cfg.embedding_dim),
-        "candidate_mask": torch.zeros(size, candidate_count, dtype=torch.bool),
-        "pre_index": torch.tensor([_PRE_INDEX[p] for p in pre_kinds], dtype=torch.long),
+    rows: dict[str, list] = {
+        name: []
+        for name in (
+            "state",
+            "events",
+            "event_mask",
+            "event_features",
+            "memory_states",
+            "memory_actions",
+            "memory_meta",
+            "memory_mask",
+            "candidates",
+            "candidate_mask",
+        )
     }
+    zero = (0.0,) * cfg.embedding_dim
+    zero_address = [0] * (cfg.engram_heads * 2)
     for row, (state, snapshot) in enumerate(zip(states, snapshots)):
-        batch["events"][row, : len(addresses[row])] = torch.tensor(addresses[row])
-        batch["event_mask"][row, : min(len(state.events), cfg.max_events)] = True
-        for column, event in enumerate(state.events[-cfg.max_events :]):
-            batch["event_features"][row, column] = torch.tensor(
-                frozen_embedding(event, cfg.embedding_dim)
-            )
-        for column, memory in enumerate(snapshot.memories):
-            batch["memory_states"][row, column] = torch.tensor(
-                state_embedding(memory.state, cfg.embedding_dim)
-            )
-            batch["memory_actions"][row, column] = torch.tensor(
-                frozen_embedding(memory.action_key, cfg.embedding_dim)
-            )
+        events = state.events[-cfg.max_events :]
+        rows["state"].append(state_vector(state))
+        rows["events"].append(
+            addresses[row] + [zero_address] * (event_count - len(addresses[row]))
+        )
+        rows["event_mask"].append(
+            [True] * len(events) + [False] * (event_count - len(events))
+        )
+        rows["event_features"].append(
+            [embedding(state.scope, event) for event in events]
+            + [zero] * (event_count - len(events))
+        )
+        padding = memory_count - len(snapshot.memories)
+        rows["memory_states"].append(
+            [state_vector(memory.state) for memory in snapshot.memories]
+            + [zero] * padding
+        )
+        rows["memory_actions"].append(
+            [embedding(state.scope, memory.action_key) for memory in snapshot.memories]
+            + [zero] * padding
+        )
+        meta = []
+        for memory in snapshot.memories:
             age = math.log1p(max(0.0, state.observed_at - memory.settled_at)) / 10.0
-            batch["memory_meta"][row, column] = torch.tensor(
+            meta.append(
                 [
                     max(-1.0, min(1.0, memory.return_g / cfg.return_scale)),
                     memory.reliability,
@@ -489,10 +516,29 @@ def make_batch(
                     float(memory.intervention == "NO_OP"),
                 ]
             )
-            batch["memory_mask"][row, column] = True
-        for column, action_key in enumerate(candidates[row]):
-            batch["candidates"][row, column] = torch.tensor(
-                frozen_embedding(action_key, cfg.embedding_dim)
+        rows["memory_meta"].append(meta + [[0.0] * _META_DIM] * padding)
+        rows["memory_mask"].append([True] * len(snapshot.memories) + [False] * padding)
+        padding = candidate_count - len(candidates[row])
+        rows["candidates"].append(
+            [embedding(state.scope, key) for key in candidates[row]] + [zero] * padding
+        )
+        rows["candidate_mask"].append([True] * len(candidates[row]) + [False] * padding)
+    # One allocation/conversion per field replaces hundreds of tiny tensor
+    # allocations and indexed writes. The public tensor keys/shapes are stable.
+    dtypes = {
+        "state": torch.float32,
+        "events": torch.long,
+        "event_mask": torch.bool,
+        "memory_mask": torch.bool,
+        "candidate_mask": torch.bool,
+    }
+    return {
+        **{
+            name: torch.tensor(
+                data,
+                dtype=dtypes.get(name, torch.get_default_dtype()),
             )
-            batch["candidate_mask"][row, column] = True
-    return batch
+            for name, data in rows.items()
+        },
+        "pre_index": torch.tensor([_PRE_INDEX[p] for p in pre_kinds], dtype=torch.long),
+    }

@@ -98,9 +98,12 @@ def frozen_embedding(text: str, dimension: int = 256) -> list[float]:
 
 
 def state_embedding(state: StateRecord, dimension: int = 256) -> list[float]:
-    return frozen_embedding(
-        state.goal + " " + state.observation + " " + " ".join(state.events), dimension
-    )
+    return frozen_embedding(state_feature_text(state), dimension)
+
+
+def state_feature_text(state: StateRecord) -> str:
+    """The versioned embedding input; IDs, times and rewards are excluded."""
+    return state.goal + " " + state.observation + " " + " ".join(state.events)
 
 
 def engram_addresses(
