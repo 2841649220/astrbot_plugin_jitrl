@@ -21,6 +21,7 @@ import pytest_asyncio
 
 from jitrl.evaluator import RewardResult
 from jitrl.memory import MemoryBank
+from jitrl.models import ValueEstimate
 from jitrl.state import abstract_state, normalize_action
 from jitrl.trajectory import (
     Transition,
@@ -241,6 +242,37 @@ async def _seed(bank, task, tool, reward, scope="s1"):
             gamma=0.5,
         )
     )
+
+
+@pytest.mark.parametrize(
+    ("advantages", "expected"),
+    [
+        ({"tool:bad(a)": -0.004, "tool:good()": 0.004}, {"bad", "good"}),
+        (
+            {"tool:bad(a)": -2.0, "tool:bad(b)": 1.0, "tool:good()": 2.0},
+            {"bad", "good"},
+        ),
+        ({"tool:bad(a)": -2.0, "tool:bad(b)": -2.0, "tool:good()": 2.0}, {"good"}),
+        ({"tool:bad(a)": -2.0, "tool:good()": -1.0}, {"bad", "good"}),
+    ],
+)
+async def test_tool_gate_requires_raw_evidence_for_every_variant(
+    plugin, advantages, expected
+):
+    names = {"bad", "good"}
+    request = SimpleNamespace(
+        func_tool=SimpleNamespace(names=lambda: sorted(names), remove_tool=names.remove)
+    )
+    scale = max(abs(value) for value in advantages.values())
+    estimate = ValueEstimate(
+        advantage=advantages,
+        advantage_norm={key: value / scale for key, value in advantages.items()},
+        action_counts=dict.fromkeys(advantages, 3),
+        neighbor_count=3 * len(advantages),
+        max_abs_advantage=scale,
+    )
+    plugin._apply_tool_gate(request, estimate)
+    assert names == expected
 
 
 async def test_robot_instances_learn_in_separate_banks(plugin):

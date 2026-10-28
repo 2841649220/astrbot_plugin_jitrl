@@ -1,4 +1,4 @@
-"""Exact top-k Jaccard retrieval in sub-linear time (Eq. 24).
+"""Exact top-k Jaccard retrieval with lossless candidate pruning (Eq. 24).
 
 The paper computes J(s, s_i) against every memory row, which is why the
 published implementation subsamples the bank (paper Table 19: retrieval latency
@@ -17,7 +17,7 @@ scan would return:
    |q n x| >= t/(1+t) * (|q| + |x|). Inserting the smallest admissible
    |x| = t*|q| gives |q n x| >= t*|q|, so every admissible row shares at least
    ceil(t*|q|) query tokens.
-3. Prefix filter (PPJoin, Bayardo et al. 2007). Order the query tokens by
+3. Prefix filter. Order the query tokens by
    increasing posting-list length and keep only the first
    p = |q| - ceil(t*|q|) + 1 of them. If a row shared no token with that prefix,
    its overlap would be at most |q| - p = ceil(t*|q|) - 1, which contradicts
@@ -29,15 +29,17 @@ costs O(|x|) with C-level set membership. For the paper's typical setting
 (t = 0.8, |q| ~ 60) the prefix is a handful of rare tokens, so a 20k-row bank
 costs a few hundred intersections instead of 20,000 full Jaccard computations.
 
-The index is append-only and all state lives in flat array objects: about
+The index stores token ids in flat arrays: about
 0.55 KB per 60-token experience, i.e. roughly 11 MB for the default 20,000-entry
-cap, versus about 44 MB for a naive dict[int, frozenset]. Deletions are handled
-by the owner invalidating and rebuilding the index, so no tombstone bookkeeping
-is needed here.
+cap, versus about 44 MB for a naive dict[int, frozenset]. Deletions use tombstones
+and periodic compaction. A bounded winner heap and admissible score bounds avoid
+sorting or computing recency for every candidate; no overlap-based truncation
+can discard a better Jaccard match.
 """
 
 from __future__ import annotations
 
+import heapq
 import math
 import time
 from array import array
@@ -483,17 +485,15 @@ class ExperienceIndex:
         Args:
             tokens: Token set of the query state.
             k: Maximum number of neighbours to return.
-            threshold: Minimum Jaccard similarity t. Values at or below zero are
-                rejected: every row would be admissible, so the caller must use
-                the SQL scan instead.
+            threshold: Minimum raw Jaccard similarity t. Zero admits all live
+                nonempty rows, including rows with no shared tokens.
             scope: Scope of the current session.
             surface: Surface of the current state.
             surface_gate: Restrict results to rows with the same surface.
             scope_mode: session drops cross-scope rows, global keeps them
                 unpenalised, hybrid down-weights them.
-            prefilter_limit: Work cap on how many candidate rows are scored.
-                When the candidate set is larger, the rows with the highest
-                overlap and the newest timestamps win.
+            prefilter_limit: Compatibility cap on returned rows, in addition to
+                k. Never truncates the candidate set or changes its ranking.
             recency_half_life_days: Half-life of the recency factor; values at
                 or below zero disable it.
             cross_scope_penalty: Similarity multiplier for cross-scope rows in
@@ -509,50 +509,51 @@ class ExperienceIndex:
         """
         unique_tokens = list(dict.fromkeys(tokens))
         count = len(unique_tokens)
-        if count == 0 or threshold <= 0.0:
+        if count == 0 or threshold > 1.0:
             return []
-        limit = max(1, int(prefilter_limit))
-        wanted = max(1, int(k))
+        threshold = max(0.0, threshold)
+        wanted = min(max(1, int(k)), max(1, int(prefilter_limit)))
         mode = scope_mode if scope_mode in {"session", "global", "hybrid"} else "hybrid"
         query_scope = scope or ""
         penalty = min(1.0, max(0.0, float(cross_scope_penalty)))
         if mode != "hybrid" or not query_scope:
             penalty = 1.0
-        # Candidate generation must stay lossless for *every* row that can end up
-        # above threshold. The cross-scope penalty only makes acceptance
-        # stricter, so the loose bound is the configured threshold itself: a row
-        # with final similarity >= threshold always has raw similarity >=
-        # threshold and therefore at least ceil(threshold * |q|) shared tokens.
-        required = max(1, math.ceil(threshold * count - _EPS))
-        if required > count:
+        scope_code = self._scope_index.get(query_scope) if query_scope else None
+        if mode == "session" and query_scope and scope_code is None:
             return []
-        prefix_length = count - required + 1
+        surface_code = self._surface_index.get(surface) if surface_gate else None
+        if surface_gate and surface_code is None:
+            return []
 
         postings = self._postings
         lookup = self._token_ids
-        # Tokens that never occurred in memory are the rarest possible and sort
-        # first, exactly like an empty posting list. They cannot contribute
-        # overlap but they do count towards the query length, so the prefix
-        # keeps its position instead of silently shrinking the denominator.
-        ranked = sorted(
-            (
-                (len(postings.get(token_id, ())), token_id)
-                for token_id in (lookup.get(token) for token in unique_tokens)
-            ),
-            key=lambda item: (item[0], item[1] if item[1] is not None else -1),
-        )
-        candidates: dict[int, None] = {}
-        for _posting_length, token_id in ranked[:prefix_length]:
-            if token_id is None:
-                continue
-            posting = postings.get(token_id)
-            if posting is None:
-                continue
-            for position in posting:
-                if position not in candidates:
-                    candidates[position] = None
-        if not candidates:
-            return []
+        query_set = {
+            token_id
+            for token_id in (lookup.get(token) for token in unique_tokens)
+            if token_id is not None
+        }
+        known_count = len(query_set)
+        if threshold > 0.0:
+            required = max(1, math.ceil(threshold * count - _EPS))
+            if known_count < required:
+                return []
+            # Unknown tokens have empty postings and occupy the beginning of
+            # the prefix. Keep their contribution to |q|, but sort only known
+            # ids: p_known = |known| - ceil(t*|q|) + 1.
+            ranked = sorted(query_set, key=lambda tid: (len(postings[tid]), tid))
+            candidates: set[int] = set()
+            for token_id in ranked[: known_count - required + 1]:
+                candidates.update(postings[token_id])
+                if len(candidates) == len(self._entry_ids):
+                    break  # All positions are covered; more postings add none.
+            # Appended positions first often fill the heap with newer rows.
+            # Correctness uses actual timestamps/ids, never insertion order.
+            positions: Iterable[int] = sorted(candidates, reverse=True)
+            maximum_length = math.floor(count / threshold + _EPS)
+        else:
+            required = 1
+            maximum_length = len(self._token_flat)
+            positions = range(len(self._entry_ids) - 1, -1, -1)
 
         lengths = self._lengths
         offsets = self._offsets
@@ -566,27 +567,15 @@ class ExperienceIndex:
         action_names = self._action_names
         scope_names = self._scope_names
         action_codes = self._action_keys
-        minimum_length = required
-        maximum_length = int(math.floor(count / threshold + _EPS))
-        query_set = {
-            token_id
-            for token_id in (lookup.get(token) for token in unique_tokens)
-            if token_id is not None
-        }
-        contains = query_set.__contains__
-        surface_code = self._surface_index.get(surface) if surface_gate else None
-        scope_code = self._scope_index.get(query_scope) if query_scope else None
-        half_life = float(recency_half_life_days)
-        reference = float(now) if now is not None else time.time()
-        floor = min(1.0, max(0.0, float(recency_floor)))
-        # (similarity, created_at, entry_id, position, overlap, length, weight)
-        scored: list[tuple[float, float, int, int, int, int, float]] = []
+        # (similarity, created_at, entry_id, position, overlap, length).
+        # Only k winners are retained, instead of every scored candidate.
+        winners: list[tuple[float, float, int, int, int, int]] = []
         alive = self._alive
-        for position, _ in candidates.items():
+        for position in positions:
             if not alive[position]:
                 continue
             length = lengths[position]
-            if length < minimum_length or length > maximum_length:
+            if length < required or length > maximum_length:
                 continue
             if surface_gate and surfaces[position] != surface_code:
                 continue
@@ -594,16 +583,24 @@ class ExperienceIndex:
             if mode == "session" and scope_code is not None:
                 if scopes[position] != scope_code:
                     continue
-            elif mode == "hybrid" and scope_code is not None:
+            elif mode == "hybrid" and query_scope:
                 cross_scope = scopes[position] != scope_code
-            start = offsets[position]
-            end = start + length
-            overlap = 0
-            for index in range(start, end):
-                if contains(flat[index]):
-                    overlap += 1
-            if overlap < required:
+            timestamp = created[position]
+            entry_id = entry_ids[position]
+            multiplier = penalty if cross_scope else 1.0
+            max_overlap = min(known_count, length)
+            upper = max_overlap / (count + length - max_overlap)
+            if upper < threshold:
                 continue
+            if (
+                len(winners) == wanted
+                and (upper * multiplier, timestamp, entry_id) <= winners[0][:3]
+            ):
+                continue
+            start = offsets[position]
+            # array slicing and set intersection both iterate in C; avoid a
+            # Python membership loop for every token of every candidate.
+            overlap = len(query_set.intersection(flat[start : start + length]))
             similarity = overlap / (count + length - overlap)
             # Contract inherited from the plugin's SQL scan: the threshold is
             # tested on the *raw* Jaccard score and the cross-scope penalty is
@@ -611,44 +608,42 @@ class ExperienceIndex:
             # weight. (The paper has no scope penalty at all.)
             if similarity < threshold:
                 continue
-            if cross_scope:
-                similarity *= penalty
+            item = (
+                similarity * multiplier,
+                timestamp,
+                entry_id,
+                position,
+                overlap,
+                length,
+            )
+            if len(winners) < wanted:
+                heapq.heappush(winners, item)
+            elif item > winners[0]:
+                heapq.heapreplace(winners, item)
+
+        half_life = float(recency_half_life_days)
+        reference = float(now) if now is not None else time.time()
+        floor = min(1.0, max(0.0, float(recency_floor)))
+        hits: list[IndexHit] = []
+        for similarity, timestamp, entry_id, position, overlap, length in sorted(
+            winners, reverse=True
+        ):
             weight = similarity
             if half_life > 0.0:
-                age = max(0.0, (reference - created[position]) / _SECONDS_PER_DAY)
+                age = max(0.0, (reference - timestamp) / _SECONDS_PER_DAY)
                 weight *= floor + (1.0 - floor) * (0.5 ** (age / half_life))
-            scored.append(
-                (
-                    similarity,
-                    created[position],
-                    entry_ids[position],
-                    position,
-                    overlap,
-                    length,
-                    weight,
+            hits.append(
+                IndexHit(
+                    entry_id=entry_id,
+                    similarity=similarity,
+                    created_at=timestamp,
+                    weight=weight,
+                    action_key=action_names[action_codes[position]],
+                    scope=scope_names[scopes[position]],
+                    discounted_return=returns[position],
+                    reward=rewards[position],
+                    overlap=overlap,
+                    length=length,
                 )
             )
-        if not scored:
-            return []
-        if len(scored) > limit:
-            # Work cap: keep the rows closest to the query before ranking.
-            scored.sort(key=lambda item: (-item[4], -item[1], -item[2]))
-            del scored[limit:]
-        scored.sort(key=lambda item: (-item[0], -item[1], -item[2]))
-        return [
-            IndexHit(
-                entry_id=entry_id,
-                similarity=similarity,
-                created_at=created_at,
-                weight=weight,
-                action_key=action_names[action_codes[position]],
-                scope=scope_names[scopes[position]],
-                discounted_return=returns[position],
-                reward=rewards[position],
-                overlap=overlap,
-                length=length,
-            )
-            for similarity, created_at, entry_id, position, overlap, length, weight in scored[
-                :wanted
-            ]
-        ]
+        return hits

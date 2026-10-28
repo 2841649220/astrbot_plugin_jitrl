@@ -277,10 +277,10 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 | `policy.exploration_rate` | `0.3` | λ，对没见过的动作给乐观奖励的概率。论文 Jericho 0.65 / WebArena 0.05 |
 | `policy.ucb_alpha` | `5.0` | α，乐观价值 `V̂ + α/|N(s)|`。期望式下等价于 Â = λ·α/|N(s)| |
 | `policy.exploration_estimate` | `expected` | 未见动作的探索项：`expected` 取闭式期望（同一情景恒定、不会在 +1/−1 间跳动）；`sample` 还原论文伯努利采样 |
-| `policy.tool_gate` | `false` | 对**高置信负优势**的工具做硬屏蔽（等价于 logit 压到 −∞） |
+| `policy.tool_gate` | `false` | 所有已观察参数签名都满足支持度、归一化负优势与至少 0.05 的原始负优势时才屏蔽整个工具；始终保留可用工具 |
 | `retrieval.estimator_weighting` | `kernel` | V̂/Q̂ 的加权方式：`kernel` 按相似度×时效核加权（默认，低相似邻居权重更低）；`uniform` 用论文式 (4)(5) 的等权平均 |
 | `retrieval.min_count` | `1` | 低于该支持度的动作不再丢弃，而是向 V̂(s) 收缩（经验贝叶斯平滑）；`1` 表示不平滑 |
-| `retrieval.prefilter_limit` | `4000` | 单次检索的候选打分条数上限；超限时按重叠词数、再按时间保留 |
+| `retrieval.prefilter_limit` | `4000` | SQL 单批读取条数与兼容返回上限；候选完整排名，返回前 min(k, 此值) 条，不再按重叠数截断；不是耗时硬上限 |
 | `memory.redact_secrets` | `true` | 写入前剔除邮箱、手机号、API Key、JWT、Bearer token、URL 凭据 |
 | `memory.max_entries` | `20000` | 容量上限，超出后按策略淘汰 |
 | `memory.checkpoint_interval` | `50` | 每多少个完成的 Episode 自动保存；`0` 关闭定期保存与首次基线 |

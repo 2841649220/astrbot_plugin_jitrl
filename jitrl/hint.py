@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from .estimator import MIN_EVIDENCE_SIGNAL
 from .models import Neighbor, PolicyDecision, ValueEstimate
 
 _PREFER_THRESHOLD = 0.15
@@ -39,7 +40,7 @@ so a one-row neighbourhood can only produce noise; injecting it would burn
 prompt tokens for nothing.
 """
 
-_MIN_SIGNAL = 0.05
+_MIN_SIGNAL = MIN_EVIDENCE_SIGNAL
 """Minimum max|A| before the block is rendered.
 
 Returns that are all equal (a common outcome when the evaluator is unavailable
@@ -100,7 +101,7 @@ def render_preference_block(
     neighbors: Sequence[Neighbor] = (),
     max_chars: int = 900,
 ) -> str:
-    """Render the JitRL evidence block injected into the system prompt.
+    """Render the evidence block attached as temporary user content.
 
     Args:
         decision: The policy decision produced from the retrieved memory.

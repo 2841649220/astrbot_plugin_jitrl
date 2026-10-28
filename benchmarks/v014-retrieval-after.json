@@ -1,0 +1,243 @@
+{
+  "meta": {
+    "harness": "scripts/bench_retrieval_quality.py",
+    "commit": "ddeb0468860b8795eec04121de5ba2a86e7e0639",
+    "python": "3.13.12",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "repeats": 25,
+    "timestamp_utc": "2026-10-28T04:46:03Z",
+    "boundary": "synthetic index-only workload; no task success or remote-logit measurement"
+  },
+  "scenarios": [
+    {
+      "name": "dense_ties",
+      "n": 1000,
+      "p50_ms": 0.5655,
+      "p95_ms": 0.5785,
+      "query_peak_bytes": 86832,
+      "recall_at_10": 1.0,
+      "exact_ranking": true,
+      "expected_ids": [
+        1000,
+        999,
+        998,
+        997,
+        996,
+        995,
+        994,
+        993,
+        992,
+        991
+      ],
+      "actual_ids": [
+        1000,
+        999,
+        998,
+        997,
+        996,
+        995,
+        994,
+        993,
+        992,
+        991
+      ],
+      "parameters": {
+        "k": 10,
+        "threshold": 0.5,
+        "scope": "s1",
+        "scope_mode": "global",
+        "prefilter_limit": 4000,
+        "recency_half_life_days": 30.0,
+        "now": 1800000000.0
+      }
+    },
+    {
+      "name": "dense_ties",
+      "n": 5000,
+      "p50_ms": 2.5921,
+      "p95_ms": 2.6402,
+      "query_peak_bytes": 815696,
+      "recall_at_10": 1.0,
+      "exact_ranking": true,
+      "expected_ids": [
+        5000,
+        4999,
+        4998,
+        4997,
+        4996,
+        4995,
+        4994,
+        4993,
+        4992,
+        4991
+      ],
+      "actual_ids": [
+        5000,
+        4999,
+        4998,
+        4997,
+        4996,
+        4995,
+        4994,
+        4993,
+        4992,
+        4991
+      ],
+      "parameters": {
+        "k": 10,
+        "threshold": 0.5,
+        "scope": "s1",
+        "scope_mode": "global",
+        "prefilter_limit": 4000,
+        "recency_half_life_days": 30.0,
+        "now": 1800000000.0
+      }
+    },
+    {
+      "name": "dense_ties",
+      "n": 20000,
+      "p50_ms": 10.4514,
+      "p95_ms": 10.594,
+      "query_peak_bytes": 3253648,
+      "recall_at_10": 1.0,
+      "exact_ranking": true,
+      "expected_ids": [
+        20000,
+        19999,
+        19998,
+        19997,
+        19996,
+        19995,
+        19994,
+        19993,
+        19992,
+        19991
+      ],
+      "actual_ids": [
+        20000,
+        19999,
+        19998,
+        19997,
+        19996,
+        19995,
+        19994,
+        19993,
+        19992,
+        19991
+      ],
+      "parameters": {
+        "k": 10,
+        "threshold": 0.5,
+        "scope": "s1",
+        "scope_mode": "global",
+        "prefilter_limit": 4000,
+        "recency_half_life_days": 30.0,
+        "now": 1800000000.0
+      }
+    },
+    {
+      "name": "padded_decoys_small_budget",
+      "n": 5000,
+      "p50_ms": 2.7862,
+      "p95_ms": 2.8477,
+      "query_peak_bytes": 815728,
+      "recall_at_10": 1.0,
+      "exact_ranking": true,
+      "expected_ids": [
+        10,
+        9,
+        8,
+        7,
+        6,
+        5,
+        4,
+        3,
+        2,
+        1
+      ],
+      "actual_ids": [
+        10,
+        9,
+        8,
+        7,
+        6,
+        5,
+        4,
+        3,
+        2,
+        1
+      ],
+      "parameters": {
+        "k": 10,
+        "threshold": 0.5,
+        "scope": "s1",
+        "scope_mode": "global",
+        "prefilter_limit": 32,
+        "recency_half_life_days": 30.0,
+        "now": 1800000000.0
+      }
+    },
+    {
+      "name": "unseen_session",
+      "n": 1000,
+      "p50_ms": 0.0042,
+      "p95_ms": 0.0045,
+      "query_peak_bytes": 5968,
+      "recall_at_10": 1.0,
+      "exact_ranking": true,
+      "expected_ids": [],
+      "actual_ids": [],
+      "parameters": {
+        "k": 10,
+        "threshold": 0.5,
+        "scope": "new",
+        "scope_mode": "session",
+        "prefilter_limit": 4000,
+        "recency_half_life_days": 30.0,
+        "now": 1800000000.0
+      }
+    },
+    {
+      "name": "unseen_hybrid",
+      "n": 1000,
+      "p50_ms": 0.6238,
+      "p95_ms": 0.6308,
+      "query_peak_bytes": 86832,
+      "recall_at_10": 1.0,
+      "exact_ranking": true,
+      "expected_ids": [
+        1000,
+        999,
+        998,
+        997,
+        996,
+        995,
+        994,
+        993,
+        992,
+        991
+      ],
+      "actual_ids": [
+        1000,
+        999,
+        998,
+        997,
+        996,
+        995,
+        994,
+        993,
+        992,
+        991
+      ],
+      "parameters": {
+        "k": 10,
+        "threshold": 0.5,
+        "scope": "new",
+        "scope_mode": "hybrid",
+        "prefilter_limit": 4000,
+        "recency_half_life_days": 30.0,
+        "now": 1800000000.0
+      }
+    }
+  ]
+}

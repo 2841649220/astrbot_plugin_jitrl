@@ -163,7 +163,8 @@ class RetrievalConfig:
         similarity_threshold: Minimum Jaccard similarity `r`.
         surface_gate: Restrict retrieval to the same `surface`.
         scope_isolation: `session`, `global` or `hybrid`, applied within one robot.
-        prefilter_limit: Work cap on the candidate rows scored per query.
+        prefilter_limit: SQL batch size and compatibility result-count cap;
+            never truncates the set of possible matches.
         recency_half_life_days: Half-life of the recency weight; `0` disables.
         min_count: Minimum supporting neighbours before an action is trusted;
             thinner support is shrunk towards V(s).
