@@ -16,6 +16,7 @@ module is not used anywhere in this package.
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
 import sqlite3
 import threading
@@ -1266,8 +1267,8 @@ class MemoryBank:
             k: Maximum number of neighbours to return.
             threshold: Minimum Jaccard similarity.
             surface_gate: Restrict results to the query surface.
-            prefilter_limit: Work cap on how many candidate rows are scored; when
-                more rows qualify, the highest-overlap, newest ones are kept.
+            prefilter_limit: SQL scan batch size and compatibility cap on the
+                number of returned rows. Candidates are never truncated.
             recency_half_life_days: Half-life of the recency weight; a value of
                 zero or less disables the recency factor.
             scope_mode: "session", "global" or "hybrid".
@@ -1355,7 +1356,7 @@ class MemoryBank:
         """Retrieve the exact top-k neighbours (worker thread).
 
         Uses the in-memory inverted index when one is available and falls back
-        to the SQL scan for threshold = 0 or a bank above the index cap.
+        to a streaming SQL scan for a bank above the index cap.
 
         Args:
             query: Abstracted current state.
@@ -1363,7 +1364,7 @@ class MemoryBank:
             k: Maximum number of neighbours.
             threshold: Minimum Jaccard similarity.
             surface_gate: Restrict results to the query surface.
-            prefilter_limit: Work cap on how many candidate rows are scored.
+            prefilter_limit: SQL batch size and compatibility result cap.
             recency_half_life_days: Half-life of the recency weight.
             scope_mode: "session", "global" or "hybrid".
             now: Reference timestamp for the recency weight.
@@ -1372,7 +1373,7 @@ class MemoryBank:
             The ranked neighbours.
         """
         limit = max(1, _as_int(prefilter_limit, 4000))
-        neighbours_wanted = max(1, _as_int(k, 10))
+        neighbours_wanted = min(max(1, _as_int(k, 10)), limit)
         minimum = max(0.0, min(1.0, _as_float(threshold, 0.8)))
         mode = str(scope_mode or "hybrid").strip().lower()
         if mode not in {"session", "global", "hybrid"}:
@@ -1386,38 +1387,37 @@ class MemoryBank:
         # but only intersects the handful of rows that can possibly clear the
         # threshold. At k = 10 and threshold = 0.8 a 20k-row bank costs a few
         # hundred intersections instead of 20,000 full Jaccard computations.
-        if minimum > 0.0:
-            with self._lock:
-                try:
-                    index = self._ensure_index_locked()
-                except (sqlite3.Error, ValueError):
-                    logger.warning(
-                        "[JitRL] retrieval index unavailable; using the SQL scan",
-                        exc_info=True,
-                    )
-                    index = None
-                if index is not None:
-                    hits = index.search(
-                        query.tokens,
-                        k=neighbours_wanted,
-                        threshold=minimum,
-                        scope=query_scope,
-                        surface=str(query.surface or ""),
-                        surface_gate=bool(surface_gate),
-                        scope_mode=mode,
-                        prefilter_limit=limit,
-                        recency_half_life_days=half_life,
-                        cross_scope_penalty=_CROSS_SCOPE_PENALTY,
-                        recency_floor=_RECENCY_FLOOR,
-                        now=reference_now,
-                    )
-                    if not hits:
-                        return []
-                    return self._neighbours_from_hits_locked(hits)
+        with self._lock:
+            try:
+                index = self._ensure_index_locked()
+            except (sqlite3.Error, ValueError):
+                logger.warning(
+                    "[JitRL] retrieval index unavailable; using the SQL scan",
+                    exc_info=True,
+                )
+                index = None
+            if index is not None:
+                hits = index.search(
+                    query.tokens,
+                    k=neighbours_wanted,
+                    threshold=minimum,
+                    scope=query_scope,
+                    surface=str(query.surface or ""),
+                    surface_gate=bool(surface_gate),
+                    scope_mode=mode,
+                    prefilter_limit=limit,
+                    recency_half_life_days=half_life,
+                    cross_scope_penalty=_CROSS_SCOPE_PENALTY,
+                    recency_floor=_RECENCY_FLOOR,
+                    now=reference_now,
+                )
+                if not hits:
+                    return []
+                return self._neighbours_from_hits_locked(hits)
 
-        # Degraded paths: threshold = 0 (every row is admissible, so an index
-        # cannot prune anything) or a bank larger than the index cap. Scan the
-        # newest prefilter_limit rows with the original exact code.
+        # A full scan is slower but remains exact when no index is available.
+        # Bound transient memory by the batch size plus a k-row winner heap,
+        # rather than hiding old matches behind ORDER BY ... LIMIT.
         sql = (
             "SELECT id, scope, state_tokens, action_key, action_text, "
             "discounted_return, reward, state_text, created_at "
@@ -1430,42 +1430,49 @@ class MemoryBank:
         if mode == "session" and query_scope:
             sql += " AND scope = ?"
             params.append(query_scope)
-        sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
-        params.append(limit)
-
+        scored: list[tuple[float, float, int, sqlite3.Row]] = []
         with self._lock:
             conn = self._require_conn()
-            rows = conn.execute(sql, params).fetchall()
+            cursor = conn.execute(sql, params)
+            try:
+                while batch := cursor.fetchmany(limit):
+                    for row in batch:
+                        decoded = _loads(row["state_tokens"], None)
+                        if not isinstance(decoded, list | tuple):
+                            continue
+                        row_tokens = frozenset(str(token) for token in decoded)
+                        if not row_tokens:
+                            continue
+                        similarity = jaccard(query.tokens, row_tokens)
+                        if similarity < minimum:
+                            continue
+                        if (
+                            mode == "hybrid"
+                            and query_scope
+                            and str(row["scope"] or "") != query_scope
+                        ):
+                            similarity *= _CROSS_SCOPE_PENALTY
+                        item = (
+                            similarity,
+                            _as_float(row["created_at"]),
+                            _as_int(row["id"]),
+                            row,
+                        )
+                        if len(scored) < neighbours_wanted:
+                            heapq.heappush(scored, item)
+                        elif item[:3] > scored[0][:3]:
+                            heapq.heapreplace(scored, item)
+            finally:
+                cursor.close()
 
-        scored: list[tuple[float, float, int, sqlite3.Row, float]] = []
-        for row in rows:
-            decoded = _loads(row["state_tokens"], None)
-            if not isinstance(decoded, list | tuple):
-                continue
-            row_tokens = frozenset(str(token) for token in decoded)
-            if not row_tokens:
-                continue
-            similarity = jaccard(query.tokens, row_tokens)
-            if similarity < minimum:
-                continue
-            if (
-                mode == "hybrid"
-                and query_scope
-                and str(row["scope"] or "") != query_scope
-            ):
-                similarity *= _CROSS_SCOPE_PENALTY
-            created_at = _as_float(row["created_at"])
+        neighbours: list[Neighbor] = []
+        for similarity, created_at, entry_id, row in sorted(scored, reverse=True):
             if half_life <= 0:
                 recency = 1.0
             else:
                 age_days = max(0.0, (reference_now - created_at) / _SECONDS_PER_DAY)
                 recency = 0.5 ** (age_days / half_life)
             weight = similarity * (_RECENCY_FLOOR + (1.0 - _RECENCY_FLOOR) * recency)
-            scored.append((similarity, created_at, _as_int(row["id"]), row, weight))
-
-        scored.sort(key=lambda item: (-item[0], -item[1], -item[2]))
-        neighbours: list[Neighbor] = []
-        for similarity, created_at, entry_id, row, weight in scored[:neighbours_wanted]:
             neighbours.append(
                 Neighbor(
                     entry_id=entry_id,

@@ -160,6 +160,34 @@ def detect_outcome(result_text: str, *, is_error: bool = False) -> str:
     text = "" if result_text is None else str(result_text).strip().lower()
     if not text:
         return "unknown"
+    # API envelopes are stronger evidence than keywords inside their payload.
+    # A successful search about "timeout errors" is not a failed search, while
+    # {"success": false, "message": "nothing happened"} really is a failure.
+    if text.startswith("{"):
+        try:
+            payload = json.loads(str(result_text).strip())
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, Mapping):
+            status = str(payload.get("status") or "").strip().lower()
+            if (
+                payload.get("is_error") is True
+                or payload.get("isError") is True
+                or payload.get("success") is False
+                or payload.get("ok") is False
+                or payload.get("error")
+                or payload.get("errors")
+                or status in {"error", "failed", "failure", "timeout"}
+            ):
+                return "error"
+            if (
+                payload.get("success") is True
+                or payload.get("ok") is True
+                or status in {"ok", "success", "succeeded"}
+                or "error" in payload
+                or "errors" in payload
+            ):
+                return "ok"
     if any(marker in text for marker in _ERROR_MARKERS):
         return "error"
     return "ok"
@@ -176,10 +204,10 @@ def extract_transitions(
 ) -> list[Transition]:
     """Rebuild (s_t, a_t, o_t) transitions from a finished agent run.
 
-    One transition is produced per tool call (in execution order) plus one
-    terminating transition for the last plain-text assistant reply. System,
-    user and _checkpoint messages are skipped, so the user request is never
-    counted as an action.
+    Only the suffix after the last user message belongs to this episode; the
+    host also supplies earlier conversation history. One transition is produced
+    per current tool call plus one terminating assistant reply. Inputs without
+    a user marker are accepted as an already isolated run for compatibility.
 
     Args:
         messages: run_context.messages: a mix of pydantic Message objects and
@@ -212,9 +240,19 @@ def extract_transitions(
     if not items:
         return []
 
+    for index in range(len(items) - 1, -1, -1):
+        try:
+            role = _field(items[index], "role")
+            if isinstance(role, str) and role.strip().lower() == "user":
+                items = items[index + 1 :]
+                break
+        except Exception:
+            continue
+
     # Pass 1: concatenate tool outputs per tool_call_id so a call finds its
     # result regardless of message order.
     tool_results: dict[str, str] = {}
+    tool_errors: set[str] = set()
     for message in items:
         try:
             role = _field(message, "role")
@@ -223,6 +261,11 @@ def extract_transitions(
             call_id = _field(message, "tool_call_id")
             if not isinstance(call_id, str) or not call_id:
                 continue
+            if (
+                _field(message, "is_error") is True
+                or _field(message, "isError") is True
+            ):
+                tool_errors.add(call_id)
             text = _text_of(_field(message, "content")).strip()
             if text:
                 previous = tool_results.get(call_id, "")
@@ -250,6 +293,9 @@ def extract_transitions(
                 name = _field(function, "name")
                 if not isinstance(name, str) or not name.strip():
                     continue
+                # Any earlier plain text was an intermediate message; a later
+                # tool call means it was not the run's terminating answer.
+                reply_text = ""
                 name = name.strip()
                 raw_args = _field(function, "arguments")
                 args: dict[str, Any] = {}
@@ -277,10 +323,10 @@ def extract_transitions(
                     observation = result[:obs_limit] if obs_limit else ""
                     # Classify on the full output so a trailing failure marker is
                     # not lost when the stored observation is truncated.
-                    outcome = detect_outcome(result)
+                    outcome = detect_outcome(result, is_error=call_id in tool_errors)
                 else:
                     observation = _PLACEHOLDER_OBSERVATION
-                    outcome = "unknown"
+                    outcome = "error" if call_id in tool_errors else "unknown"
                 collected.append((action, observation, outcome))
         except Exception:
             continue

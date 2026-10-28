@@ -1,0 +1,522 @@
+{
+  "meta": {
+    "harness": "scripts/bench_jitrl.py",
+    "harness_version": 1,
+    "generated_at": "2026-10-28T12:37:15+0800",
+    "generated_at_utc": "2026-10-28T04:37:15Z",
+    "commit": "ddeb0468860b8795eec04121de5ba2a86e7e0639",
+    "branch": "main",
+    "dirty_files": -1,
+    "python": "3.13.12",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "machine": "AMD64",
+    "processor": "AMD64 Family 25 Model 80 Stepping 0, AuthenticAMD",
+    "cpu_count": 16,
+    "sqlite": "3.51.2",
+    "seed": 20260227,
+    "mode": "full",
+    "queries": 40,
+    "warmup": 4,
+    "n_values": [
+      1000,
+      5000,
+      20000
+    ],
+    "run_parameters": {
+      "k": 10,
+      "threshold": 0.8,
+      "threshold_loose": 0.5,
+      "surface_gate": false,
+      "scope_mode": "hybrid",
+      "recency_half_life_days": 30.0,
+      "prefilter_limit": 4000,
+      "max_entries": 20000,
+      "max_entries_selector": [
+        200,
+        1000,
+        5000,
+        20000
+      ],
+      "checkpoint_interval": 50,
+      "keep_checkpoints": 20,
+      "prune_strategy": "low_value",
+      "candidate_limit": 3,
+      "beta": 1.5,
+      "ucb_alpha": 5.0,
+      "exploration_rate": 0.3,
+      "sample_temperature": 1.0,
+      "max_hint_chars": 900,
+      "micro_reps": 10,
+      "abstract_repeats": 300
+    },
+    "shipped_defaults": {
+      "k": 10,
+      "similarity_threshold": 0.8,
+      "surface_gate": false,
+      "scope_isolation": "hybrid",
+      "prefilter_limit": 4000,
+      "recency_half_life_days": 30.0,
+      "min_count": 1,
+      "max_entries": 20000,
+      "checkpoint_interval": 50,
+      "keep_checkpoints": 20
+    },
+    "workload": {
+      "seed": 20260227,
+      "tokens_per_state": [
+        30,
+        120
+      ],
+      "vocabulary": {
+        "distinct_words": 6000,
+        "cjk_pool": 900,
+        "zipf_exponent": 1.05,
+        "cjk_share": 0.35
+      },
+      "scopes": [
+        "umo:aiocqhttp:GroupMessage:10001",
+        "umo:aiocqhttp:GroupMessage:10002",
+        "umo:telegram:PrivateMessage:2001",
+        "umo:discord:GroupMessage:3001",
+        "umo:lark:GroupMessage:4001",
+        "umo:webchat:PrivateMessage:5001"
+      ],
+      "surfaces": [
+        "qq",
+        "telegram",
+        "discord",
+        "lark"
+      ],
+      "action_space": {
+        "tools": 578,
+        "commands": 10,
+        "arg_keys": 12,
+        "arg_values": 12
+      },
+      "timestamps": {
+        "span_days": 180.0,
+        "reference_now": 1782000000.0,
+        "jitter_days": 0.5
+      },
+      "episodes": {
+        "single_step_share": 0.55,
+        "max_steps": 4,
+        "gamma": 0.5
+      },
+      "query_perturbation": {
+        "drop_rate": 0.06,
+        "swaps": [
+          1,
+          2
+        ],
+        "source_bias": "recent (uniform**1.6)"
+      }
+    },
+    "duration_s": 65.09
+  },
+  "scenarios": [
+    {
+      "name": "state_abstract_2kb",
+      "n": null,
+      "count": 300,
+      "p50_ms": 0.9673,
+      "p95_ms": 1.0463,
+      "mean_ms": 0.981137,
+      "extra": {
+        "observation_chars": 2042,
+        "task_chars": 28,
+        "state_tokens": 266,
+        "signature_chars": 1200,
+        "text_chars": 505,
+        "tokenize_p50_us": 182.9,
+        "repeats": 300,
+        "min_ms": 0.9463,
+        "max_ms": 1.5326
+      }
+    },
+    {
+      "name": "insert_no_checkpoint",
+      "n": 1000,
+      "count": 1000,
+      "p50_ms": 0.574,
+      "p95_ms": 1.1358,
+      "mean_ms": 0.749354,
+      "extra": {
+        "episodes": 1000,
+        "rows": 1790,
+        "rows_per_s": 2388.7,
+        "insert_s": 0.7494,
+        "init_ms": 20.2333,
+        "steps_per_episode": 1.79,
+        "db_bytes_open": 10784488,
+        "max_entries": 20000,
+        "checkpoint_interval": 0,
+        "min_ms": 0.3567,
+        "max_ms": 7.8896
+      }
+    },
+    {
+      "name": "topk_k10_thr0.8_hybrid",
+      "n": 1000,
+      "count": 40,
+      "p50_ms": 0.31,
+      "p95_ms": 0.4117,
+      "mean_ms": 0.328543,
+      "extra": {
+        "threshold": 0.8,
+        "surface_gate": false,
+        "k": 10,
+        "scope_mode": "hybrid",
+        "prefilter_limit": 4000,
+        "recency_half_life_days": 30.0,
+        "rows_scored": 1000,
+        "hit_share": 1.0,
+        "neighbours_mean": 1.0,
+        "top1_similarity_mean": 0.9073,
+        "min_ms": 0.2252,
+        "max_ms": 0.6165
+      }
+    },
+    {
+      "name": "topk_k10_thr0.5_hybrid",
+      "n": 1000,
+      "count": 40,
+      "p50_ms": 1.0803,
+      "p95_ms": 2.3275,
+      "mean_ms": 1.2131,
+      "extra": {
+        "threshold": 0.5,
+        "surface_gate": false,
+        "k": 10,
+        "scope_mode": "hybrid",
+        "prefilter_limit": 4000,
+        "recency_half_life_days": 30.0,
+        "rows_scored": 1000,
+        "hit_share": 1.0,
+        "neighbours_mean": 1.0,
+        "top1_similarity_mean": 0.9073,
+        "min_ms": 0.3155,
+        "max_ms": 2.8244
+      }
+    },
+    {
+      "name": "topk_k10_thr0.8_hybrid_surface_gate",
+      "n": 1000,
+      "count": 40,
+      "p50_ms": 0.2858,
+      "p95_ms": 0.3764,
+      "mean_ms": 0.297715,
+      "extra": {
+        "threshold": 0.8,
+        "surface_gate": true,
+        "k": 10,
+        "scope_mode": "hybrid",
+        "prefilter_limit": 4000,
+        "recency_half_life_days": 30.0,
+        "rows_scored": 1000,
+        "hit_share": 1.0,
+        "neighbours_mean": 1.0,
+        "top1_similarity_mean": 0.9073,
+        "min_ms": 0.2404,
+        "max_ms": 0.4138
+      }
+    },
+    {
+      "name": "estimate_candidates_select_top10",
+      "n": 1000,
+      "count": 400,
+      "p50_ms": 0.0293,
+      "p95_ms": 0.0458,
+      "mean_ms": 0.031292,
+      "extra": {
+        "iterations": 400,
+        "reps": 10,
+        "neighbours_mean": 10.0,
+        "candidates_mean": 1.925,
+        "combined_p50_us": 29.3,
+        "build_candidates_p50_us": 6.2,
+        "estimate_values_p50_us": 13.8,
+        "select_action_p50_us": 9.3,
+        "beta": 1.5,
+        "ucb_alpha": 5.0,
+        "exploration_rate": 0.3,
+        "min_ms": 0.0136,
+        "max_ms": 0.2766
+      }
+    },
+    {
+      "name": "e2e_request_path",
+      "n": 1000,
+      "count": 40,
+      "p50_ms": 0.3408,
+      "p95_ms": 0.4773,
+      "mean_ms": 0.361037,
+      "extra": {
+        "neighbours_mean": 1.0,
+        "early_exit_share": 0.0,
+        "block_chars_mean": 0.0,
+        "apply_mode": "hint",
+        "candidate_limit": 3,
+        "max_hint_chars": 900,
+        "min_ms": 0.2702,
+        "max_ms": 0.74
+      }
+    },
+    {
+      "name": "insert_no_checkpoint",
+      "n": 5000,
+      "count": 5000,
+      "p50_ms": 0.5863,
+      "p95_ms": 1.1866,
+      "mean_ms": 0.807874,
+      "extra": {
+        "episodes": 5000,
+        "rows": 9383,
+        "rows_per_s": 2322.9,
+        "insert_s": 4.0394,
+        "init_ms": 6.6765,
+        "steps_per_episode": 1.877,
+        "db_bytes_open": 39772192,
+        "max_entries": 20000,
+        "checkpoint_interval": 0,
+        "min_ms": 0.3445,
+        "max_ms": 17.0649
+      }
+    },
+    {
+      "name": "topk_k10_thr0.8_hybrid",
+      "n": 5000,
+      "count": 40,
+      "p50_ms": 0.3607,
+      "p95_ms": 0.7807,
+      "mean_ms": 0.429645,
+      "extra": {
+        "threshold": 0.8,
+        "surface_gate": false,
+        "k": 10,
+        "scope_mode": "hybrid",
+        "prefilter_limit": 4000,
+        "recency_half_life_days": 30.0,
+        "rows_scored": 4000,
+        "hit_share": 0.975,
+        "neighbours_mean": 1.0,
+        "top1_similarity_mean": 0.9039,
+        "min_ms": 0.2557,
+        "max_ms": 0.8543
+      }
+    },
+    {
+      "name": "topk_k10_thr0.5_hybrid",
+      "n": 5000,
+      "count": 40,
+      "p50_ms": 5.0919,
+      "p95_ms": 13.4695,
+      "mean_ms": 6.65327,
+      "extra": {
+        "threshold": 0.5,
+        "surface_gate": false,
+        "k": 10,
+        "scope_mode": "hybrid",
+        "prefilter_limit": 4000,
+        "recency_half_life_days": 30.0,
+        "rows_scored": 4000,
+        "hit_share": 1.0,
+        "neighbours_mean": 1.0,
+        "top1_similarity_mean": 0.8997,
+        "min_ms": 1.8178,
+        "max_ms": 20.464
+      }
+    },
+    {
+      "name": "topk_k10_thr0.8_hybrid_surface_gate",
+      "n": 5000,
+      "count": 40,
+      "p50_ms": 0.3403,
+      "p95_ms": 0.4555,
+      "mean_ms": 0.351962,
+      "extra": {
+        "threshold": 0.8,
+        "surface_gate": true,
+        "k": 10,
+        "scope_mode": "hybrid",
+        "prefilter_limit": 4000,
+        "recency_half_life_days": 30.0,
+        "rows_scored": 4000,
+        "hit_share": 0.975,
+        "neighbours_mean": 1.0,
+        "top1_similarity_mean": 0.9039,
+        "min_ms": 0.2549,
+        "max_ms": 0.5729
+      }
+    },
+    {
+      "name": "estimate_candidates_select_top10",
+      "n": 5000,
+      "count": 400,
+      "p50_ms": 0.032,
+      "p95_ms": 0.0419,
+      "mean_ms": 0.031691,
+      "extra": {
+        "iterations": 400,
+        "reps": 10,
+        "neighbours_mean": 10.0,
+        "candidates_mean": 2.025,
+        "combined_p50_us": 32.0,
+        "build_candidates_p50_us": 6.6,
+        "estimate_values_p50_us": 14.8,
+        "select_action_p50_us": 9.6,
+        "beta": 1.5,
+        "ucb_alpha": 5.0,
+        "exploration_rate": 0.3,
+        "min_ms": 0.014,
+        "max_ms": 0.0874
+      }
+    },
+    {
+      "name": "e2e_request_path",
+      "n": 5000,
+      "count": 40,
+      "p50_ms": 0.486,
+      "p95_ms": 0.9039,
+      "mean_ms": 0.54623,
+      "extra": {
+        "neighbours_mean": 0.975,
+        "early_exit_share": 0.025,
+        "block_chars_mean": 0.0,
+        "apply_mode": "hint",
+        "candidate_limit": 3,
+        "max_hint_chars": 900,
+        "min_ms": 0.2901,
+        "max_ms": 1.0095
+      }
+    },
+    {
+      "name": "insert_no_checkpoint",
+      "n": 20000,
+      "count": 20000,
+      "p50_ms": 0.575,
+      "p95_ms": 1.1683,
+      "mean_ms": 0.839383,
+      "extra": {
+        "episodes": 20000,
+        "rows": 37777,
+        "rows_per_s": 2250.3,
+        "insert_s": 16.7877,
+        "init_ms": 7.0956,
+        "steps_per_episode": 1.889,
+        "db_bytes_open": 148242632,
+        "max_entries": 60000,
+        "checkpoint_interval": 0,
+        "min_ms": 0.3281,
+        "max_ms": 19.1712
+      }
+    },
+    {
+      "name": "topk_k10_thr0.8_hybrid",
+      "n": 20000,
+      "count": 40,
+      "p50_ms": 0.5427,
+      "p95_ms": 1.1351,
+      "mean_ms": 0.603098,
+      "extra": {
+        "threshold": 0.8,
+        "surface_gate": false,
+        "k": 10,
+        "scope_mode": "hybrid",
+        "prefilter_limit": 4000,
+        "recency_half_life_days": 30.0,
+        "rows_scored": 4000,
+        "hit_share": 0.975,
+        "neighbours_mean": 1.0,
+        "top1_similarity_mean": 0.9163,
+        "min_ms": 0.2783,
+        "max_ms": 1.4872
+      }
+    },
+    {
+      "name": "topk_k10_thr0.5_hybrid",
+      "n": 20000,
+      "count": 40,
+      "p50_ms": 13.0045,
+      "p95_ms": 29.0133,
+      "mean_ms": 14.356727,
+      "extra": {
+        "threshold": 0.5,
+        "surface_gate": false,
+        "k": 10,
+        "scope_mode": "hybrid",
+        "prefilter_limit": 4000,
+        "recency_half_life_days": 30.0,
+        "rows_scored": 4000,
+        "hit_share": 1.0,
+        "neighbours_mean": 1.0,
+        "top1_similarity_mean": 0.9133,
+        "min_ms": 4.713,
+        "max_ms": 51.9643
+      }
+    },
+    {
+      "name": "topk_k10_thr0.8_hybrid_surface_gate",
+      "n": 20000,
+      "count": 40,
+      "p50_ms": 0.3848,
+      "p95_ms": 0.5505,
+      "mean_ms": 0.390587,
+      "extra": {
+        "threshold": 0.8,
+        "surface_gate": true,
+        "k": 10,
+        "scope_mode": "hybrid",
+        "prefilter_limit": 4000,
+        "recency_half_life_days": 30.0,
+        "rows_scored": 4000,
+        "hit_share": 0.975,
+        "neighbours_mean": 1.0,
+        "top1_similarity_mean": 0.9163,
+        "min_ms": 0.2286,
+        "max_ms": 0.8026
+      }
+    },
+    {
+      "name": "estimate_candidates_select_top10",
+      "n": 20000,
+      "count": 400,
+      "p50_ms": 0.0282,
+      "p95_ms": 0.0363,
+      "mean_ms": 0.029337,
+      "extra": {
+        "iterations": 400,
+        "reps": 10,
+        "neighbours_mean": 10.0,
+        "candidates_mean": 2.15,
+        "combined_p50_us": 28.2,
+        "build_candidates_p50_us": 6.1,
+        "estimate_values_p50_us": 13.2,
+        "select_action_p50_us": 8.9,
+        "beta": 1.5,
+        "ucb_alpha": 5.0,
+        "exploration_rate": 0.3,
+        "min_ms": 0.0234,
+        "max_ms": 0.0701
+      }
+    },
+    {
+      "name": "e2e_request_path",
+      "n": 20000,
+      "count": 40,
+      "p50_ms": 0.5994,
+      "p95_ms": 0.9879,
+      "mean_ms": 0.651532,
+      "extra": {
+        "neighbours_mean": 0.975,
+        "early_exit_share": 0.025,
+        "block_chars_mean": 0.0,
+        "apply_mode": "hint",
+        "candidate_limit": 3,
+        "max_hint_chars": 900,
+        "min_ms": 0.2952,
+        "max_ms": 1.3096
+      }
+    }
+  ]
+}

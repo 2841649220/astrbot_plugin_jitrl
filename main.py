@@ -63,7 +63,7 @@ from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from .jitrl.config import JitRLConfig
-from .jitrl.estimator import estimate_values
+from .jitrl.estimator import MIN_EVIDENCE_SIGNAL, estimate_values
 from .jitrl.evaluator import StepRewardEvaluator, discounted_returns
 from .jitrl.hint import render_preference_block, render_recall_report
 from .jitrl.memory import MemoryBank
@@ -1553,26 +1553,34 @@ class JitRLLearner(Star):
             estimate: Value estimate over every retrieved action.
         """
         tool_set = request.func_tool
-        if tool_set is None:
+        if tool_set is None or estimate.max_abs_advantage < MIN_EVIDENCE_SIGNAL:
             return
         names = set(tool_set.names())
-        blocked: list[str] = []
-        for key, advantage in estimate.advantage_norm.items():
+        variants: dict[str, list[str]] = {}
+        for key in estimate.advantage_norm:
             if self._action_kind(key) != "tool":
                 continue
-            count = estimate.action_counts.get(key, 0)
-            if count < self.cfg.policy.tool_gate_min_count:
-                continue
-            if advantage > self.cfg.policy.tool_gate_threshold:
-                continue
             name = self._action_name(key)
-            if name in names:
-                blocked.append(name)
-        if not blocked or len(blocked) >= len(names):
+            variants.setdefault(name, []).append(key)
+        # The host can only mask an entire tool. One bad argument signature
+        # must not hide other signatures with positive or insufficient evidence.
+        blocked = {
+            name
+            for name, keys in variants.items()
+            if name in names
+            and all(
+                estimate.action_counts.get(key, 0)
+                >= self.cfg.policy.tool_gate_min_count
+                and estimate.advantage_norm[key] <= self.cfg.policy.tool_gate_threshold
+                and estimate.advantage.get(key, 0.0) <= -MIN_EVIDENCE_SIGNAL
+                for key in keys
+            )
+        }
+        if not blocked or not (names - blocked):
             return
-        for name in blocked:
+        for name in sorted(blocked):
             tool_set.remove_tool(name)
-        logger.debug("[JitRL] tool gate masked %s", blocked)
+        logger.debug("[JitRL] tool gate masked %s", sorted(blocked))
 
     async def _rerank(
         self,

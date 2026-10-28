@@ -73,6 +73,9 @@ EPSILON: float = 1e-8
 DEFAULT_NORMALIZE_FLOOR: float = 1e-3
 """Below this max|A| the normalised advantage is reported as zero."""
 
+MIN_EVIDENCE_SIGNAL: float = 0.05
+"""Raw advantage floor for prompt evidence and hard tool masking."""
+
 _WEIGHTING_MODES: frozenset[str] = frozenset({"kernel", "uniform"})
 _EXPLORATION_MODES: frozenset[str] = frozenset({"expected", "sample"})
 
