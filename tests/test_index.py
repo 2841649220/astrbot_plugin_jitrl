@@ -17,9 +17,8 @@ Contract pinned here:
   * similarity_weight = similarity * (0.5 + 0.5 * 0.5 ** (age_days / half_life)),
     and weight == similarity exactly when half_life <= 0;
   * ranking is (-similarity, -created_at, -id) and at most k rows are returned;
-  * prefilter_limit is a work cap on the number of rows *scored*, not a
-    "newest N rows" window.  The two tests marked EXPECTED-BEFORE-CHANGE pin
-    that improvement and are expected to fail on the pre-change tree.
+  * prefilter_limit bounds SQL batch size and the returned count, not the
+    candidate set. All admissible rows participate in the exact ranking.
 """
 
 from __future__ import annotations
