@@ -2,7 +2,7 @@ name: astrbot_plugin_jitrl
 display_name: JitRL 持续学习
 desc: 基于 JitRL、Engram 与 MiTA 的持续学习插件：按 AstrBot 平台实例隔离经验库、Neural Lens 运行时与模型权重，自适应平台适配器的 self_id 变化；可选四层 MiTA 本地神经扩展默认关闭，远端大模型冻结，并保留 V0.1 配置及 API。
 short_desc: 按平台实例隔离学习，支持可选四层 MiTA Neural Lens。
-version: 0.2.1
+version: 0.2.2
 astrbot_version: ">=4.29,<5"
 author: "2841649220"
 repo: https://github.com/2841649220/astrbot_plugin_jitrl

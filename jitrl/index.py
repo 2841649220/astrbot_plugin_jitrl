@@ -505,7 +505,7 @@ class ExperienceIndex:
         Returns:
             Neighbours sorted by (-similarity, -created_at, -entry_id), carrying
             the same similarity and weight the brute-force path computes. Empty
-            when the query shares no tokens with the bank.
+            when a positive threshold cannot be reached.
         """
         unique_tokens = list(dict.fromkeys(tokens))
         count = len(unique_tokens)
@@ -530,7 +530,7 @@ class ExperienceIndex:
         query_set = {
             token_id
             for token_id in (lookup.get(token) for token in unique_tokens)
-            if token_id is not None
+            if token_id is not None and token_id in postings
         }
         known_count = len(query_set)
         if threshold > 0.0:

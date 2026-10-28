@@ -14,6 +14,28 @@ from jitrl.models import StateView
 NOW = 1_800_000_000.0
 
 
+def test_compacted_tokens_without_postings_stay_in_query_denominator():
+    index = ExperienceIndex()
+    for entry_id in range(1, 81):
+        index.append(
+            entry_id=entry_id,
+            tokens={"shared", "retired"} if entry_id <= 64 else {"shared"},
+            scope="s1",
+            surface="web",
+            action_key="tool:search()",
+            discounted_return=0.0,
+            reward=0.0,
+            created_at=NOW + entry_id,
+        )
+    index.remove_many(range(1, 65))
+    assert index.vocab_size == 2
+    assert index._token_ids["retired"] not in index._postings
+    hits = index.search({"shared", "retired"}, threshold=0.5, k=3, now=NOW)
+    assert [hit.entry_id for hit in hits] == [80, 79, 78]
+    assert all(hit.similarity == 0.5 for hit in hits)
+    assert not index.search({"retired"}, threshold=0.1, now=NOW)
+
+
 def test_high_overlap_does_not_displace_a_better_jaccard_match():
     index = ExperienceIndex()
     query = frozenset(f"q{i}" for i in range(10))

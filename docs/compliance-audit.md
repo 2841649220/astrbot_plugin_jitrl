@@ -1,5 +1,20 @@
 # JitRL 插件 · AstrBot 官方插件市场合规审计
 
+## V0.2.2 主线迁移复核（2026-10-28）
+
+- V0.1.4 的精确检索、会话过滤、当前轮轨迹和保守工具门控已迁入本分支；研究依据与
+  性能边界见[主线优化记录](mainline-optimization.md)。V0.1 主线未引入神经依赖。
+- 本次未修改 `jitrl/neural/`，四层 MiTA、历史检索快照、pending 奖励排除与作用域合同
+  由原有神经测试继续覆盖；正式 384d / 四层 / grouped MiTA 的 CUDA 采集、20 步训练、
+  原子保存重载和候选评分闭环通过，报告在开发仓库的
+  [v022-neural-smoke-cuda.json](../benchmarks/v022-neural-smoke-cuda.json)。它只使用合成数据。
+- `astrbot.api.logger` 和临时 `extra_user_content_parts` / `mark_as_temp()` 注入方式保留，
+  没有新增标准库日志或逐请求 system prompt 改写。版本声明与发布 ZIP 由构建脚本校验。
+- Python 3.13 的完整神经分支测试通过；另用本机 AstrBot / Python 3.12 执行
+  `tests/test_integration.py`，29 项通过。测试使用独立的 `ASTRBOT_ROOT` 临时目录。
+
+以下章节保留历史审计快照及其当时的版本、行号与测量。
+
 审计对象：`astrbot_plugin_jitrl`（仓库根 `C:/Users/ASUS/Desktop/astrbot_plugin_jitrl`，版本 0.1.1）  
 审计日期：2026-10-27  
 规范基线：docs.astrbot.app（2026-10-27 抓取）、AstrBot master 源码（`astrbot/__init__.py` 声明 `__version__ = "4.29.3"`）、插件市场 JSON 规范 2026-06-27。  
