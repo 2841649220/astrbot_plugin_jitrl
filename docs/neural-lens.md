@@ -1,8 +1,15 @@
-# V0.2.2 Neural Lens 使用与 API 兼容约定
+# V0.2.3 Neural Lens 使用与 API 兼容约定
 
 本分支以 V0.1.2 为神经扩展起点，分支名为 `v0.2.0-neural-lens`；V0.2.2 同步 V0.1.4 的精确检索、当前回合奖励归属和工具门控优化，四层 MiTA 结构与现有权重格式保持兼容。V0.2.1 加入机器人实例隔离，并于 2026-10-27 重发时修正为只按平台实例 ID 识别机器人（`self_id` 仅作元数据）。原来的插件名、`JitRLLearner` 入口、AstrBot 版本范围、两个事件钩子、`jitrl_recall` 工具、配置键和 Web 路由均保留。`neural.mode` 默认 `off`，旧配置无需修改，也不要求安装 PyTorch；其行为继续由 V0.1 的 `apply_mode`、`learning`、`retrieval`、`policy` 等控制。具体研究与测量见[主线优化记录](mainline-optimization.md)。
 
 新增部分是研究性本地神经控制器，远端 LLM 始终冻结。这里的梯度更新只发生在本地 Neural Lens。论文依据、公式及效果边界见 [研究说明](neural-lens-research.md)。本版本没有真实任务提升的实验结论。
+
+V0.2.3 优化神经检索和编码，四层 MiTA 与已有权重兼容。`min_support` / POST `support`
+按不同已结算 episode ID 计数，零相似度或零可靠度不增加支持；32 步来自一个回合仍只算
+一份回合支持。PRE 只选择当前可用动作，最多展示两个不同回合的证据。POST 用相同权重
+聚合状态与动作的回合均值，审计 payload 记录支持度单位。不同回合 ID 不保证统计独立。
+检索快照与奖励仍逐次读取或按历史记录回放，缓存只保存冻结状态特征，重置时清理。
+具体测量和边界见[神经流水线性能记录](neural-pipeline-performance.md)。
 
 ## 1. 从旧版本启用
 
