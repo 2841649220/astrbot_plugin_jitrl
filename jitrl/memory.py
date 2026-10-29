@@ -1209,6 +1209,35 @@ class MemoryBank:
         with self._lock:
             return self._count_locked(scope)
 
+    async def counts(self, scope: str | None = None) -> dict[str, int]:
+        """Count currently stored experiences and episode headers together.
+
+        Args:
+            scope: Optional scope filter.
+
+        Returns:
+            Current database counts, independent of process learning counters.
+
+        Raises:
+            RuntimeError: When the bank is not initialized.
+        """
+        return await asyncio.to_thread(self._counts_sync, scope)
+
+    def _counts_sync(self, scope: str | None) -> dict[str, int]:
+        """Read both counts under one lock so mutations cannot split the view."""
+        with self._lock:
+            conn = self._require_conn()
+            sql = "SELECT COUNT(*) FROM episodes"
+            params = ()
+            if scope is not None:
+                sql += " WHERE scope = ?"
+                params = (str(scope),)
+            row = conn.execute(sql, params).fetchone()
+            return {
+                "experiences": self._count_locked(scope),
+                "episodes": _as_int(row[0]) if row is not None else 0,
+            }
+
     async def topk(
         self,
         query: StateView,

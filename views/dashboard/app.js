@@ -96,8 +96,8 @@ function renderRobotSelector(robots, selected) {
 
 function renderOverview(data) {
   document.getElementById("kpi-total").textContent = data.total || 0;
+  document.getElementById("kpi-episodes").textContent = data.episodes || 0;
   const stats = data.stats || {};
-  document.getElementById("kpi-episodes").textContent = stats.episodes || 0;
   document.getElementById("kpi-biased").textContent = stats.biased || 0;
   document.getElementById("kpi-failures").textContent = stats.failures || 0;
 

@@ -1657,15 +1657,15 @@ class JitRLLearner(Star):
         try:
             await self._ensure_ready(event)
             umo = event.unified_msg_origin
-            total = await self._bank.count()
+            counts = await self._bank.counts()
             scoped = await self._bank.count(umo)
             stats = self._stats
             cached = self._last_decision.get(self._cache_scope(event))
             lines = [
                 "JitRL 持续学习状态",
                 f"· 开关：{('开' if self.cfg.enabled else '关')} / 应用模式：{self.cfg.apply_mode}",
-                f"· 记忆：本机器人 {total} 条，本会话 {scoped} 条",
-                f"· 学习：episodes={stats['episodes']}，experiences={stats['experiences']}",
+                f"· 记忆：本机器人 {counts['experiences']} 条 / {counts['episodes']} 个 Episode，本会话 {scoped} 条",
+                f"· 本次运行学习累计：episodes={stats['episodes']}，experiences={stats['experiences']}",
                 f"· 干预：requests={stats['requests']}，biased={stats['biased']}，failures={stats['failures']}",
                 f"· 超参：k={self.cfg.retrieval.k} r={self.cfg.retrieval.similarity_threshold}"
                 f" gamma={self.cfg.learning.gamma} beta={self.cfg.policy.beta}"
@@ -2158,7 +2158,7 @@ class JitRLLearner(Star):
         try:
             robot_id = self._select_web_robot(request.query.get("robot"))
             bank = await self._ensure_ready(robot_id=robot_id) if robot_id else None
-            total = await bank.count() if bank else 0
+            counts = await bank.counts() if bank else {"experiences": 0, "episodes": 0}
             last = None
             decisions = [
                 item
@@ -2179,7 +2179,8 @@ class JitRLLearner(Star):
                 {
                     "enabled": self.cfg.enabled,
                     "apply_mode": self.cfg.apply_mode,
-                    "total": total,
+                    "total": counts["experiences"],
+                    "episodes": counts["episodes"],
                     "stats": dict(self._stats),
                     "robot_id": robot_id or "",
                     "robots": self._known_robots(),
