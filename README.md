@@ -3,13 +3,13 @@
 [![CI](https://github.com/2841649220/astrbot_plugin_jitrl/actions/workflows/ci.yml/badge.svg)](https://github.com/2841649220/astrbot_plugin_jitrl/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/version-0.2.3-blue)](CHANGELOG.md)
 
-> V0.2.3（2026-10-28）优化神经检索与批量特征编码，补齐候选池，并按不同历史回合计算证据支持度。保留 V0.1.4 兼容路径、平台实例隔离和可选四层 MiTA Neural Lens；远端大模型始终冻结，神经扩展默认关闭，已有神经权重格式兼容。
+> V0.2.3（2026-10-29 同版本重发）修复清空记忆后 Episodes 仍显示旧累计值的问题，面板按数据库实际留存回合统计，重启与回退后保持一致。保留神经检索与编码优化、V0.1.4 兼容路径、平台实例隔离和可选四层 MiTA Neural Lens；远端大模型始终冻结，神经扩展默认关闭，已有神经权重格式兼容。
 >
 > V0.1 路径无需训练；V0.2 神经路径使用可选 PyTorch 训练会话隔离的小模型。当前默认四层 token 注意力全部使用真正的 MiTA 压缩与路由机制，结合 JitRL 经验回报和 Engram 条件模式记忆。
 
 ## V0.2.3 快速入口
 
-当前发布版本：`0.2.3`（2026-10-28）；实验性开发分支：`v0.2.0-neural-lens`。V0.1 兼容路径继续以 V0.1.4 为基础；本次优化神经路径的数据读取、特征复用和证据门控。按 AstrBot 平台实例 ID 隔离经验库和 Neural Lens，`self_id` 仅作为展示元数据。现有插件入口、配置键、指令、经验库、检查点及面板路由继续保留。`neural.mode: off` 为默认值，无需安装额外依赖。详见[神经流水线性能与效果验证](docs/neural-pipeline-performance.md)及[前一版主线优化记录](docs/mainline-optimization.md)。
+当前发布版本：`0.2.3`（2026-10-28 发布，2026-10-29 同版本重发）；实验性开发分支：`v0.2.0-neural-lens`。V0.1 兼容路径继续以 V0.1.4 为基础；本次修正面板的已存回合计数，保留神经路径的数据读取、特征复用和证据门控优化。按 AstrBot 平台实例 ID 隔离经验库和 Neural Lens，`self_id` 仅作为展示元数据。现有插件入口、配置键、指令、经验库、检查点及面板路由继续保留。`neural.mode: off` 为默认值，无需安装额外依赖。详见[神经流水线性能与效果验证](docs/neural-pipeline-performance.md)及[前一版主线优化记录](docs/mainline-optimization.md)。
 
 - [神经架构的研究依据与论文边界](docs/neural-lens-research.md)
 - [MiTA 主干：公式落地、4/4 层替换与研究实验](docs/mita-backbone-research.md)
@@ -262,13 +262,15 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 
 | 面板区域 | 内容 |
 | --- | --- |
-| KPI 卡 | 记忆条数、Episodes、策略干预次数、失败次数 |
+| KPI 卡 | 当前已存记忆条数与 Episodes、本次运行累计策略干预次数与失败次数 |
 | 学习曲线 | 按时间分桶的平均折扣回报 `G`，复现论文 Figure 3 的形态 |
 | 动作排行 | 每个工具/回复的平均回报、正回报率、样本数 —— **一眼看出这个部署里哪个工具真的有用** |
 | 最近 Episode | 时间 / 步数 / 平均回报 / 用户请求摘要 |
 | 超参数 | 当前 k、r、γ、β、λ、α 与作用域、评估器模式 |
 | 检查点 | 名称、类型、完整 ID、时间、经验数、文件大小，支持创建、回退全库、删除快照 |
 | 操作 | 刷新、导出 JSON、带备份的清空记忆；回退、删除和清空均使用页内两步确认 |
+
+`Episodes（已存）` 统计当前机器人 V0.1 经验库中的回合记录，清空后归零，回退或重启后按数据库实际留存显示。删除检查点只移除备份文件，不改变在线经验数量。`/jitrl status` 另列“本次运行学习累计”，该累计值不会因删除记忆而减少；神经经验和权重通过 `/jitrl lens reset confirm` 独立重置。
 
 后端路由（`GET` 除注明外）：`/astrbot_plugin_jitrl/robots`、`/overview`、`/curve`、`/actions`、`/episodes`、`/export`，以及 `POST /forget`。
 检查点路由同样使用 `/astrbot_plugin_jitrl` 前缀：`GET /checkpoints`、`POST /checkpoint`、

@@ -101,6 +101,32 @@ async def test_add_episode_writes_every_step(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_counts_distinguish_stored_episodes_from_steps_and_survive_reopen(
+    tmp_path,
+) -> None:
+    bank = MemoryBank(tmp_path / "memory.db", checkpoint_interval=0)
+    await bank.initialize()
+    try:
+        assert await bank.counts() == {"episodes": 0, "experiences": 0}
+        await bank.add_episode(build_episode("e1", [1.0, 2.0, 3.0]))
+        await bank.add_episode(build_episode("e2", [1.0], scope="s2"))
+        assert await bank.counts() == {"episodes": 2, "experiences": 4}
+        assert await bank.counts("s1") == {"episodes": 1, "experiences": 3}
+        assert await bank.counts("other") == {"episodes": 0, "experiences": 0}
+        await bank.add_episode(build_episode("e1", [2.0]))
+        assert await bank.counts() == {"episodes": 2, "experiences": 2}
+        await bank.close()
+        await bank.initialize()
+        assert await bank.counts() == {"episodes": 2, "experiences": 2}
+        await bank.forget(scope="s1")
+        assert await bank.counts() == {"episodes": 1, "experiences": 1}
+        await bank.clear()
+        assert await bank.counts() == {"episodes": 0, "experiences": 0}
+    finally:
+        await bank.close()
+
+
+@pytest.mark.asyncio
 async def test_topk_exact_match_and_threshold(tmp_path) -> None:
     """Retrieval ranks by Jaccard similarity and honours the threshold."""
     bank = MemoryBank(tmp_path / "memory.db")

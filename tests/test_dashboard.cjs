@@ -61,12 +61,13 @@ async function dashboard(robots = [robot]) {
   const gets = [];
   const bridge = {
     inventory: [{ ...snapshot }],
+    overview: { total: 2, episodes: 1, stats: { episodes: 2 } },
     ready: async () => {},
     apiGet: async (endpoint, params) => {
       gets.push({ endpoint, params: { ...params } });
       return ({
       robots: { robots },
-      overview: { total: 2, enabled: true, apply_mode: "hint", stats: {}, robot_id: params.robot, robots },
+      overview: { ...bridge.overview, enabled: true, apply_mode: "hint", robot_id: params.robot, robots },
       curve: { buckets: [] }, actions: { actions: [] }, episodes: { episodes: [] },
       checkpoints: { checkpoints: bridge.inventory, interval: 50, keep: 20 },
       })[endpoint];
@@ -185,6 +186,41 @@ test("clear retains two-step confirmation and explains recovery", async () => {
   assert.equal(app.posts[0].endpoint, "forget");
   assert.equal(app.posts[0].payload.robot, robot.id);
   assert.match(app.ids["action-hint"].textContent, /删除前备份回退/);
+});
+
+test("episode KPI follows stored episodes through clear, rollback and snapshot deletion", async () => {
+  const app = await dashboard();
+  assert.equal(app.ids["kpi-episodes"].textContent, "1");
+  app.bridge.postHandler = async (endpoint, payload) => {
+    if (endpoint === "forget") {
+      app.bridge.overview.total = app.bridge.overview.episodes = 0;
+      return { removed: 2 };
+    }
+    if (endpoint === "rollback") {
+      app.bridge.overview.total = 2;
+      app.bridge.overview.episodes = 1;
+      return { experiences: 2, safety_checkpoint: { id: "backup" } };
+    }
+    if (endpoint === "checkpoint_delete") {
+      app.bridge.inventory = [];
+      return { deleted: payload.id };
+    }
+    throw new Error("Unexpected endpoint " + endpoint);
+  };
+  await app.ids["btn-forget"].emit("click");
+  await app.ids["btn-forget"].emit("click");
+  assert.equal(app.ids["kpi-total"].textContent, "0");
+  assert.equal(app.ids["kpi-episodes"].textContent, "0");
+  const [rollback] = app.controls();
+  await rollback.emit("click");
+  await rollback.emit("click");
+  assert.equal(app.ids["kpi-total"].textContent, "2");
+  assert.equal(app.ids["kpi-episodes"].textContent, "1");
+  const [, remove] = app.controls();
+  await remove.emit("click");
+  await remove.emit("click");
+  assert.equal(app.ids["kpi-episodes"].textContent, "1");
+  assert.equal(app.bridge.overview.stats.episodes, 2);
 });
 
 test("every dashboard read is scoped to the selected robot", async () => {

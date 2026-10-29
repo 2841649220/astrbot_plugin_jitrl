@@ -528,6 +528,7 @@ async def test_web_robot_selection_prevents_cross_instance_management(host, plug
     overview = await web_call(host, plugin, "_web_overview", {"robot": selected_id})
     assert overview.payload["robot_id"] == selected_id
     assert overview.payload["total"] == 1
+    assert overview.payload["episodes"] == 1
     forgotten = await web_call(
         host,
         plugin,
@@ -537,6 +538,12 @@ async def test_web_robot_selection_prevents_cross_instance_management(host, plug
     assert forgotten.payload["removed"] == 1
     assert await first_bank.count() == 0
     assert await second_bank.count() == 1
+    overview = await web_call(host, plugin, "_web_overview", {"robot": selected_id})
+    assert overview.payload["episodes"] == overview.payload["total"] == 0
+    other = await web_call(
+        host, plugin, "_web_overview", {"robot": plugin._robot_key_for_event(second)}
+    )
+    assert other.payload["episodes"] == other.payload["total"] == 1
 
 
 async def test_one_platform_instance_is_one_robot_although_self_id_varies(plugin):
@@ -1097,6 +1104,73 @@ async def test_web_forget_requires_explicit_confirmation(host, plugin):
     )
     assert response.status_code == 200
     assert await plugin._bank.count() == 0
+
+
+@pytest.mark.parametrize("scope,remaining", [("all", 0), ("session", 1)])
+async def test_overview_counts_live_episodes_after_forget_and_snapshot_deletion(
+    host, plugin, scope, remaining
+):
+    await learn(plugin)
+    await learn(plugin, "s2")
+    before = await web_call(host, plugin, "_web_overview", {})
+    assert before.payload["episodes"] == before.payload["total"] == 2
+
+    response = await web_call(
+        host,
+        plugin,
+        "_web_forget",
+        {"scope": scope, "umo": "s1", "confirm": True},
+    )
+    assert response.status_code == 200
+    assert response.payload["removed"] == 2 - remaining
+    snapshots = await plugin._bank.list_checkpoints()
+    assert snapshots and snapshots[0]["episodes"] == 2
+    for snapshot in snapshots:
+        response = await web_call(
+            host,
+            plugin,
+            "_web_checkpoint_delete",
+            {"id": snapshot["id"], "confirm": True},
+        )
+        assert response.status_code == 200
+    assert await plugin._bank.list_checkpoints() == []
+
+    after = await web_call(host, plugin, "_web_overview", {})
+    assert after.payload["episodes"] == after.payload["total"] == remaining
+    assert after.payload["stats"]["episodes"] == 2
+    assert len(await plugin._bank.recent_episodes()) == remaining
+    status = await command(plugin.jitrl_status(Event()))
+    assert f"全局 {remaining} 条 / {remaining} 个 Episode" in status
+    assert "本次运行学习累计：episodes=2，experiences=2" in status
+
+
+async def test_overview_counts_persisted_episodes_after_restart_and_rollback(
+    host, plugin
+):
+    await learn(plugin)
+    saved = await plugin._bank.create_checkpoint("one episode")
+    await learn(plugin, "s2")
+    await plugin.terminate()
+    restarted = host.module.JitRLLearner(
+        plugin.context, {"memory": {"checkpoint_interval": 0}}
+    )
+    try:
+        response = await web_call(host, restarted, "_web_overview", {})
+        assert response.status_code == 200
+        assert response.payload["episodes"] == response.payload["total"] == 2
+        assert response.payload["stats"]["episodes"] == 0
+        response = await web_call(
+            host,
+            restarted,
+            "_web_rollback",
+            {"id": saved["id"], "scope": "all", "confirm": True},
+        )
+        assert response.status_code == 200
+        after = await web_call(host, restarted, "_web_overview", {})
+        assert after.payload["episodes"] == after.payload["total"] == 1
+        assert after.payload["stats"]["episodes"] == 0
+    finally:
+        await restarted.terminate()
 
 
 async def test_export_command_hides_the_server_path(plugin):
