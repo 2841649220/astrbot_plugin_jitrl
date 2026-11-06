@@ -32,10 +32,12 @@ Hook wiring:
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import inspect
 import json
 import random
+import shutil
 import sqlite3
 import threading
 import time
@@ -61,6 +63,7 @@ from .jitrl.memory import MemoryBank
 from .jitrl.models import Neighbor, PolicyDecision, StateView, ValueEstimate
 from .jitrl.policy import build_candidates, select_action, verbalized_to_logit
 from .jitrl.reranker import VerbalizedReranker
+from .jitrl.settings import settings_schema, settings_values, update_settings
 from .jitrl.state import abstract_state, redact
 from .jitrl.trajectory import build_episode, extract_transitions, infer_success
 
@@ -205,6 +208,11 @@ class JitRLLearner(Star):
         """
         super().__init__(context)
         self.cfg = JitRLConfig.from_raw(config)
+        self._raw_config = config
+        self._config_lock = asyncio.Lock()
+        self._settings_revision = 0
+        self._resetting_robots: set[str] = set()
+        self._reset_locks: dict[str, asyncio.Lock] = {}
         data_root = Path(get_astrbot_plugin_data_path()) / _PLUGIN_DATA_DIR
         self._data_root = data_root
         self._legacy_db_path = data_root / "memory.sqlite3"
@@ -1323,8 +1331,12 @@ class JitRLLearner(Star):
 
         umo = event.unified_msg_origin
         robot_id = self._robot_key_for_event(event)
+        if robot_id in self._resetting_robots:
+            event.set_extra(_GENERATION_KEY, -1)
+            return
         cache_scope = self._cache_scope(event)
         generation = bank.generation
+        settings_revision = self._settings_revision
         event.set_extra(_GENERATION_KEY, generation)
         user_text = (event.get_message_str() or req.prompt or "").strip()
 
@@ -1343,6 +1355,7 @@ class JitRLLearner(Star):
             cache_key = (
                 cache_scope,
                 generation,
+                settings_revision,
                 self.cfg.apply_mode,
                 tuple(sorted(tool_names)),
                 state.signature,
@@ -1363,7 +1376,10 @@ class JitRLLearner(Star):
                 # re-sampling) it on every step.
                 self._decision_cache.move_to_end(cache_key)
 
-            if generation != bank.generation:
+            if (
+                generation != bank.generation
+                or settings_revision != self._settings_revision
+            ):
                 return
             if snapshot.block:
                 # The block is appended to the *user* message as a temporary
@@ -1438,6 +1454,8 @@ class JitRLLearner(Star):
 
         try:
             context = event.get_extra(_EVENT_EXTRA_KEY) or {}
+            if self._active_robot_key.get() in self._resetting_robots:
+                return
             umo = event.unified_msg_origin
             cache_scope = self._cache_scope(event)
             user_text = context.get("user_text") or (event.get_message_str() or "")
@@ -1780,12 +1798,17 @@ class JitRLLearner(Star):
                 )
                 return
             if scope == "all":
-                removed = await self._bank.clear()
+                removed = await self._reset_robot_data(self._bank)
             else:
                 removed = await self._bank.forget(scope=event.unified_msg_origin)
             self._invalidate_memory_cache()
             yield event.plain_result(
-                f"已删除 {removed} 条经验。删除前已自动备份，可用 /jitrl checkpoints 查看并回退。"
+                f"已删除 {removed} 条经验。"
+                + (
+                    "当前机器人的 Episodes、运行计数、检查点和导出已清空，恢复初始化。"
+                    if scope == "all"
+                    else "本会话记忆已清除，未创建备份。"
+                )
             )
         except Exception:
             logger.warning("[JitRL] forget command failed", exc_info=True)
@@ -1930,6 +1953,45 @@ class JitRLLearner(Star):
             for key, value in self._decision_cache.items()
             if not str(key[0]).startswith(prefix)
         }
+
+    async def _reset_robot_data(self, bank: MemoryBank) -> int:
+        """Reset one robot without retaining recovery copies or stale counters."""
+        robot_key = self._active_robot_key.get()
+        if not robot_key:
+            raise ValueError("请先选择机器人实例。")
+        lock = self._reset_locks.setdefault(robot_key, asyncio.Lock())
+        async with lock:
+            self._resetting_robots.add(robot_key)
+            try:
+                removed = await bank.clear()
+                self._stats_by_robot.pop(robot_key, None)
+                self._rng_by_robot.pop(robot_key, None)
+                self._invalidate_memory_cache()
+                self._state_cache = OrderedDict(
+                    (key, value)
+                    for key, value in self._state_cache.items()
+                    if key[0] != robot_key
+                )
+                await asyncio.to_thread(self._clear_robot_files, robot_key)
+                return removed
+            finally:
+                self._resetting_robots.discard(robot_key)
+
+    def _clear_robot_files(self, robot_key: str) -> None:
+        """Remove only this robot's exports and superseded migration copies."""
+        directory = self._robot_dirs[robot_key]
+        for pattern in ("export-*.json*", "jitrl-export.json*"):
+            for path in directory.glob(pattern):
+                if path.is_file() or path.is_symlink():
+                    path.unlink()
+        archive_root = self._data_root / "robots" / _ROBOT_ARCHIVE_DIR
+        archive = archive_root / robot_key
+        if archive.is_symlink() or not archive.resolve().is_relative_to(
+            archive_root.resolve()
+        ):
+            raise ValueError("旧数据归档目录无效。")
+        if archive.is_dir():
+            shutil.rmtree(archive)
 
     def _invalidate_memory_cache(self) -> None:
         robot_key = self._active_robot_key.get()
@@ -2082,6 +2144,13 @@ class JitRLLearner(Star):
         """
         routes = (
             ("/astrbot_plugin_jitrl/robots", self._web_robots, ["GET"], "robots"),
+            ("/astrbot_plugin_jitrl/settings", self._web_settings, ["GET"], "settings"),
+            (
+                "/astrbot_plugin_jitrl/settings/save",
+                self._web_save_settings,
+                ["POST"],
+                "save settings",
+            ),
             ("/astrbot_plugin_jitrl/overview", self._web_overview, ["GET"], "overview"),
             ("/astrbot_plugin_jitrl/curve", self._web_curve, ["GET"], "curve"),
             ("/astrbot_plugin_jitrl/actions", self._web_actions, ["GET"], "actions"),
@@ -2128,6 +2197,75 @@ class JitRLLearner(Star):
         from astrbot.api.web import json_response
 
         return json_response({"robots": self._known_robots()})
+
+    def _settings_payload(self) -> dict[str, Any]:
+        return {
+            "schema": settings_schema(),
+            "values": settings_values(self.cfg),
+            "revision": self._settings_revision,
+            "persistent": callable(getattr(self._raw_config, "save_config", None)),
+        }
+
+    async def _web_settings(self) -> Any:
+        from astrbot.api.web import json_response
+
+        async with self._config_lock:
+            return json_response(self._settings_payload())
+
+    def _persist_settings(self, values: dict[str, Any]) -> bool:
+        """Save with AstrBot's own config object; restore it if the save fails."""
+        raw = self._raw_config
+        if not isinstance(raw, dict):
+            return False
+        previous = copy.deepcopy(dict(raw))
+        try:
+            raw.update(values)
+            save = getattr(raw, "save_config", None)
+            if callable(save):
+                save()
+                return True
+            return False
+        except Exception:
+            raw.clear()
+            raw.update(previous)
+            raise
+
+    async def _apply_settings(self, config: JitRLConfig) -> None:
+        self.cfg = config
+        for bank in list(self._banks.values()):
+            await bank.configure(config.memory)
+        self._state_cache.clear()
+        self._last_decision.clear()
+        self._decision_cache.clear()
+
+    async def _web_save_settings(self) -> Any:
+        from astrbot.api.web import error_response, json_response, request
+
+        try:
+            payload = await request.json(default={})
+            if not isinstance(payload, dict):
+                return error_response("请求体必须是 JSON 对象。")
+            async with self._config_lock:
+                if type(payload.get("revision")) is not int:
+                    return error_response("缺少设置版本，请重新加载设置。")
+                if payload["revision"] != self._settings_revision:
+                    return error_response(
+                        "设置已被其他页面修改，请重新加载设置。", status_code=409
+                    )
+                config = update_settings(
+                    self.cfg, payload.get("values"), settings_schema()
+                )
+                await asyncio.to_thread(self._persist_settings, settings_values(config))
+                await self._apply_settings(config)
+                self._settings_revision += 1
+                return json_response(self._settings_payload())
+        except ValueError as exc:
+            return error_response(str(exc))
+        except Exception:
+            logger.warning("[JitRL] settings save failed", exc_info=True)
+            return error_response(
+                "设置保存失败，请查看 AstrBot 日志。", status_code=500
+            )
 
     def _select_web_robot(self, requested: str | None) -> str | None:
         """Resolve a dashboard selection to a known robot memory bank."""
@@ -2373,13 +2511,16 @@ class JitRLLearner(Star):
                 return error_response("当前没有机器人实例可管理。")
             scope = str(payload.get("scope", "all")).strip().lower()
             if scope == "all":
-                removed = await bank.clear()
+                removed = await self._reset_robot_data(bank)
             elif scope == "session" and payload.get("umo"):
                 removed = await bank.forget(scope=str(payload["umo"]))
             else:
                 return error_response("scope must be all, or session with umo")
             self._invalidate_memory_cache()
-            return json_response({"removed": removed})
+            counts = await bank.counts()
+            return json_response(
+                {"removed": removed, **counts, "reset": scope == "all"}
+            )
         except ValueError as exc:
             return error_response(str(exc))
         except Exception:

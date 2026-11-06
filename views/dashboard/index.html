@@ -19,7 +19,7 @@
         <span id="chip-state" class="chip chip-muted">--</span>
         <button id="btn-refresh" class="btn" type="button">刷新</button>
         <button id="btn-export" class="btn" type="button">导出</button>
-        <button id="btn-forget" class="btn btn-danger" type="button" data-memory-mutation>清空记忆</button>
+        <button id="btn-forget" class="btn btn-danger" type="button" data-memory-mutation>清除数据并初始化</button>
       </div>
     </header>
 
@@ -63,6 +63,20 @@
         <h2>当前超参数</h2>
         <dl id="hyper" class="hyper"></dl>
         <div id="last-decision" class="decision"></div>
+      </section>
+      <section class="card span-2">
+        <h2>参数设置 <small>学习、检索、策略与存储等全部配置</small></h2>
+        <form id="settings-form">
+          <fieldset id="settings-controls">
+            <div id="settings-fields" class="settings-fields"></div>
+            <div class="settings-actions">
+              <button class="btn" type="submit">保存并应用</button>
+              <button id="btn-settings-defaults" class="btn" type="button">重置超参数</button>
+              <button id="btn-settings-reload" class="btn" type="button">重新加载设置</button>
+            </div>
+          </fieldset>
+        </form>
+        <p id="settings-hint" class="hint" role="status" aria-live="polite"></p>
       </section>
     </main>
 

@@ -110,23 +110,21 @@ async def test_session_restore_rejects_cross_scope_episode_conflict(bank):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scope", [None, "s1"])
-async def test_delete_creates_recoverable_safety_backup(bank, scope):
+async def test_delete_does_not_create_backup_and_full_reset_drops_history(bank, scope):
     await bank.add_episode(episode("a", "s1"))
     await bank.add_episode(episode("b", "s2"))
-    before = await contents(bank)
+    saved = await bank.create_checkpoint("existing")
     if scope is None:
         assert await bank.clear() == 2
     else:
         assert await bank.forget(scope=scope) == 1
         assert await bank.count("s2") == 1
-    backup = (await bank.list_checkpoints())[0]
-    assert backup["kind"] == "before_forget"
-    await bank.restore_checkpoint(backup["id"])
-    assert await contents(bank) == before
+    snapshots = await bank.list_checkpoints()
+    assert [row["id"] for row in snapshots] == ([] if scope is None else [saved["id"]])
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("operation", ["clear", "forget", "restore"])
+@pytest.mark.parametrize("operation", ["restore"])
 async def test_failed_safety_backup_aborts_mutation(bank, monkeypatch, operation):
     await bank.add_episode(episode("a"))
     saved = await bank.create_checkpoint()
@@ -230,18 +228,17 @@ async def test_auto_rotation_preserves_manual_and_separate_safety_history(tmp_pa
     )
     try:
         await bank.initialize()
-        startup = (await bank.list_checkpoints())[0]
-        assert startup["kind"] == "startup" and startup["experiences"] == 0
+        assert await bank.list_checkpoints() == []
         manual = await bank.create_checkpoint("stable")
         for i in range(8):
             await bank.add_episode(episode(str(i)))
         rows = await bank.list_checkpoints()
         assert [row["experiences"] for row in rows if row["kind"] == "auto"] == [8, 6]
         for _ in range(4):
-            await bank.clear()
+            await bank.restore_checkpoint(manual["id"])
         rows = await bank.list_checkpoints()
         assert manual["id"] in {row["id"] for row in rows}
-        assert len([row for row in rows if row["kind"] == "before_forget"]) == 2
+        assert len([row for row in rows if row["kind"] == "before_restore"]) == 2
         assert len([row for row in rows if row["kind"] == "auto"]) == 2
         await bank.delete_checkpoint(manual["id"])
         assert len(await bank.list_checkpoints()) == 4
@@ -341,6 +338,42 @@ async def test_uncommitted_transaction_does_not_hang_backup(bank):
 
 
 @pytest.mark.asyncio
+async def test_full_reset_removes_damaged_snapshots_and_restarts_ids_and_auto_interval(
+    tmp_path, monkeypatch
+):
+    bank = MemoryBank(tmp_path / "reset.sqlite3", checkpoint_interval=3)
+    try:
+        await bank.initialize()
+        await bank.add_episode(episode("old-a"))
+        await bank.add_episode(episode("old-b"))
+        await bank.create_checkpoint("manual")
+        (bank._checkpoints.directory / "broken.tmp").write_bytes(b"incomplete")
+        generation = bank.generation
+
+        def no_backup(*args, **kwargs):
+            raise AssertionError("clear must never create a snapshot")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(CheckpointStore, "create", no_backup)
+            assert await bank.clear() == 2
+        assert bank.generation > generation
+        assert bank._episodes_since_checkpoint == 0
+        assert not bank._checkpoints.directory.exists()
+        assert (
+            await bank.add_episode(episode("late"), expected_generation=generation) == 0
+        )
+        await bank.add_episode(episode("new-a"))
+        assert bank._conn.execute("SELECT id FROM episodes").fetchone()[0] == 1
+        assert await bank.list_checkpoints() == []
+        await bank.add_episode(episode("new-b"))
+        await bank.add_episode(episode("new-c"))
+        snapshots = await bank.list_checkpoints()
+        assert len(snapshots) == 1 and snapshots[0]["episodes"] == 3
+    finally:
+        await bank.close()
+
+
+@pytest.mark.asyncio
 async def test_restore_protects_selected_safety_snapshot_during_rotation(tmp_path):
     bank = MemoryBank(
         tmp_path / "memory.sqlite3", checkpoint_interval=0, keep_checkpoints=1
@@ -348,8 +381,13 @@ async def test_restore_protects_selected_safety_snapshot_during_rotation(tmp_pat
     try:
         await bank.initialize()
         await bank.add_episode(episode("trusted"))
-        await bank.clear()
-        saved = (await bank.list_checkpoints())[0]
+        original = await bank.create_checkpoint()
+        await bank.restore_checkpoint(original["id"])
+        saved = next(
+            row
+            for row in await bank.list_checkpoints()
+            if row["kind"] == "before_restore"
+        )
         await bank.add_episode(episode("polluted"))
         result = await bank.restore_checkpoint(saved["id"])
         assert bank._checkpoints.path(saved["id"]).is_file()
@@ -374,7 +412,7 @@ async def test_transient_bank_requires_explicit_checkpoint_directory(tmp_path):
         await bank.initialize()
         await bank.add_episode(episode("a"))
         saved = await bank.create_checkpoint()
-        await bank.clear()
+        await bank.forget(scope="s1")
         await bank.restore_checkpoint(saved["id"])
         assert await bank.count() == 1
     finally:
