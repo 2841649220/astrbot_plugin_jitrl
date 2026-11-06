@@ -1805,7 +1805,7 @@ class JitRLLearner(Star):
             yield event.plain_result(
                 f"已删除 {removed} 条经验。"
                 + (
-                    "当前机器人的 Episodes、运行计数、检查点和导出已清空，恢复初始化。"
+                    "当前机器人的 Episodes、运行计数、检查点和导出已清空，超参数已保留，恢复初始化。"
                     if scope == "all"
                     else "本会话记忆已清除，未创建备份。"
                 )

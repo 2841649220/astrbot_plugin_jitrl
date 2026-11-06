@@ -433,7 +433,7 @@ async function forgetAll() {
     forgetArmed = true;
     forgetButton.textContent = "再次点击确认清空";
     forgetButton.classList.add("btn-armed");
-    sayAction("将永久清除当前机器人的经验、Episodes、运行计数、全部检查点和导出，恢复初始化，不保留备份。请再点一次确认（6 秒后自动取消）。");
+    sayAction("将永久清除当前机器人的经验、Episodes、运行计数、全部检查点和导出，保留当前超参数，恢复初始化，不保留备份。请再点一次确认（6 秒后自动取消）。");
     if (forgetTimer) clearTimeout(forgetTimer);
     forgetTimer = setTimeout(disarmForget, FORGET_ARM_MS);
     return;
@@ -444,7 +444,7 @@ async function forgetAll() {
   try {
     const result = await bridge.apiPost("forget", { scope: "all", confirm: true, robot: selectedRobotId });
     const removed = result && typeof result.removed === "number" ? result.removed : 0;
-    sayAction("已清除 " + removed + " 条经验及全部检查点和导出，Episodes 与运行计数已归零，初始化完成。");
+    sayAction("已清除 " + removed + " 条经验及全部检查点和导出，Episodes 与运行计数已归零；超参数已保留，初始化完成。");
     await refresh();
   } catch (error) {
     sayAction("清空失败：" + String((error && error.message) || error), true);

@@ -32,4 +32,4 @@ V0.1.5 和 V0.2.4 共用以下管理行为。
 设置接口为 `GET /astrbot_plugin_jitrl/settings` 与 `POST /astrbot_plugin_jitrl/settings/save`。
 
 本地回归覆盖数据库清空、损坏快照、自动保存间隔、旧评估回写、重载、机器人隔离、配置持久化及保存失败、
-数据清除保留自定义参数、默认值按钮与无机器人时的设置入口。完整 AstrBot 部署验证仍需宿主环境。
+数据清除保留自定义参数、默认值按钮与无机器人时的设置入口。另外使用 AstrBot v4.29.0 与 master（`86c24e8`）的真实 PluginRequest/json_response 辅助代码及 Chrome 浏览器验证设置保存、数据清除保留参数和独立默认值按钮。完整 AstrBot 部署验证仍需宿主环境。

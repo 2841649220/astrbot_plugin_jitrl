@@ -149,8 +149,8 @@ git clone https://github.com/2841649220/astrbot_plugin_jitrl.git
 Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot_version`
 阻止加载。
 
-也可从 [v0.1.4 Release](https://github.com/2841649220/astrbot_plugin_jitrl/releases/tag/v0.1.4)
-下载 `astrbot_plugin_jitrl-v0.1.4.zip`，在 AstrBot 插件管理页选择「从文件安装」。
+也可从 [v0.1.5 Release](https://github.com/2841649220/astrbot_plugin_jitrl/releases/tag/v0.1.5)
+下载 `astrbot_plugin_jitrl-v0.1.5.zip`，在 AstrBot 插件管理页选择「从文件安装」。
 安装包包含单个插件根目录，以及完整的代码、配置和面板资源。
 
 **零第三方依赖**：只用 Python 标准库（`sqlite3` / `json` / `re` / `asyncio` / `math`），不需要 `pip install` 任何东西。
