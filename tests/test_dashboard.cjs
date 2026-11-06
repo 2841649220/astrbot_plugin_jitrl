@@ -37,6 +37,10 @@ class Element {
     };
   }
   set textContent(value) { this.text = String(value); this.children = []; }
+  set type(value) {
+    if (this.tag === "textarea") throw new TypeError("textarea.type is read-only");
+    this.inputType = value;
+  }
   get textContent() { return this.text || this.children.map((c) => c.textContent).join(""); }
   set innerHTML(value) { throw new Error("Untrusted data must use textContent"); }
   append(...items) { this.children.push(...items); }
