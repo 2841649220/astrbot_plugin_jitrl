@@ -238,6 +238,7 @@ class JitRLLearner(Star):
         self._config_lock = asyncio.Lock()
         self._settings_revision = 0
         self._resetting_robots: set[str] = set()
+        self._robot_reset_epochs: dict[str, int] = {}
         self._reset_locks: dict[str, asyncio.Lock] = {}
         data_root = Path(get_astrbot_plugin_data_path()) / _PLUGIN_DATA_DIR
         self._data_root = data_root
@@ -1187,6 +1188,8 @@ class JitRLLearner(Star):
     async def _neural_request(
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
+        robot_id = self._robot_key_for_event(event)
+        reset_epoch = self._robot_reset_epochs.get(robot_id, 0)
         try:
             runtime = await self._ensure_neural(event)
             runtime_config = runtime.cfg
@@ -1240,6 +1243,11 @@ class JitRLLearner(Star):
             ):
                 return
             if not await runtime.commit(decision, epoch):
+                return
+            if (
+                reset_epoch != self._robot_reset_epochs.get(robot_id, 0)
+                or runtime.cfg is not runtime_config
+            ):
                 return
             if part is not None:
                 req.extra_user_content_parts.append(part)
@@ -2647,6 +2655,9 @@ class JitRLLearner(Star):
         lock = self._reset_locks.setdefault(robot_key, asyncio.Lock())
         async with lock:
             self._resetting_robots.add(robot_key)
+            self._robot_reset_epochs[robot_key] = (
+                self._robot_reset_epochs.get(robot_key, 0) + 1
+            )
             try:
                 removed = await bank.clear()
                 async with self._neural_ready_lock:

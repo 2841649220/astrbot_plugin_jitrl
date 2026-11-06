@@ -139,6 +139,33 @@ async def test_neural_settings_apply_to_open_runtime_without_erasing_snapshots(
     assert runtime.cfg.query_heads == 6
 
 
+async def test_committed_request_resuming_after_full_reset_cannot_restore_counters(
+    plugin, host, monkeypatch
+):
+    runtime = await plugin._ensure_neural(Event())
+    original = runtime.commit
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def delayed_commit(decision, epoch):
+        committed = await original(decision, epoch)
+        entered.set()
+        await resume.wait()
+        return committed
+
+    monkeypatch.setattr(runtime, "commit", delayed_commit)
+    event = Event()
+    pending = asyncio.create_task(plugin.on_llm_request(event, request()))
+    await asyncio.wait_for(entered.wait(), 3)
+    try:
+        assert "恢复初始化" in await command(plugin.jitrl_forget(Event(), "all"))
+    finally:
+        resume.set()
+    await asyncio.wait_for(pending, 3)
+    assert all(value == 0 for value in plugin._stats.values())
+    assert event.get_extra(host.module._NEURAL_KEY).frames == []
+    assert runtime.store.stats()["decisions"] == 0
+
+
 class Tools:
     """Tool set whose identity and contents must survive advisory inference."""
 
