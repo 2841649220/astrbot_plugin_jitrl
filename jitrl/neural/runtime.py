@@ -133,6 +133,21 @@ class LensRuntime:
         self._closing = False
         self._closed = False
         self.last_error = ""
+        self._configuration_ready = asyncio.Event()
+        self._configuration_ready.set()
+
+    async def configure(self, cfg: LensConfig) -> None:
+        """Wait for active model workers before replacing operator settings."""
+        async with self._training_lock:
+            self._configuration_ready.clear()
+            try:
+                if self._workers:
+                    await asyncio.gather(*list(self._workers), return_exceptions=True)
+                self.cfg = cfg
+                with self._model_lock:
+                    self._models.clear()
+            finally:
+                self._configuration_ready.set()
 
     async def close(self) -> None:
         self._closing = True
@@ -146,6 +161,7 @@ class LensRuntime:
             self._closed = True
 
     async def _work(self, function: Any, *args: Any, **kwargs: Any) -> Any:
+        await self._configuration_ready.wait()
         if self._closing:
             raise RuntimeError("Neural Lens is closing")
         worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))

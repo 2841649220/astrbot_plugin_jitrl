@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sqlite3
 import time
 import uuid
@@ -156,6 +157,16 @@ class CheckpointStore:
     def delete(self, checkpoint_id: str) -> None:
         """Delete exactly one selected snapshot, including a damaged file."""
         self.path(checkpoint_id).unlink()
+
+    def clear(self) -> None:
+        """Discard the complete snapshot history, including damaged/temp files."""
+        if (
+            self.directory.is_symlink()
+            or self.directory.resolve().parent != self.directory.parent.resolve()
+        ):
+            raise ValueError("检查点目录不能是符号链接。")
+        if self.directory.exists():
+            shutil.rmtree(self.directory)
 
     def restore(
         self,

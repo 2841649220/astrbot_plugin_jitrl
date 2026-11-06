@@ -326,7 +326,7 @@ async def test_forget_rejects_typo_and_clears_all_session_caches(plugin):
     text = await command(plugin.jitrl_forget(Event(), "al"))
     assert "未删除" in text and await plugin._bank.count() == 2
     text = await command(plugin.jitrl_forget(Event(), "all"))
-    assert "自动备份" in text and await plugin._bank.count() == 0
+    assert "恢复初始化" in text and await plugin._bank.count() == 0
     assert not plugin._last_episode and not plugin._last_decision
 
 
@@ -1114,6 +1114,7 @@ async def test_overview_counts_live_episodes_after_forget_and_snapshot_deletion(
     await learn(plugin, "s2")
     before = await web_call(host, plugin, "_web_overview", {})
     assert before.payload["episodes"] == before.payload["total"] == 2
+    await plugin._bank.create_checkpoint("old memory")
 
     response = await web_call(
         host,
@@ -1124,7 +1125,7 @@ async def test_overview_counts_live_episodes_after_forget_and_snapshot_deletion(
     assert response.status_code == 200
     assert response.payload["removed"] == 2 - remaining
     snapshots = await plugin._bank.list_checkpoints()
-    assert snapshots and snapshots[0]["episodes"] == 2
+    assert len(snapshots) == (0 if scope == "all" else 1)
     for snapshot in snapshots:
         response = await web_call(
             host,
@@ -1137,11 +1138,12 @@ async def test_overview_counts_live_episodes_after_forget_and_snapshot_deletion(
 
     after = await web_call(host, plugin, "_web_overview", {})
     assert after.payload["episodes"] == after.payload["total"] == remaining
-    assert after.payload["stats"]["episodes"] == 2
+    learned = 0 if scope == "all" else 2
+    assert after.payload["stats"]["episodes"] == learned
     assert len(await plugin._bank.recent_episodes()) == remaining
     status = await command(plugin.jitrl_status(Event()))
-    assert f"全局 {remaining} 条 / {remaining} 个 Episode" in status
-    assert "本次运行学习累计：episodes=2，experiences=2" in status
+    assert f"本机器人 {remaining} 条 / {remaining} 个 Episode" in status
+    assert f"本次运行学习累计：episodes={learned}，experiences={learned}" in status
 
 
 async def test_overview_counts_persisted_episodes_after_restart_and_rollback(
@@ -1180,3 +1182,210 @@ async def test_export_command_hides_the_server_path(plugin):
     assert "\\\\" not in text and "/" not in text.replace("http://", "")
     files = list(plugin._db_path.parent.glob("export-*.json"))
     assert len(files) == 1
+
+
+async def test_full_reset_discards_exports_archives_counters_and_survives_reload(
+    host, plugin
+):
+    await learn(plugin)
+    robot_id = plugin._active_robot_key.get()
+    bank = plugin._bank
+    await bank.create_checkpoint("must disappear")
+    directory = plugin._db_path.parent
+    (directory / "export-old.json").write_text("old data", encoding="utf-8")
+    (directory / "jitrl-export.json").write_text("old data", encoding="utf-8")
+    archive = plugin._data_root / "robots" / ".legacy" / robot_id / "old"
+    archive.mkdir(parents=True)
+    (archive / "memory.sqlite3.merged").write_bytes(b"old database")
+    plugin._stats.update(requests=4, biased=2, failures=1)
+    other = await plugin._ensure_ready(Event(platform_id="other"))
+    await _seed(other, "other task", "search", 2.0)
+    await other.create_checkpoint("keep me")
+
+    response = await web_call(
+        host,
+        plugin,
+        "_web_forget",
+        {"robot": robot_id, "scope": "all", "confirm": True},
+    )
+    assert response.status_code == 200
+    assert response.payload["episodes"] == response.payload["experiences"] == 0
+    assert await bank.list_checkpoints() == []
+    assert not list(directory.glob("*export*.json*"))
+    assert not archive.exists()
+    assert all(value == 0 for value in plugin._stats.values())
+    assert await other.count() == 1
+    assert len(await other.list_checkpoints()) == 1
+    await plugin.terminate()
+    restarted = host.module.JitRLLearner(plugin.context, {})
+    try:
+        response = await web_call(host, restarted, "_web_overview", {"robot": robot_id})
+        assert response.payload["episodes"] == response.payload["total"] == 0
+        assert await restarted._bank.list_checkpoints() == []
+    finally:
+        await restarted.terminate()
+
+
+async def test_evaluation_in_flight_cannot_repopulate_full_reset(
+    host, plugin, monkeypatch
+):
+    await learn(plugin)
+    started, resume = asyncio.Event(), asyncio.Event()
+
+    async def delayed_score(self, **kwargs):
+        started.set()
+        await resume.wait()
+        return RewardResult(rewards=[1.0], source="test", ok=True)
+
+    monkeypatch.setattr(host.module.StepRewardEvaluator, "score", delayed_score)
+    pending = asyncio.create_task(learn(plugin))
+    await asyncio.wait_for(started.wait(), 3)
+    try:
+        response = await web_call(
+            host, plugin, "_web_forget", {"scope": "all", "confirm": True}
+        )
+        assert response.status_code == 200
+    finally:
+        resume.set()
+    await asyncio.wait_for(pending, 3)
+    assert await plugin._bank.counts() == {"episodes": 0, "experiences": 0}
+    assert all(value == 0 for value in plugin._stats.values())
+    assert not plugin._last_episode
+    await learn(plugin)
+    assert await plugin._bank.counts() == {"episodes": 1, "experiences": 1}
+
+
+async def test_settings_persist_and_update_all_open_banks(host, plugin):
+    class HostConfig(dict):
+        def save_config(self):
+            self.saved = json.loads(json.dumps(self))
+
+    raw = HostConfig(plugin._raw_config)
+    plugin._raw_config = raw
+    first = plugin._bank
+    second = await plugin._ensure_ready(Event(platform_id="other"))
+    before = await plugin._web_settings()
+    values = {
+        "learning": {"gamma": 0.75, "evaluator_provider_id": "MyProvider-A"},
+        "policy": {"beta": 2.1},
+        "memory": {"max_entries": 750, "checkpoint_interval": 3, "keep_checkpoints": 4},
+    }
+    response = await web_call(
+        host,
+        plugin,
+        "_web_save_settings",
+        {"values": values, "revision": before.payload["revision"]},
+    )
+    assert response.status_code == 200 and response.payload["persistent"]
+    assert response.payload["revision"] == 1
+    assert raw.saved["learning"]["gamma"] == plugin.cfg.learning.gamma == 0.75
+    assert raw.saved["learning"]["evaluator_provider_id"] == "MyProvider-A"
+    assert plugin.cfg.policy.beta == 2.1
+    for bank in (first, second):
+        assert bank.max_entries == 750 and bank.checkpoint_interval == 3
+        assert bank._checkpoints.keep == 4
+    restarted = host.module.JitRLLearner(plugin.context, raw.saved)
+    try:
+        assert restarted.cfg.learning.gamma == 0.75
+        assert restarted.cfg.policy.beta == 2.1
+    finally:
+        await restarted.terminate()
+    stale = await web_call(
+        host,
+        plugin,
+        "_web_save_settings",
+        {"values": {"enabled": False}, "revision": 0},
+    )
+    assert stale.status_code == 409 and plugin.cfg.enabled
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"policy": {"beta": "2"}},
+        {"policy": {"beta": float("nan")}},
+        {"retrieval": {"k": 1.5}},
+        {"retrieval": {"k": True}},
+        {"retrieval": {"k": 65}},
+        {"apply_mode": "unknown"},
+        {"memory": {"path": "other"}},
+        {"learning": []},
+    ],
+)
+async def test_settings_reject_invalid_values_without_partial_changes(
+    host, plugin, values
+):
+    before = (await plugin._web_settings()).payload
+    response = await web_call(
+        host,
+        plugin,
+        "_web_save_settings",
+        {"revision": 0, "values": {"enabled": False, **values}},
+    )
+    assert response.status_code == 400
+    assert (await plugin._web_settings()).payload == before
+
+
+async def test_failed_settings_save_preserves_active_config(host, plugin):
+    class FailingConfig(dict):
+        def save_config(self):
+            raise OSError("disk full")
+
+    raw = FailingConfig(plugin._raw_config)
+    plugin._raw_config = raw
+    before = dict(raw)
+    response = await web_call(
+        host,
+        plugin,
+        "_web_save_settings",
+        {"revision": 0, "values": {"policy": {"beta": 4.0}}},
+    )
+    assert response.status_code == 500
+    assert plugin.cfg.policy.beta == 1.5
+    assert plugin._settings_revision == 0 and raw == before
+
+
+@pytest.mark.parametrize("method", ["web", "command"])
+async def test_data_reset_preserves_custom_hyperparameters_and_saved_config(
+    host, plugin, method
+):
+    class HostConfig(dict):
+        def save_config(self):
+            self.saved = json.loads(json.dumps(self))
+
+    raw = HostConfig(plugin._raw_config)
+    plugin._raw_config = raw
+    response = await web_call(
+        host,
+        plugin,
+        "_web_save_settings",
+        {
+            "revision": 0,
+            "values": {
+                "policy": {"beta": 3.7},
+                "learning": {"gamma": 0.8},
+                "retrieval": {"k": 14},
+            },
+        },
+    )
+    assert response.status_code == 200
+    await learn(plugin)
+    before = (await plugin._web_settings()).payload
+    saved = json.loads(json.dumps(raw.saved))
+    if method == "web":
+        response = await web_call(
+            host, plugin, "_web_forget", {"scope": "all", "confirm": True}
+        )
+        assert response.status_code == 200
+    else:
+        assert "恢复初始化" in await command(plugin.jitrl_forget(Event(), "all"))
+    assert await plugin._bank.counts() == {"experiences": 0, "episodes": 0}
+    assert (await plugin._web_settings()).payload == before
+    assert dict(raw) == raw.saved == saved
+    restarted = host.module.JitRLLearner(plugin.context, raw.saved)
+    try:
+        assert restarted.cfg.policy.beta == 3.7
+        assert restarted.cfg.learning.gamma == 0.8
+        assert restarted.cfg.retrieval.k == 14
+    finally:
+        await restarted.terminate()

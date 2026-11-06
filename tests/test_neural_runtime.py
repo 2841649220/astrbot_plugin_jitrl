@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib.util
 import threading
@@ -20,6 +21,33 @@ from jitrl.neural.contracts import (
 from jitrl.neural.encoding import canonicalize, digest
 from jitrl.neural.runtime import LensRuntime, render_evidence
 from jitrl.neural.store import LensStore
+
+
+@pytest.mark.asyncio
+async def test_configure_waits_for_current_worker_and_keeps_facts(tmp_path):
+    runtime = LensRuntime(tmp_path, LensConfig())
+    entered, release = threading.Event(), threading.Event()
+    config = replace(runtime.cfg, learning_rate=0.001, min_support=5)
+
+    def work():
+        entered.set()
+        assert release.wait(3)
+        return runtime.cfg.learning_rate
+
+    worker = asyncio.create_task(runtime._work(work))
+    await asyncio.to_thread(entered.wait, 3)
+    pending = asyncio.create_task(runtime.configure(config))
+    await asyncio.sleep(0)
+    assert not pending.done()
+    release.set()
+    try:
+        assert await worker == 0.0003
+        await pending
+        assert runtime.cfg is config
+        assert runtime.store.stats()["decisions"] == 0
+    finally:
+        await runtime.close()
+
 
 HAS_TORCH = importlib.util.find_spec("torch") is not None
 needs_torch = pytest.mark.skipif(not HAS_TORCH, reason="optional PyTorch not installed")

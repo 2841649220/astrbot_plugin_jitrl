@@ -60,7 +60,7 @@
         "type": "float",
         "default": 30.0,
         "slider": {
-          "min": 5,
+          "min": 3,
           "max": 180,
           "step": 5
         }
@@ -70,7 +70,7 @@
         "type": "float",
         "default": 0.5,
         "slider": {
-          "min": 0.05,
+          "min": 0.01,
           "max": 0.99,
           "step": 0.05
         },
@@ -93,7 +93,7 @@
         "default": 1,
         "slider": {
           "min": 1,
-          "max": 10,
+          "max": 50,
           "step": 1
         }
       },
@@ -127,8 +127,8 @@
         "type": "int",
         "default": 10,
         "slider": {
-          "min": 3,
-          "max": 20,
+          "min": 1,
+          "max": 64,
           "step": 1
         },
         "hint": "论文实测 k∈[8,14] 最稳；过小方差大，过大噪声多。"
@@ -170,8 +170,8 @@
         "type": "int",
         "default": 4000,
         "slider": {
-          "min": 200,
-          "max": 20000,
+          "min": 50,
+          "max": 200000,
           "step": 100
         },
         "hint": "SQL 降级扫描的单批读取条数，同时兼容旧版的最大返回条数限制。候选不再按重叠词数或新旧截断，最终返回精确相似度最高的 min(k, 此值) 条；此值不再代表打分工作量或耗时的硬上限。"
@@ -181,8 +181,8 @@
         "type": "float",
         "default": 30.0,
         "slider": {
-          "min": 1,
-          "max": 365,
+          "min": 0,
+          "max": 3650,
           "step": 1
         },
         "hint": "越久远的经验返回值按此衰减轻微下调。"
@@ -193,7 +193,7 @@
         "default": 1,
         "slider": {
           "min": 1,
-          "max": 5,
+          "max": 20,
           "step": 1
         },
         "hint": "低于该次数的动作不再直接丢弃，而是把它的回报向状态基线 V(s) 收缩（经验贝叶斯平滑）；1 表示不做平滑。"
@@ -223,8 +223,8 @@
         "type": "float",
         "default": 1.5,
         "slider": {
-          "min": 0.1,
-          "max": 10,
+          "min": 0,
+          "max": 20,
           "step": 0.1
         },
         "hint": "z' = z + β·Â 中控制策略偏离参考策略的强度。β 越大越激进。"
@@ -245,8 +245,8 @@
         "type": "float",
         "default": 5.0,
         "slider": {
-          "min": 0.5,
-          "max": 20,
+          "min": 0,
+          "max": 50,
           "step": 0.5
         },
         "hint": "未见动作的乐观价值 V(s)+α/|N(s)|，记忆越稀疏奖励越大。期望式下等价于优势 A=λ·α/|N(s)|。"
@@ -276,8 +276,8 @@
         "type": "float",
         "default": 1.0,
         "slider": {
-          "min": 0.1,
-          "max": 3,
+          "min": 0.05,
+          "max": 5,
           "step": 0.1
         }
       },
@@ -287,7 +287,7 @@
         "default": 3,
         "slider": {
           "min": 2,
-          "max": 8,
+          "max": 16,
           "step": 1
         },
         "hint": "论文使用 3 个候选动作。"
@@ -304,7 +304,7 @@
         "default": 3,
         "slider": {
           "min": 1,
-          "max": 20,
+          "max": 100,
           "step": 1
         }
       },
@@ -323,8 +323,8 @@
         "type": "int",
         "default": 900,
         "slider": {
-          "min": 200,
-          "max": 4000,
+          "min": 0,
+          "max": 8000,
           "step": 100
         }
       }
@@ -339,8 +339,8 @@
         "type": "int",
         "default": 20000,
         "slider": {
-          "min": 500,
-          "max": 200000,
+          "min": 100,
+          "max": 1000000,
           "step": 500
         }
       },
@@ -370,8 +370,8 @@
         "type": "int",
         "default": 500,
         "slider": {
-          "min": 50,
-          "max": 5000,
+          "min": 10,
+          "max": 100000,
           "step": 50
         }
       },
@@ -384,7 +384,7 @@
           "max": 10000,
           "step": 1
         },
-        "hint": "首次使用时保存基线，之后每累计指定数量的 Episode 保存快照。0 关闭自动检查点，清空/回退前的安全备份仍保留。计数在插件重载后重新开始。"
+        "hint": "每累计指定数量的 Episode 保存快照；0 关闭自动检查点。清除数据会删除全部旧检查点且不创建备份，自动计数重新开始。回退仍保存操作前备份。"
       },
       "keep_checkpoints": {
         "description": "自动/安全检查点各自保留数量",
@@ -395,7 +395,7 @@
           "max": 200,
           "step": 1
         },
-        "hint": "自动检查点和操作前备份分别轮换。手动检查点不会自动删除，需要在面板或指令中主动删除。"
+        "hint": "自动检查点和回退前备份分别轮换。手动检查点保留至主动删除；清除全部数据时一并移除。"
       }
     }
   },
@@ -447,8 +447,8 @@
         "type": "int",
         "default": 180,
         "slider": {
-          "min": 30,
-          "max": 1800,
+          "min": 10,
+          "max": 86400,
           "step": 30
         }
       }
@@ -521,65 +521,125 @@
       "train_every": {
         "description": "后台训练间隔（执行事实数）",
         "type": "int",
-        "default": 32
+        "default": 32,
+        "slider": {
+          "min": 1,
+          "max": 10000,
+          "step": 1
+        }
       },
       "min_samples": {
         "description": "最少已结算训练样本",
         "type": "int",
-        "default": 32
+        "default": 32,
+        "slider": {
+          "min": 2,
+          "max": 100000,
+          "step": 1
+        }
       },
       "train_steps": {
         "description": "单次训练步数",
         "type": "int",
-        "default": 20
+        "default": 20,
+        "slider": {
+          "min": 1,
+          "max": 1000,
+          "step": 1
+        }
       },
       "batch_size": {
         "description": "训练批大小",
         "type": "int",
-        "default": 16
+        "default": 16,
+        "slider": {
+          "min": 1,
+          "max": 128,
+          "step": 1
+        }
       },
       "learning_rate": {
         "description": "本地学习率",
         "type": "float",
-        "default": 0.0003
+        "default": 0.0003,
+        "slider": {
+          "min": 1e-06,
+          "max": 0.01,
+          "step": 1e-06
+        }
       },
       "min_support": {
         "description": "最少不同历史回合支持",
         "type": "int",
         "default": 3,
-        "hint": "按具有正相似度与可靠度权重的独立 episode 计数；同一回合重复调用不会增加支持度。PRE 证据还要求对应动作当前可用。"
+        "hint": "按具有正相似度与可靠度权重的独立 episode 计数；同一回合重复调用不会增加支持度。PRE 证据还要求对应动作当前可用。",
+        "slider": {
+          "min": 1,
+          "max": 32,
+          "step": 1
+        }
       },
       "max_uncertainty": {
         "description": "残差不确定性代理阈值",
         "type": "float",
         "default": 0.5,
-        "hint": "此数值未经概率校准，不是统计置信界。"
+        "hint": "此数值未经概率校准，不是统计置信界。",
+        "slider": {
+          "min": 0.01,
+          "max": 2.0,
+          "step": 0.01
+        }
       },
       "relevance_threshold": {
         "description": "结构动作相关性代理阈值",
         "type": "float",
-        "default": 0.6
+        "default": 0.6,
+        "slider": {
+          "min": 0.0,
+          "max": 1.0,
+          "step": 0.01
+        }
       },
       "similarity_threshold": {
         "description": "冻结词法检索相似度阈值",
         "type": "float",
-        "default": 0.25
+        "default": 0.25,
+        "slider": {
+          "min": 0.0,
+          "max": 1.0,
+          "step": 0.01
+        }
       },
       "max_adjustment": {
         "description": "POST 代理评分最大调整幅度",
         "type": "float",
-        "default": 1.0
+        "default": 1.0,
+        "slider": {
+          "min": 0.0,
+          "max": 2.0,
+          "step": 0.01
+        }
       },
       "evidence_tokens": {
         "description": "提示预算目标",
         "type": "int",
         "default": 128,
-        "hint": "当前使用不超过此数的 UTF-8 字节作为保守 token 预算代理；仅输出受控名称、历史回报、来源和证据 ID。"
+        "hint": "当前使用不超过此数的 UTF-8 字节作为保守 token 预算代理；仅输出受控名称、历史回报、来源和证据 ID。",
+        "slider": {
+          "min": 32,
+          "max": 256,
+          "step": 1
+        }
       },
       "replay_limit": {
         "description": "回放及检索扫描上限",
         "type": "int",
-        "default": 2048
+        "default": 2048,
+        "slider": {
+          "min": 32,
+          "max": 20000,
+          "step": 1
+        }
       },
       "attention_backend": {
         "description": "神经注意力主干",
@@ -596,23 +656,43 @@
       "mita_landmarks": {
         "description": "每层 MiTA 的 landmark / expert 数",
         "type": "int",
-        "default": 8
+        "default": 8,
+        "slider": {
+          "min": 1,
+          "max": 32,
+          "step": 1
+        }
       },
       "mita_topk": {
         "description": "每个 expert 的原始 KV 上限",
         "type": "int",
-        "default": 16
+        "default": 16,
+        "slider": {
+          "min": 1,
+          "max": 64,
+          "step": 1
+        }
       },
       "mita_query_chunk": {
         "description": "MiTA query / expert 分块上限",
         "type": "int",
         "default": 64,
-        "hint": "分组执行在短序列使用不超过 32 的块降低 padding；参考路径使用该 query 分块上限。"
+        "hint": "分组执行在短序列使用不超过 32 的块降低 padding；参考路径使用该 query 分块上限。",
+        "slider": {
+          "min": 1,
+          "max": 256,
+          "step": 1
+        }
       },
       "memory_tokens": {
         "description": "进入神经 token 主干的历史经验上限",
         "type": "int",
-        "default": 128
+        "default": 128,
+        "slider": {
+          "min": 32,
+          "max": 128,
+          "step": 1
+        }
       },
       "device": {
         "description": "本地神经训练与推理设备",
@@ -623,7 +703,7 @@
           "cuda",
           "auto"
         ],
-        "hint": "默认 CPU；cuda 明确要求可用 GPU，auto 自动选择。权重可跨设备加载；修改后重载插件。"
+        "hint": "默认 CPU；cuda 明确要求可用 GPU，auto 自动选择。保存设置后更新运行时，权重可跨设备加载。"
       },
       "mita_execution": {
         "description": "MiTA 执行内核",
@@ -634,6 +714,179 @@
           "reference"
         ],
         "hint": "grouped 按 expert 复用 KV 并使用融合 SDPA；reference 保留逐 query 对照。公式与参数相同，切换无需重训。"
+      },
+      "max_memory": {
+        "description": "legacy 向量主干历史经验上限",
+        "type": "int",
+        "default": 32,
+        "slider": {
+          "min": 1,
+          "max": 128,
+          "step": 1
+        }
+      },
+      "coarse_limit": {
+        "description": "粗检索候选预算",
+        "type": "int",
+        "default": 128,
+        "slider": {
+          "min": 32,
+          "max": 2048,
+          "step": 1
+        },
+        "hint": "必须不小于 max_memory 和 memory_tokens。"
+      },
+      "hidden_dim": {
+        "description": "主干隐藏维度",
+        "type": "int",
+        "default": 384,
+        "hint": "更改模型结构后需重新训练本地权重；保留历史检索快照。hidden_dim 须能被 query_heads 整除，query_heads 须能被 kv_heads 整除。默认主干为四层 MiTA。",
+        "slider": {
+          "min": 24,
+          "max": 1536,
+          "step": 1
+        }
+      },
+      "embedding_dim": {
+        "description": "状态编码维度",
+        "type": "int",
+        "default": 256,
+        "hint": "更改模型结构后需重新训练本地权重；保留历史检索快照。hidden_dim 须能被 query_heads 整除，query_heads 须能被 kv_heads 整除。默认主干为四层 MiTA。",
+        "slider": {
+          "min": 8,
+          "max": 1024,
+          "step": 1
+        }
+      },
+      "summary_dim": {
+        "description": "摘要编码维度",
+        "type": "int",
+        "default": 128,
+        "hint": "更改模型结构后需重新训练本地权重；保留历史检索快照。hidden_dim 须能被 query_heads 整除，query_heads 须能被 kv_heads 整除。默认主干为四层 MiTA。",
+        "slider": {
+          "min": 8,
+          "max": 512,
+          "step": 1
+        }
+      },
+      "blocks": {
+        "description": "Token 注意力层数",
+        "type": "int",
+        "default": 4,
+        "hint": "更改模型结构后需重新训练本地权重；保留历史检索快照。hidden_dim 须能被 query_heads 整除，query_heads 须能被 kv_heads 整除。默认主干为四层 MiTA。",
+        "slider": {
+          "min": 1,
+          "max": 12,
+          "step": 1
+        }
+      },
+      "query_heads": {
+        "description": "Query 注意力头数",
+        "type": "int",
+        "default": 6,
+        "hint": "更改模型结构后需重新训练本地权重；保留历史检索快照。hidden_dim 须能被 query_heads 整除，query_heads 须能被 kv_heads 整除。默认主干为四层 MiTA。",
+        "slider": {
+          "min": 1,
+          "max": 32,
+          "step": 1
+        }
+      },
+      "kv_heads": {
+        "description": "KV 注意力头数",
+        "type": "int",
+        "default": 2,
+        "hint": "更改模型结构后需重新训练本地权重；保留历史检索快照。hidden_dim 须能被 query_heads 整除，query_heads 须能被 kv_heads 整除。默认主干为四层 MiTA。",
+        "slider": {
+          "min": 1,
+          "max": 32,
+          "step": 1
+        }
+      },
+      "bases": {
+        "description": "策略基数",
+        "type": "int",
+        "default": 8,
+        "hint": "更改模型结构后需重新训练本地权重；保留历史检索快照。hidden_dim 须能被 query_heads 整除，query_heads 须能被 kv_heads 整除。默认主干为四层 MiTA。",
+        "slider": {
+          "min": 1,
+          "max": 32,
+          "step": 1
+        }
+      },
+      "rank": {
+        "description": "低秩适配器秩",
+        "type": "int",
+        "default": 8,
+        "hint": "更改模型结构后需重新训练本地权重；保留历史检索快照。hidden_dim 须能被 query_heads 整除，query_heads 须能被 kv_heads 整除。默认主干为四层 MiTA。",
+        "slider": {
+          "min": 1,
+          "max": 64,
+          "step": 1
+        }
+      },
+      "engram_buckets": {
+        "description": "Engram 哈希桶数",
+        "type": "int",
+        "default": 4093,
+        "hint": "更改模型结构后需重新训练本地权重；保留历史检索快照。hidden_dim 须能被 query_heads 整除，query_heads 须能被 kv_heads 整除。默认主干为四层 MiTA。",
+        "slider": {
+          "min": 31,
+          "max": 65521,
+          "step": 1
+        }
+      },
+      "engram_heads": {
+        "description": "Engram 查询头数",
+        "type": "int",
+        "default": 2,
+        "hint": "更改模型结构后需重新训练本地权重；保留历史检索快照。hidden_dim 须能被 query_heads 整除，query_heads 须能被 kv_heads 整除。默认主干为四层 MiTA。",
+        "slider": {
+          "min": 1,
+          "max": 8,
+          "step": 1
+        }
+      },
+      "engram_dim": {
+        "description": "Engram 向量维度",
+        "type": "int",
+        "default": 16,
+        "hint": "更改模型结构后需重新训练本地权重；保留历史检索快照。hidden_dim 须能被 query_heads 整除，query_heads 须能被 kv_heads 整除。默认主干为四层 MiTA。",
+        "slider": {
+          "min": 4,
+          "max": 128,
+          "step": 1
+        }
+      },
+      "max_events": {
+        "description": "状态历史事件上限",
+        "type": "int",
+        "default": 32,
+        "hint": "更改模型结构后需重新训练本地权重；保留历史检索快照。hidden_dim 须能被 query_heads 整除，query_heads 须能被 kv_heads 整除。默认主干为四层 MiTA。",
+        "slider": {
+          "min": 1,
+          "max": 256,
+          "step": 1
+        }
+      },
+      "return_scale": {
+        "description": "回报归一化尺度",
+        "type": "float",
+        "default": 6.0,
+        "slider": {
+          "min": 0.01,
+          "max": 100.0,
+          "step": 0.01
+        }
+      },
+      "seed": {
+        "description": "本地随机种子",
+        "type": "int",
+        "default": 1729,
+        "slider": {
+          "min": 1,
+          "max": 2147483647,
+          "step": 1
+        }
       }
     }
   }

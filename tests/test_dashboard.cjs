@@ -9,6 +9,10 @@ const vm = require("node:vm");
 const view = path.join(__dirname, "..", "views", "dashboard");
 const html = fs.readFileSync(path.join(view, "index.html"), "utf8");
 const source = fs.readFileSync(path.join(view, "app.js"), "utf8");
+const schema = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "_conf_schema.json"), "utf8"));
+function defaultValues(fields) {
+  return Object.fromEntries(Object.entries(fields).map(([key, spec]) => [key, spec.type === "object" ? defaultValues(spec.items) : spec.default]));
+}
 const snapshot = {
   id: "a".repeat(32), name: "可信版本", kind: "manual", created_at: 1000,
   episodes: 1, experiences: 2, size_bytes: 8192,
@@ -62,14 +66,16 @@ async function dashboard(robots = [robot]) {
   const bridge = {
     inventory: [{ ...snapshot }],
     overview: { total: 2, episodes: 1, stats: { episodes: 2 } },
+    settings: { schema, values: defaultValues(schema), revision: 0, persistent: true },
     ready: async () => {},
     apiGet: async (endpoint, params) => {
       gets.push({ endpoint, params: { ...params } });
       return ({
-      robots: { robots },
-      overview: { ...bridge.overview, enabled: true, apply_mode: "hint", robot_id: params.robot, robots },
-      curve: { buckets: [] }, actions: { actions: [] }, episodes: { episodes: [] },
-      checkpoints: { checkpoints: bridge.inventory, interval: 50, keep: 20 },
+        robots: { robots },
+        settings: bridge.settings,
+        overview: { ...bridge.overview, enabled: true, apply_mode: "hint", robot_id: params.robot || (robots[0] && robots[0].id), robots },
+        curve: { buckets: [] }, actions: { actions: [] }, episodes: { episodes: [] },
+        checkpoints: { checkpoints: bridge.inventory, interval: 50, keep: 20 },
       })[endpoint];
     },
     apiPost: async (endpoint, payload) => {
@@ -79,6 +85,10 @@ async function dashboard(robots = [robot]) {
       if (endpoint === "rollback") return { experiences: 2, safety_checkpoint: { id: "b".repeat(32) } };
       if (endpoint === "checkpoint_delete") { bridge.inventory = []; return { deleted: payload.id }; }
       if (endpoint === "forget") return { removed: 2 };
+      if (endpoint === "settings/save") {
+        bridge.settings = { ...bridge.settings, values: payload.values, revision: payload.revision + 1 };
+        return bridge.settings;
+      }
       throw new Error("Unexpected endpoint " + endpoint);
     },
   };
@@ -99,6 +109,7 @@ async function dashboard(robots = [robot]) {
   await context.boot;
   return { ids, bridge, posts, gets, timers, document,
     controls: () => ids.checkpoints.children[0].children[1].children,
+    inputs: () => Object.fromEntries(all().filter((el) => el.name).map((el) => [el.name, el])),
   };
 }
 
@@ -177,33 +188,25 @@ test("failed rollback shows the error and re-enables controls", async () => {
   assert.equal(button.disabled, false);
 });
 
-test("clear retains two-step confirmation and explains recovery", async () => {
+test("clear retains two-step confirmation and explains permanent initialization", async () => {
   const app = await dashboard();
   await app.ids["btn-forget"].emit("click");
   assert.equal(app.posts.length, 0);
-  assert.match(app.ids["action-hint"].textContent, /自动保存检查点/);
+  assert.match(app.ids["action-hint"].textContent, /不保留备份/);
   await app.ids["btn-forget"].emit("click");
   assert.equal(app.posts[0].endpoint, "forget");
-  assert.equal(app.posts[0].payload.robot, robot.id);
-  assert.match(app.ids["action-hint"].textContent, /删除前备份回退/);
+  assert.match(app.ids["action-hint"].textContent, /初始化完成/);
 });
 
-test("episode KPI follows stored episodes through clear, rollback and snapshot deletion", async () => {
+test("full clear resets episode KPI and removes checkpoint inventory", async () => {
   const app = await dashboard();
   assert.equal(app.ids["kpi-episodes"].textContent, "1");
-  app.bridge.postHandler = async (endpoint, payload) => {
+  app.bridge.postHandler = async (endpoint) => {
     if (endpoint === "forget") {
       app.bridge.overview.total = app.bridge.overview.episodes = 0;
-      return { removed: 2 };
-    }
-    if (endpoint === "rollback") {
-      app.bridge.overview.total = 2;
-      app.bridge.overview.episodes = 1;
-      return { experiences: 2, safety_checkpoint: { id: "backup" } };
-    }
-    if (endpoint === "checkpoint_delete") {
       app.bridge.inventory = [];
-      return { deleted: payload.id };
+      app.bridge.overview.stats = { episodes: 0 };
+      return { removed: 2 };
     }
     throw new Error("Unexpected endpoint " + endpoint);
   };
@@ -211,22 +214,64 @@ test("episode KPI follows stored episodes through clear, rollback and snapshot d
   await app.ids["btn-forget"].emit("click");
   assert.equal(app.ids["kpi-total"].textContent, "0");
   assert.equal(app.ids["kpi-episodes"].textContent, "0");
-  const [rollback] = app.controls();
-  await rollback.emit("click");
-  await rollback.emit("click");
-  assert.equal(app.ids["kpi-total"].textContent, "2");
-  assert.equal(app.ids["kpi-episodes"].textContent, "1");
-  const [, remove] = app.controls();
-  await remove.emit("click");
-  await remove.emit("click");
-  assert.equal(app.ids["kpi-episodes"].textContent, "1");
-  assert.equal(app.bridge.overview.stats.episodes, 2);
+  assert.match(app.ids.checkpoints.textContent, /还没有检查点/);
+  assert.equal(app.bridge.overview.stats.episodes, 0);
+});
+
+test("changing robots cancels clear confirmation", async () => {
+  const robot2 = { id: "robot-two", label: "other" };
+  const app = await dashboard([robot, robot2]);
+  await app.ids["btn-forget"].emit("click");
+  app.ids["robot-select"].value = robot2.id;
+  await app.ids["robot-select"].emit("change");
+  await app.ids["btn-forget"].emit("click");
+  assert.equal(app.posts.length, 0);
+});
+
+test("all schema fields are editable and save typed values", async () => {
+  const app = await dashboard();
+  const inputs = app.inputs();
+  assert.ok(inputs["retrieval.k"] && inputs["policy.beta"] && inputs["feedback.positive_keywords"]);
+  assert.equal(inputs["retrieval.k"].min, 1);
+  inputs["retrieval.k"].value = "12";
+  inputs["policy.beta"].value = "2.4";
+  inputs["feedback.positive_keywords"].value = "谢谢\n有效";
+  inputs["learning.enabled"].checked = false;
+  await app.ids["settings-form"].emit("submit");
+  const saved = app.posts[0];
+  assert.equal(saved.endpoint, "settings/save");
+  assert.equal(saved.payload.revision, 0);
+  assert.equal(saved.payload.values.retrieval.k, 12);
+  assert.equal(saved.payload.values.policy.beta, 2.4);
+  assert.equal(saved.payload.values.learning.enabled, false);
+  assert.deepEqual(saved.payload.values.feedback.positive_keywords, ["谢谢", "有效"]);
+  assert.match(app.ids["settings-hint"].textContent, /设置已保存并应用/);
+});
+
+test("default values require a save and settings work before the first robot exists", async () => {
+  const app = await dashboard([]);
+  app.inputs()["policy.beta"].value = "5";
+  await app.ids["btn-settings-defaults"].emit("click");
+  assert.equal(Number(app.inputs()["policy.beta"].value), 1.5);
+  assert.equal(app.posts.length, 0);
+  await app.ids["settings-form"].emit("submit");
+  assert.equal(app.posts[0].endpoint, "settings/save");
+});
+
+test("settings save errors preserve edits and release the form", async () => {
+  const app = await dashboard();
+  app.inputs()["policy.beta"].value = "4";
+  app.bridge.postHandler = async () => { throw new Error("写入失败"); };
+  await app.ids["settings-form"].emit("submit");
+  assert.match(app.ids["settings-hint"].textContent, /写入失败/);
+  assert.equal(app.inputs()["policy.beta"].value, "4");
+  assert.equal(app.ids["settings-controls"].disabled, false);
 });
 
 test("every dashboard read is scoped to the selected robot", async () => {
   const app = await dashboard();
   assert.ok(app.gets.length >= 6);
-  assert.ok(app.gets.filter(({ endpoint }) => endpoint !== "robots").every(({ params }) => params.robot === robot.id));
+  assert.ok(app.gets.filter(({ endpoint }) => !["robots", "settings"].includes(endpoint)).every(({ params }) => params.robot === robot.id));
   assert.equal(app.ids["robot-select"].value, robot.id);
 });
 
@@ -236,7 +281,7 @@ test("switching robots refreshes only the selected instance", async () => {
   app.ids["robot-select"].value = second.id;
   await app.ids["robot-select"].emit("change");
   assert.equal(app.ids["robot-select"].value, second.id);
-  assert.ok(app.gets.filter(({ endpoint }) => endpoint !== "robots").slice(-5).every(({ params }) => params.robot === second.id));
+  assert.ok(app.gets.filter(({ endpoint }) => !["robots", "settings"].includes(endpoint)).slice(-5).every(({ params }) => params.robot === second.id));
 });
 
 test("unlabeled legacy robot falls back to the platform instance id", async () => {

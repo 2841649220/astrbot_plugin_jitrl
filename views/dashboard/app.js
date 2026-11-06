@@ -20,11 +20,15 @@ let checkpointArmed = null;
 let mutationBusy = false;
 let refreshVersion = 0;
 let selectedRobotId = "";
+let settingsPayload = null;
+let settingsBusy = false;
+const settingsInputs = new Map();
 
 function setMutationBusy(busy) {
   mutationBusy = busy;
+  robotSelect.disabled = busy || !selectedRobotId;
   for (const button of document.querySelectorAll("[data-memory-mutation]")) {
-    button.disabled = busy;
+    button.disabled = busy || !selectedRobotId;
   }
   document.getElementById("checkpoint-name").disabled = busy;
   robotSelect.disabled = busy || !selectedRobotId;
@@ -87,7 +91,7 @@ function renderRobotSelector(robots, selected) {
   }
   selectedRobotId = selected || "";
   robotSelect.value = selectedRobotId;
-  robotSelect.disabled = mutationBusy || !selectedRobotId;
+  robotSelect.disabled = !selectedRobotId || mutationBusy;
   for (const button of document.querySelectorAll("[data-memory-mutation]")) {
     button.disabled = mutationBusy || !selectedRobotId;
   }
@@ -429,7 +433,7 @@ function disarmForget() {
   forgetArmed = false;
   if (forgetTimer) clearTimeout(forgetTimer);
   forgetTimer = null;
-  forgetButton.textContent = "清空记忆";
+  forgetButton.textContent = "清除数据并初始化";
   forgetButton.classList.remove("btn-armed");
 }
 
@@ -442,22 +446,139 @@ async function forgetAll() {
     forgetArmed = true;
     forgetButton.textContent = "再次点击确认清空";
     forgetButton.classList.add("btn-armed");
-    sayAction("将清空当前机器人的全部记忆，清空前会自动保存检查点。请再点一次确认（6 秒后自动取消）。");
+    sayAction("将永久清除当前机器人的经验、Episodes、运行计数、全部检查点和导出、神经经验与本地权重，保留当前超参数，恢复初始化，不保留备份。请再点一次确认（6 秒后自动取消）。");
     if (forgetTimer) clearTimeout(forgetTimer);
     forgetTimer = setTimeout(disarmForget, FORGET_ARM_MS);
     return;
   }
   disarmForget();
+  ++refreshVersion;
   setMutationBusy(true);
   try {
     const result = await bridge.apiPost("forget", { scope: "all", confirm: true, robot: selectedRobotId });
     const removed = result && typeof result.removed === "number" ? result.removed : 0;
-    sayAction("已删除 " + removed + " 条经验，可从删除前备份回退。");
+    sayAction("已清除 " + removed + " 条经验及全部检查点和导出，神经经验与权重已清除，Episodes 与运行计数已归零；超参数已保留，初始化完成。");
     await refresh();
   } catch (error) {
     sayAction("清空失败：" + String((error && error.message) || error), true);
   } finally {
     setMutationBusy(false);
+  }
+}
+
+function settingsHint(message, error) {
+  const host = document.getElementById("settings-hint");
+  host.textContent = message;
+  host.classList.toggle("err", Boolean(error));
+}
+
+function renderSettings(payload) {
+  settingsPayload = payload;
+  settingsInputs.clear();
+  const host = document.getElementById("settings-fields");
+  host.textContent = "";
+  function fields(schema, values, container, prefix) {
+    for (const [key, spec] of Object.entries(schema)) {
+      const path = prefix.concat(key);
+      if (spec.type === "object") {
+        const group = document.createElement("details");
+        group.className = "settings-group";
+        const summary = document.createElement("summary");
+        summary.textContent = spec.description || key;
+        const grid = document.createElement("div");
+        grid.className = "settings-grid";
+        fields(spec.items, values[key] || {}, grid, path);
+        group.append(summary, grid);
+        container.append(group);
+        continue;
+      }
+      const label = document.createElement("label");
+      label.className = "setting-field";
+      const title = document.createElement("span");
+      title.textContent = spec.description || key;
+      let input;
+      if (spec.options) {
+        input = document.createElement("select");
+        spec.options.forEach((value, index) => {
+          const option = document.createElement("option");
+          option.value = value;
+          option.textContent = (spec.labels || [])[index] || value;
+          input.append(option);
+        });
+      } else {
+        input = document.createElement(spec.type === "list" || spec.type === "text" ? "textarea" : "input");
+        input.type = spec.type === "bool" ? "checkbox" : ["int", "float"].includes(spec.type) ? "number" : "text";
+        if (["int", "float"].includes(spec.type)) {
+          const bounds = spec.slider || {};
+          if (bounds.min !== undefined) input.min = bounds.min;
+          if (bounds.max !== undefined) input.max = bounds.max;
+          input.step = spec.type === "int" ? "1" : "any";
+          input.required = true;
+        }
+      }
+      const value = values[key] === undefined ? spec.default : values[key];
+      if (spec.type === "bool") input.checked = Boolean(value);
+      else input.value = spec.type === "list" ? (value || []).join("\n") : String(value ?? "");
+      input.name = path.join(".");
+      input.setAttribute("aria-label", spec.description || key);
+      const help = document.createElement("small");
+      help.textContent = (spec.hint || "") + (spec.type === "list" ? " 每行一项。" : "");
+      label.append(title, input, help);
+      container.append(label);
+      settingsInputs.set(path.join("."), { input, spec, path });
+    }
+  }
+  fields(payload.schema, payload.values, host, []);
+  settingsHint(payload.persistent ? "设置作用于本插件的所有机器人，保存后持久化并应用。" : "当前宿主未提供配置保存接口，修改仅在本次运行有效。");
+}
+
+async function loadSettings() {
+  if (settingsBusy) return;
+  try {
+    renderSettings(await bridge.apiGet("settings", {}));
+  } catch (error) {
+    settingsHint("设置加载失败：" + String(error.message || error), true);
+  }
+}
+
+function defaultSettings() {
+  for (const { input, spec } of settingsInputs.values()) {
+    if (spec.type === "bool") input.checked = Boolean(spec.default);
+    else input.value = spec.type === "list" ? spec.default.join("\n") : String(spec.default ?? "");
+  }
+  settingsHint("超参数已填入默认值，点击“保存并应用”后生效；学习数据不受影响。");
+}
+
+async function saveSettings(event) {
+  event.preventDefault();
+  if (settingsBusy || !settingsPayload) return;
+  const values = {};
+  for (const { input, spec, path } of settingsInputs.values()) {
+    let value = input.value;
+    if (spec.type === "bool") value = input.checked;
+    else if (["int", "float"].includes(spec.type)) {
+      if (!String(value).trim() || !Number.isFinite(Number(value))) {
+        settingsHint("请填写有效数值：" + spec.description, true);
+        return;
+      }
+      value = Number(value);
+    } else if (spec.type === "list") value = value.split("\n").map((item) => item.trim()).filter(Boolean);
+    let target = values;
+    for (const key of path.slice(0, -1)) target = target[key] || (target[key] = {});
+    target[path[path.length - 1]] = value;
+  }
+  settingsBusy = true;
+  document.getElementById("settings-controls").disabled = true;
+  try {
+    const result = await bridge.apiPost("settings/save", { values, revision: settingsPayload.revision });
+    renderSettings(result);
+    settingsHint(result.persistent ? "设置已保存并应用。" : "设置已应用，仅本次运行有效。");
+    await refresh();
+  } catch (error) {
+    settingsHint("保存失败：" + String(error.message || error), true);
+  } finally {
+    settingsBusy = false;
+    document.getElementById("settings-controls").disabled = false;
   }
 }
 
@@ -468,16 +589,19 @@ async function main() {
   }
   await bridge.ready();
   document.getElementById("btn-refresh").addEventListener("click", refresh);
+  robotSelect.addEventListener("change", () => {
+    disarmForget();
+    disarmCheckpoint();
+    selectedRobotId = robotSelect.value;
+    refresh();
+  });
   document.getElementById("btn-export").addEventListener("click", downloadExport);
   forgetButton.addEventListener("click", forgetAll);
   document.getElementById("checkpoint-form").addEventListener("submit", createCheckpoint);
-  robotSelect.addEventListener("change", async () => {
-    selectedRobotId = robotSelect.value;
-    disarmForget();
-    disarmCheckpoint();
-    await refresh();
-  });
-  await refresh();
+  document.getElementById("settings-form").addEventListener("submit", saveSettings);
+  document.getElementById("btn-settings-reload").addEventListener("click", loadSettings);
+  document.getElementById("btn-settings-defaults").addEventListener("click", defaultSettings);
+  await Promise.all([refresh(), loadSettings()]);
 }
 
 main();

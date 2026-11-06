@@ -10,6 +10,7 @@ hyperparameters rather than raising: a bad config must never break a chat.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import isfinite
 from typing import Any
 
 from .neural.config import LensConfig
@@ -58,7 +59,7 @@ def _as_int(
     """
     try:
         value = int(raw)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         value = default
     if low is not None:
         value = max(low, value)
@@ -85,6 +86,8 @@ def _as_float(
         value = float(raw)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         value = default
+    if not isfinite(value):
+        value = default
     if low is not None:
         value = max(low, value)
     if high is not None:
@@ -105,7 +108,7 @@ def _as_str(raw: Any, default: str, *, allowed: tuple[str, ...] | None = None) -
     """
     if not isinstance(raw, str) or not raw:
         return default
-    value = raw.strip().lower()
+    value = raw.strip().lower() if allowed is not None else raw.strip()
     if allowed is not None and value not in allowed:
         return default
     return value

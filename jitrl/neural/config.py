@@ -114,6 +114,21 @@ class LensConfig:
             "mita_topk": (1, 64),
             "mita_query_chunk": (1, 256),
             "memory_tokens": (32, 128),
+            "max_memory": (1, 128),
+            "coarse_limit": (32, 2048),
+            "hidden_dim": (24, 1536),
+            "embedding_dim": (8, 1024),
+            "summary_dim": (8, 512),
+            "blocks": (1, 12),
+            "query_heads": (1, 32),
+            "kv_heads": (1, 32),
+            "bases": (1, 32),
+            "rank": (1, 64),
+            "engram_buckets": (31, 65521),
+            "engram_heads": (1, 8),
+            "engram_dim": (4, 128),
+            "max_events": (1, 256),
+            "seed": (1, 2147483647),
         }
         for name, (lo, hi) in ranges.items():
             try:
@@ -126,6 +141,7 @@ class LensConfig:
             ("relevance_threshold", 0.0, 1.0),
             ("similarity_threshold", 0.0, 1.0),
             ("max_adjustment", 0.0, 2.0),
+            ("return_scale", 0.01, 100.0),
         ):
             try:
                 value = float(raw.get(name, getattr(base, name)))
@@ -133,4 +149,7 @@ class LensConfig:
                     values[name] = max(lo, min(hi, value))
             except (ValueError, TypeError, OverflowError):
                 pass
-        return cls(**values)
+        try:
+            return cls(**values)
+        except ValueError:
+            return base

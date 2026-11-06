@@ -19,7 +19,7 @@
         <span id="chip-state" class="chip chip-muted">--</span>
         <button id="btn-refresh" class="btn" type="button">刷新</button>
         <button id="btn-export" class="btn" type="button">导出</button>
-        <button id="btn-forget" class="btn btn-danger" type="button" data-memory-mutation>清空 V0.1 记忆</button>
+        <button id="btn-forget" class="btn btn-danger" type="button" data-memory-mutation>清除数据并初始化</button>
       </div>
     </header>
 
@@ -36,9 +36,9 @@
       </section>
 
       <section class="card span-2">
-        <h2>Neural Lens <small>V0.2.1 · 平台实例隔离 · 默认四层 MiTA</small></h2>
+        <h2>Neural Lens <small>V0.2.4 · 平台实例隔离 · 默认四层 MiTA</small></h2>
         <p id="neural-status" class="checkpoint-policy"></p>
-        <p class="checkpoint-policy">神经状态：/jitrl lens status；训练：/jitrl lens train。下方经验、曲线与检查点管理 V0.1 经验库，神经库与权重由 /jitrl lens reset confirm 独立重置。</p>
+        <p class="checkpoint-policy">神经状态：/jitrl lens status；训练：/jitrl lens train。下方经验、曲线与检查点管理 V0.1 经验库，“清除数据并初始化”同时清除神经库与本地权重，并保留超参数；仅重置本会话神经数据可用 /jitrl lens reset confirm。</p>
       </section>
 
       <section class="card span-2">
@@ -73,6 +73,20 @@
         <h2>当前超参数</h2>
         <dl id="hyper" class="hyper"></dl>
         <div id="last-decision" class="decision"></div>
+      </section>
+      <section class="card span-2">
+        <h2>参数设置 <small>学习、检索、策略与存储等全部配置</small></h2>
+        <form id="settings-form">
+          <fieldset id="settings-controls">
+            <div id="settings-fields" class="settings-fields"></div>
+            <div class="settings-actions">
+              <button class="btn" type="submit">保存并应用</button>
+              <button id="btn-settings-defaults" class="btn" type="button">重置超参数</button>
+              <button id="btn-settings-reload" class="btn" type="button">重新加载设置</button>
+            </div>
+          </fieldset>
+        </form>
+        <p id="settings-hint" class="hint" role="status" aria-live="polite"></p>
       </section>
     </main>
 

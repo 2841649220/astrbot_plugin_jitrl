@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
-from test_checkpoint_plugin import Event, _seed, command
+from test_checkpoint_plugin import Event, _seed, command, web_call
 from test_checkpoint_plugin import host as host
 
 from jitrl.evaluator import RewardResult
@@ -22,9 +22,121 @@ from jitrl.neural.contracts import (
     MemoryRecord,
     RetrievalSnapshot,
 )
+from jitrl.neural.encoding import digest
 from jitrl.neural.runtime import render_evidence
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_full_data_reset_clears_both_learners_and_preserves_all_parameters(
+    plugin, host, monkeypatch
+):
+    await seed_legacy_memory(plugin)
+    event = await completed_neural_episode(plugin, host, monkeypatch)
+    runtime = plugin._neural
+    robot_id = plugin._robot_key_for_event(event)
+    frame = event.get_extra(host.module._NEURAL_KEY).frames[0]
+    await plugin._bank.create_checkpoint("old legacy")
+    weight = runtime.root / "checkpoints" / digest("private-a") / "orphan.pt"
+    weight.parent.mkdir(parents=True, exist_ok=True)
+    weight.write_bytes(b"old weights")
+    settings_before = (await plugin._web_settings()).payload
+    raw_before = json.loads(json.dumps(plugin._raw_config))
+    other = Event(scope="private-a", platform_id="other-platform")
+    await plugin.on_llm_request(other, request())
+    other_runtime = plugin._neural
+    assert other_runtime is not runtime
+
+    response = await web_call(
+        host,
+        plugin,
+        "_web_forget",
+        {"robot": robot_id, "scope": "all", "confirm": True},
+    )
+    assert response.status_code == 200
+    assert runtime.store.stats() == {"decisions": 0, "executions": 0, "settlements": 0}
+    assert not weight.exists()
+    assert not await runtime.commit(frame.decision, frame.epoch)
+    assert await plugin._bank.count() == 0
+    assert await plugin._bank.list_checkpoints() == []
+    assert all(value == 0 for value in plugin._stats.values())
+    assert not any(
+        key.startswith(f"{robot_id}:") for key in plugin._neural_last_episode
+    )
+    assert (await plugin._web_settings()).payload == settings_before
+    assert dict(plugin._raw_config) == raw_before
+    assert other_runtime.store.stats()["decisions"] == 1
+    await plugin.on_llm_request(Event(scope="private-a"), request())
+    assert runtime.store.stats()["decisions"] == 1
+
+
+async def test_full_reset_blocks_late_neural_settlements(plugin, host, monkeypatch):
+    event = Event(scope="private-a")
+    await plugin.on_llm_request(event, request())
+    started, resume = asyncio.Event(), asyncio.Event()
+
+    async def delayed_score(self, **kwargs):
+        started.set()
+        await resume.wait()
+        return RewardResult(rewards=[1.0], source="heuristic", ok=True)
+
+    monkeypatch.setattr(host.module.StepRewardEvaluator, "score", delayed_score)
+    pending = asyncio.create_task(
+        plugin.on_agent_done(
+            event,
+            SimpleNamespace(messages=[call("a"), result("a")]),
+            SimpleNamespace(completion_text=""),
+        )
+    )
+    await asyncio.wait_for(started.wait(), 3)
+    try:
+        assert "恢复初始化" in await command(plugin.jitrl_forget(Event(), "all"))
+    finally:
+        resume.set()
+    await asyncio.wait_for(pending, 3)
+    assert plugin._neural.store.stats() == {
+        "decisions": 0,
+        "executions": 0,
+        "settlements": 0,
+    }
+    assert all(value == 0 for value in plugin._stats.values())
+
+
+async def test_neural_settings_apply_to_open_runtime_without_erasing_snapshots(
+    plugin, host
+):
+    await plugin.on_llm_request(Event(), request())
+    runtime = plugin._neural
+    before = runtime.store.stats()
+    response = await web_call(
+        host,
+        plugin,
+        "_web_save_settings",
+        {
+            "revision": 0,
+            "values": {
+                "neural": {
+                    "learning_rate": 0.001,
+                    "min_support": 5,
+                    "max_memory": 48,
+                    "hidden_dim": 48,
+                }
+            },
+        },
+    )
+    assert response.status_code == 200
+    assert runtime.cfg.learning_rate == 0.001 and runtime.cfg.min_support == 5
+    assert runtime.cfg.max_memory == 48 and runtime.cfg.hidden_dim == 48
+    assert runtime.store.stats() == before
+    assert runtime.cfg.attention_backend == "mita"
+    response = await web_call(
+        host,
+        plugin,
+        "_web_save_settings",
+        {"revision": 1, "values": {"neural": {"query_heads": 5}}},
+    )
+    assert response.status_code == 400
+    assert runtime.cfg.query_heads == 6
 
 
 class Tools:

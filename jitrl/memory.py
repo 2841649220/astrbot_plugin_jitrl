@@ -212,7 +212,7 @@ class MemoryBank:
             checkpoint_dir: Snapshot directory; defaults to a sibling directory.
                 Transient banks require an explicit directory for snapshots.
             checkpoint_interval: Episodes between automatic snapshots; 0 disables
-                automatic snapshots. Safety backups still protect deletion.
+                automatic snapshots. Restores still create an undo snapshot.
             keep_checkpoints: Retained snapshots per automatic/safety history.
         """
         self.db_path = Path(db_path)
@@ -281,6 +281,7 @@ class MemoryBank:
                 if (
                     self._checkpoints is not None
                     and self.checkpoint_interval > 0
+                    and conn.execute("SELECT 1 FROM experiences LIMIT 1").fetchone()
                     and not self._checkpoints.list()
                 ):
                     self._checkpoints.create(conn, kind="startup")
@@ -470,9 +471,21 @@ class MemoryBank:
             self._invalidate_index_locked()
             return result
 
-    def _backup_before_forget_locked(self) -> None:
-        if self._checkpoints is not None:
-            self._checkpoints.create(self._require_conn(), kind="before_forget")
+    async def configure(self, config: Any) -> None:
+        """Apply storage settings to an already-open bank under its write lock."""
+        await asyncio.to_thread(self._configure_sync, config)
+
+    def _configure_sync(self, config: Any) -> None:
+        with self._lock:
+            self.max_entries = config.max_entries
+            self.redact_secrets = config.redact_secrets
+            self.keep_episodes = config.keep_episodes
+            self.prune_strategy = config.prune_strategy
+            if self.checkpoint_interval != config.checkpoint_interval:
+                self._episodes_since_checkpoint = 0
+            self.checkpoint_interval = config.checkpoint_interval
+            if self._checkpoints is not None:
+                self._checkpoints.keep = config.keep_checkpoints
 
     # -- writes --------------------------------------------------------------
     async def add_episode(
@@ -711,7 +724,6 @@ class MemoryBank:
         where = " WHERE " + " AND ".join(conditions)
         with self._lock:
             conn = self._require_conn()
-            self._backup_before_forget_locked()
             deleted_ids: list[int] = []
             if self._index is not None:
                 deleted_ids = [
@@ -738,7 +750,7 @@ class MemoryBank:
         return removed
 
     async def clear(self) -> int:
-        """Delete every stored experience and episode header.
+        """Reset experiences, episode headers, row IDs and all checkpoints.
 
         Returns:
             The number of experience rows removed.
@@ -756,11 +768,15 @@ class MemoryBank:
         """
         with self._lock:
             conn = self._require_conn()
-            self._backup_before_forget_locked()
+            if self._checkpoints is not None:
+                self._checkpoints.clear()
             try:
                 cursor = conn.execute("DELETE FROM experiences")
                 removed = max(0, int(cursor.rowcount or 0))
                 conn.execute("DELETE FROM episodes")
+                conn.execute(
+                    "DELETE FROM sqlite_sequence WHERE name IN ('experiences', 'episodes')"
+                )
                 conn.commit()
             except Exception:
                 try:
@@ -769,6 +785,7 @@ class MemoryBank:
                     pass
                 raise
             self._generation += 1
+            self._episodes_since_checkpoint = 0
             self._row_count = 0
             if self._index is not None:
                 self._index.clear()
