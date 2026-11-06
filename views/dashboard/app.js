@@ -506,8 +506,9 @@ function renderSettings(payload) {
           input.append(option);
         });
       } else {
-        input = document.createElement(spec.type === "list" || spec.type === "text" ? "textarea" : "input");
-        input.type = spec.type === "bool" ? "checkbox" : ["int", "float"].includes(spec.type) ? "number" : "text";
+        const multiline = spec.type === "list" || spec.type === "text";
+        input = document.createElement(multiline ? "textarea" : "input");
+        if (!multiline) input.type = spec.type === "bool" ? "checkbox" : ["int", "float"].includes(spec.type) ? "number" : "text";
         if (["int", "float"].includes(spec.type)) {
           const bounds = spec.slider || {};
           if (bounds.min !== undefined) input.min = bounds.min;
