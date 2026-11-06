@@ -2,7 +2,7 @@
 
 - For routine features and fixes, increment only the patch (last) version number.
 - Increment the middle version number only for large architectural improvements.
-- The current V0.2 release is `0.2.3` (2026-10-28), improving neural retrieval/encoding performance and episode-aware evidence gates on the existing `0.2.0` architecture. Its V0.1 compatibility baseline remains `0.1.4`. Routine follow-up releases increment the patch version. `0.2.2` migrated the `0.1.4` mainline improvements; `0.1.3` and the original `0.2.1` introduced robot-instance isolation, and the re-released `0.2.1` fixed the key to the platform instance alone and consolidated legacy directories.
+- The current V0.2 release is `0.2.4` (2026-11-07), carrying V0.1.5 full data reset and persistent dashboard settings, with independent hyperparameter reset and neural-data/weight cleanup. Its V0.1 compatibility baseline is `0.1.5`; routine follow-ups increment the patch version.
 - Keep V0.2 neural work on `v0.2.0-neural-lens`; do not merge it into the V0.1 line without an explicit request.
 - Neural training is optional and scope-isolated. Preserve exact historical retrieval snapshots, exclude pending rewards from supervised targets, and never claim local candidate scores are remote logits or causal uplift.
 - The default neural backbone uses actual MiTA in all four token-attention blocks. Keep landmark compression, reusable top-k KV experts and jointly normalized routing intact; GQA/hybrid/legacy are explicit comparisons, not silent substitutions.

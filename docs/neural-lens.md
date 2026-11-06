@@ -1,5 +1,7 @@
 # V0.2.3 Neural Lens 使用与 API 兼容约定
 
+V0.2.4 同步 V0.1.5：面板全量清除同时清理两类经验、检查点、导出、迁移副本及神经权重，保留所有超参数；独立按钮重置超参数。所有神经配置字段可在面板保存，等待当前模型任务完成后应用，结构参数改变后需重训。详见[数据清除与参数设置](reset-settings.md)。
+
 本分支以 V0.1.2 为神经扩展起点，分支名为 `v0.2.0-neural-lens`；V0.2.2 同步 V0.1.4 的精确检索、当前回合奖励归属和工具门控优化，四层 MiTA 结构与现有权重格式保持兼容。V0.2.1 加入机器人实例隔离，并于 2026-10-27 重发时修正为只按平台实例 ID 识别机器人（`self_id` 仅作元数据）。原来的插件名、`JitRLLearner` 入口、AstrBot 版本范围、两个事件钩子、`jitrl_recall` 工具、配置键和 Web 路由均保留。`neural.mode` 默认 `off`，旧配置无需修改，也不要求安装 PyTorch；其行为继续由 V0.1 的 `apply_mode`、`learning`、`retrieval`、`policy` 等控制。具体研究与测量见[主线优化记录](mainline-optimization.md)。
 
 新增部分是研究性本地神经控制器，远端 LLM 始终冻结。这里的梯度更新只发生在本地 Neural Lens。论文依据、公式及效果边界见 [研究说明](neural-lens-research.md)。本版本没有真实任务提升的实验结论。
@@ -139,7 +141,7 @@ POST 使用 PRE 固定的快照与 checkpoint，不会静默切换到刚训练�
 
 升级到机器人隔离实现时，原共享 `memory.sqlite3`、检查点目录和导出文件会在首个机器人实例打开 JitRL 时迁移到该实例目录；原共享 `neural/` 会在首个神经运行时初始化时迁移到该实例目录。迁移后，其他机器人实例从空库开始。插件不会复制旧共享数据到所有机器人。目标目录已有同名数据时，冲突源会留在原共享路径并记录日志，迁移标记会阻止后续机器人接管这些旧文件。
 
-从使用 `platform_id:self_id` 键的旧版本（0.1.3、0.2.1）升级时，旧的 `robots/<platform_id:self_id>/` 目录会在插件启动时按 `robot.json` 中的 `platform_id` 合并：数据最丰富的目录提升为规范平台实例目录，其余归档到 `robots/.legacy/<robot-hash>/`。规范库首次初始化时按 episode 幂等合并归档的 V0.1 经验（`MemoryBank.merge_json` 只导入缺失 episode，重试不会重复）；检查点、导出和 Neural Lens 权重保留在提升后的目录；若规范目录没有神经数据，会采纳归档目录中数据量最大、写入最新的 Neural Lens 存储。归档数据不会删除。
+从使用 `platform_id:self_id` 键的旧版本（0.1.3、0.2.1）升级时，旧的 `robots/<platform_id:self_id>/` 目录会在插件启动时按 `robot.json` 中的 `platform_id` 合并：数据最丰富的目录提升为规范平台实例目录，其余归档到 `robots/.legacy/<robot-hash>/`。规范库首次初始化时按 episode 幂等合并归档的 V0.1 经验（`MemoryBank.merge_json` 只导入缺失 episode，重试不会重复）；检查点、导出和 Neural Lens 权重保留在提升后的目录；若规范目录没有神经数据，会采纳归档目录中数据量最大、写入最新的 Neural Lens 存储。归档数据在全量清除对应机器人数据时一并删除。
 
 请求时保存当时可见的完整检索快照；完成后从当前轮轨迹中只采集有匹配 tool result 的工具调用和实际最终回复。宿主的完成钩子决定了 PENDING 执行事实的落库时点；当前没有即时执行拦截器，不承诺在远端工具执行瞬间持久化。LLM/heuristic/fused 的回报保留来源及较低可靠性权重，不能当成环境真值。评估器关闭或失败而没有可用标签时，事实保持 PENDING。
 

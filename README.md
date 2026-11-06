@@ -1,15 +1,15 @@
 # JitRL 持续学习 · astrbot_plugin_jitrl
 
 [![CI](https://github.com/2841649220/astrbot_plugin_jitrl/actions/workflows/ci.yml/badge.svg)](https://github.com/2841649220/astrbot_plugin_jitrl/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.2.3-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.2.4-blue)](CHANGELOG.md)
 
-> V0.2.3（2026-10-29 同版本重发）修复清空记忆后 Episodes 仍显示旧累计值的问题，面板按数据库实际留存回合统计，重启与回退后保持一致。保留神经检索与编码优化、V0.1.4 兼容路径、平台实例隔离和可选四层 MiTA Neural Lens；远端大模型始终冻结，神经扩展默认关闭，已有神经权重格式兼容。
+> V0.2.4（2026-11-07）同步 V0.1.5 的数据清除和完整参数设置：全量清除传统/神经学习数据、检查点、导出与本地权重，保留超参数；独立按钮重置超参数。远端大模型始终冻结，神经扩展和训练默认关闭，默认四层 MiTA 保持不变。
 >
 > V0.1 路径无需训练；V0.2 神经路径使用可选 PyTorch 训练会话隔离的小模型。当前默认四层 token 注意力全部使用真正的 MiTA 压缩与路由机制，结合 JitRL 经验回报和 Engram 条件模式记忆。
 
-## V0.2.3 快速入口
+## V0.2.4 快速入口
 
-当前发布版本：`0.2.3`（2026-10-28 发布，2026-10-29 同版本重发）；实验性开发分支：`v0.2.0-neural-lens`。V0.1 兼容路径继续以 V0.1.4 为基础；本次修正面板的已存回合计数，保留神经路径的数据读取、特征复用和证据门控优化。按 AstrBot 平台实例 ID 隔离经验库和 Neural Lens，`self_id` 仅作为展示元数据。现有插件入口、配置键、指令、经验库、检查点及面板路由继续保留。`neural.mode: off` 为默认值，无需安装额外依赖。详见[神经流水线性能与效果验证](docs/neural-pipeline-performance.md)及[前一版主线优化记录](docs/mainline-optimization.md)。
+当前发布版本：`0.2.4`（2026-11-07）；实验性开发分支：`v0.2.0-neural-lens`。V0.1 兼容路径同步至 V0.1.5。数据清除同时管理所选机器人的两类经验与权重，并保留传统和神经超参数；设置栏覆盖全部配置，支持持久化、即时应用、独立重置默认值及联合参数校验。按 AstrBot 平台实例 ID 隔离数据，`self_id` 仅作展示元数据。`neural.mode: off` 无需安装额外依赖。管理行为见[数据清除与参数设置](docs/reset-settings.md)，此前性能优化见[神经流水线性能验证](docs/neural-pipeline-performance.md)。
 
 - [神经架构的研究依据与论文边界](docs/neural-lens-research.md)
 - [MiTA 主干：公式落地、4/4 层替换与研究实验](docs/mita-backbone-research.md)
@@ -21,7 +21,7 @@
 - `neural.mita_execution` 默认 `grouped`，按专家打包 query 并复用 KV、调用融合 SDPA；`reference` 保留原逐 query 实现。两者使用同一 MiTA 公式和参数，切换执行内核无需重训。
 - `neural.device` 支持 CPU、CUDA 或 auto，默认 CPU。正式 384d/四层 MiTA 已分别完成 CPU 与 CUDA 的训练、保存重载和候选评分闭环。
 - 已接入 AstrBot 的 PRE 临时提示与完成后采集；POST 为独立的候选评分 API，仍需上游候选生成和执行前硬校验。
-- 保留 `/jitrl feedback` 与原反馈关键词入口；神经模式将反馈作为追加结算，保留旧奖励历史。旧面板的备份、删除、导出和回退只管理 V0.1 经验；神经事实和模型使用 `/jitrl lens reset confirm` 独立重置。
+- 保留 `/jitrl feedback` 与原反馈关键词入口；神经模式将反馈作为追加结算，保留旧奖励历史。检查点、导出与回退管理 V0.1 经验；全量清除同时移除两类学习数据与神经权重，保留超参数。仅重置本会话神经数据可用 `/jitrl lens reset confirm`。
 
 开发仓库可运行 `python scripts/neural_lens.py smoke --steps 20` 验证正式尺寸模型的采集、训练、原子检查点与候选评分闭环。此演示为合成数据，不代表真实任务收益；结果见[当前 grouped smoke 报告](benchmarks/neural-smoke-grouped-cuda.json)。
 
@@ -161,13 +161,13 @@ git clone https://github.com/2841649220/astrbot_plugin_jitrl.git
 Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot_version`
 阻止加载。
 
-也可从 [v0.2.3 Release](https://github.com/2841649220/astrbot_plugin_jitrl/releases/tag/v0.2.3)
-下载 `astrbot_plugin_jitrl-v0.2.3.zip`，在 AstrBot 插件管理页选择「从文件安装」。
+也可从 [v0.2.4 Release](https://github.com/2841649220/astrbot_plugin_jitrl/releases/tag/v0.2.4)
+下载 `astrbot_plugin_jitrl-v0.2.4.zip`，在 AstrBot 插件管理页选择「从文件安装」。
 安装包包含单个插件根目录，以及完整的代码、配置和面板资源。
 
 **零第三方依赖**：只用 Python 标准库（`sqlite3` / `json` / `re` / `asyncio` / `math`），不需要 `pip install` 任何东西。
 
-数据按机器人实例隔离，目录为 `data/plugin_data/astrbot_plugin_jitrl/robots/<robot-hash>/`；其中分别保存 V0.1 记忆库、检查点、导出文件和 Neural Lens 数据。实例键只由 AstrBot 平台实例 ID 计算；`self_id` 仅写入 `robot.json` 作为排查元数据（QQ 官方机器人等适配器会按消息内容改变 `self_id`，不能作为实例身份）。从使用 `platform_id:self_id` 键的旧版本（0.1.3 与 0.2.1 初版）升级时，旧的 `robots/<platform_id:self_id>/` 目录会在插件启动时合并：数据最丰富的目录提升为规范目录，其余归档到 `robots/.legacy/<robot-hash>/`，并在首次使用时按 episode 幂等合并 V0.1 经验；检查点、导出与 Neural Lens 权重保留在提升后的目录；若规范目录还没有神经数据，会采纳归档目录中数据量最大、写入最新的 Neural Lens 存储。归档数据不会删除。旧共享 `memory.sqlite3`、检查点和导出仍迁移给第一个触发插件的机器人实例；若目标实例已有同名数据，旧文件会留在原路径并记录日志。
+数据按机器人实例隔离，目录为 `data/plugin_data/astrbot_plugin_jitrl/robots/<robot-hash>/`；其中分别保存 V0.1 记忆库、检查点、导出文件和 Neural Lens 数据。实例键只由 AstrBot 平台实例 ID 计算；`self_id` 仅写入 `robot.json` 作为排查元数据（QQ 官方机器人等适配器会按消息内容改变 `self_id`，不能作为实例身份）。从使用 `platform_id:self_id` 键的旧版本（0.1.3 与 0.2.1 初版）升级时，旧的 `robots/<platform_id:self_id>/` 目录会在插件启动时合并：数据最丰富的目录提升为规范目录，其余归档到 `robots/.legacy/<robot-hash>/`，并在首次使用时按 episode 幂等合并 V0.1 经验；检查点、导出与 Neural Lens 权重保留在提升后的目录；若规范目录还没有神经数据，会采纳归档目录中数据量最大、写入最新的 Neural Lens 存储。归档数据在全量清除对应机器人数据时一并删除。旧共享 `memory.sqlite3`、检查点和导出仍迁移给第一个触发插件的机器人实例；若目标实例已有同名数据，旧文件会留在原路径并记录日志。
 
 ---
 
@@ -207,22 +207,22 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 
 | 指令 | 作用 |
 | --- | --- |
-| `/jitrl status` | 记忆条数、学习进度、干预次数、当前超参、最近一次决策 |
+| `/jitrl status` | 当前机器人的记忆条数、学习进度、干预次数、当前超参、最近一次决策 |
 | `/jitrl stats [n]` | **各动作的平均回报 / 正回报率排行** —— 一眼看出哪个工具在这个部署里真的有用 |
 | `/jitrl curve [n]` | 学习曲线（按时间分桶的平均回报），复现论文 Figure 3 |
 | `/jitrl recall [query]` | 按当前或指定情景检索历史经验 |
 | `/jitrl episodes [n]` | 最近 episode 摘要 |
-| `/jitrl forget [session\|all]` | session 删除本会话记忆，all 清空全部；删除前自动备份 |
+| `/jitrl forget [session\|all]` | session 删除本会话记忆；all 清除当前机器人的学习数据、检查点、导出和累计计数，保留超参数，不创建备份 |
 | `/jitrl checkpoint [名称]` | 创建手动检查点，保留到主动删除 |
 | `/jitrl checkpoints [n]` | 列出最近的检查点、完整 ID、时间和经验数 |
-| `/jitrl rollback <ID> [session\|all] confirm` | 从检查点回退，默认仅当前会话；回退前自动备份当前全库 |
+| `/jitrl rollback <ID> [session\|all] confirm` | 从当前机器人的检查点回退，默认仅当前会话；回退前自动备份 |
 | `/jitrl checkpoint_delete <ID> confirm` | 永久删除指定检查点，不修改当前记忆 |
 | `/jitrl feedback good\|bad` | 手动回填对上一轮的评价 |
 | `/jitrl export` | 导出记忆 JSON |
 
 ### 检查点与污染恢复
 
-检查点管理指令始终仅管理员可用，即使关闭了 `commands.admin_only`，因为每份快照包含全部会话的数据。
+检查点管理指令始终仅管理员可用，即使关闭了 `commands.admin_only`；每份快照包含当前机器人全部会话的数据。
 
 ```text
 /jitrl checkpoint 可信基线
@@ -231,15 +231,15 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 /jitrl rollback <从列表复制的完整ID> all confirm
 ```
 
-先在确认表现正常时保存一个手动检查点。发现异常后，可以只回退当前会话，或回退全部会话。
+先在确认表现正常时保存一个手动检查点。发现异常后，可以只回退当前会话，或回退当前机器人的全部会话。
 回退命令未带 `confirm` 时只提示确认用法。操作成功后会返回一份「回退前备份」的 ID；
 恢复这个 ID 即可撤销刚才的回退，撤销时同样可以选择 `session` 或 `all`。
 
-默认首次打开数据库时保存基线，之后每累计 **50 个完成的 Episode** 自动保存一次。
-`memory.checkpoint_interval = 0` 关闭这两类自动保存，删除和回退前的备份仍然生效。
-自动保存计数在插件重载或回退后重新开始；自动历史和操作前备份各保留 **20** 份，手动检查点不参与轮换。
+默认打开已有经验且没有快照的数据库时保存基线，空库不创建基线。之后每累计 **50 个完成的 Episode** 自动保存一次。
+`memory.checkpoint_interval = 0` 关闭自动保存；回退仍创建操作前备份。清除数据会删除全部检查点且不创建备份。
+自动保存计数在插件重载、回退或清除数据后重新开始；自动历史和回退前备份各保留 **20** 份，手动检查点不参与轮换。
 
-快照独立存放在 `data/plugin_data/astrbot_plugin_jitrl/checkpoints/`，使用 SQLite Backup API
+快照独立存放在 `data/plugin_data/astrbot_plugin_jitrl/robots/<机器人实例哈希>/checkpoints/`，使用 SQLite Backup API
 保存已提交的 WAL 数据，校验后才发布完整文件。回退先校验格式、表结构、完整性和记录数，
 再备份当前数据，最后在一个事务内替换记忆；校验、备份或写入失败时，当前记忆保持不变。
 会话回退保留其他会话的数据。快照包括奖励、折扣回报、episode 元数据及原有脱敏内容，
@@ -258,37 +258,38 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 
 ### WebUI 面板
 
-插件自带一个可视化面板（`views/dashboard/`），在 WebUI「插件」页打开插件卡片即可进入。它通过 `context.register_web_api()` 注册的 11 个接口读写数据，并提供机器人实例选择器；每次读取、导出、检查点操作、回退或清空都会绑定到所选实例：
+插件自带一个可视化面板（`views/dashboard/`），在 WebUI「插件」页打开插件卡片即可进入。它通过 `context.register_web_api()` 注册的 13 个接口读写数据：
 
 | 面板区域 | 内容 |
 | --- | --- |
-| KPI 卡 | 当前已存记忆条数与 Episodes、本次运行累计策略干预次数与失败次数 |
+| 机器人选择器与 KPI 卡 | 查看指定机器人的已存记忆条数与 Episodes、本次运行累计策略干预次数与失败次数 |
 | 学习曲线 | 按时间分桶的平均折扣回报 `G`，复现论文 Figure 3 的形态 |
 | 动作排行 | 每个工具/回复的平均回报、正回报率、样本数 —— **一眼看出这个部署里哪个工具真的有用** |
 | 最近 Episode | 时间 / 步数 / 平均回报 / 用户请求摘要 |
-| 超参数 | 当前 k、r、γ、β、λ、α 与作用域、评估器模式 |
-| 检查点 | 名称、类型、完整 ID、时间、经验数、文件大小，支持创建、回退全库、删除快照 |
-| 操作 | 刷新、导出 JSON、带备份的清空记忆；回退、删除和清空均使用页内两步确认 |
+| 超参数与设置栏 | 全部学习、检索、策略、存储等参数，提供数字输入框、开关、菜单、关键词列表，支持保存应用及独立重置默认值 |
+| 检查点 | 当前机器人的名称、类型、完整 ID、时间、经验数、文件大小，支持创建、回退、删除快照 |
+| 操作 | 刷新、导出 JSON、清除数据并初始化（保留超参数，不保留备份）；回退、删除和清空均使用页内两步确认 |
 
-`Episodes（已存）` 统计当前机器人 V0.1 经验库中的回合记录，清空后归零，回退或重启后按数据库实际留存显示。删除检查点只移除备份文件，不改变在线经验数量。`/jitrl status` 另列“本次运行学习累计”，该累计值不会因删除记忆而减少；神经经验和权重通过 `/jitrl lens reset confirm` 独立重置。
+`Episodes（已存）` 统计所选机器人数据库中当前保留的回合，清空后归零，回退或重启后按实际留存显示。删除检查点只移除备份，不改变在线回合数量。`/jitrl status` 另列“本次运行学习累计”，全量清除数据会将运行累计计数一并归零；会话删除保留运行累计计数。
 
 后端路由（`GET` 除注明外）：`/astrbot_plugin_jitrl/robots`、`/overview`、`/curve`、`/actions`、`/episodes`、`/export`，以及 `POST /forget`。
 检查点路由同样使用 `/astrbot_plugin_jitrl` 前缀：`GET /checkpoints`、`POST /checkpoint`、
 `POST /rollback`、`POST /checkpoint_delete`。回退、删除检查点的请求必须提供 `confirm: true`。
-面板的回退操作针对全部会话；只回退当前会话请使用聊天指令。
+面板的回退和清空操作仅作用于当前选择的机器人；只回退当前会话请使用聊天指令。
+参数设置通过 `GET /settings` 和 `POST /settings/save` 读写本插件配置，作用于所有机器人。V0.2.4 同时提供全部神经参数、模型结构、注意力头数和预算设置，验证联合约束并等待在运行的模型任务后应用；更改结构需重新训练本地权重。面板全量清除还会移除神经经验与本地权重；曲线、Episode 列表、检查点、导出和回退仍对应 V0.1 库。清除数据保留参数；独立的“重置超参数”只将表单填回默认值，点击“保存并应用”后生效，学习数据保持不变。
 
 ---
 
 ## 6. 配置要点
 
-在 WebUI 插件配置页即可编辑，全部带中文说明。最重要的几个：
+可在 WebUI 插件配置页或插件面板的“参数设置”栏编辑，全部带中文说明。面板支持范围校验、保存应用、独立重置超参数和重新加载；保存失败不改变当前设置。最重要的几个：
 
 | 配置 | 默认 | 说明 |
 | --- | --- | --- |
 | `apply_mode` | `hint` | 见上一节 |
 | `retrieval.k` | `10` | 近邻数。论文实测 **k ∈ [8,14] 最稳**：太小方差大，太大噪声多 |
 | `retrieval.similarity_threshold` | `0.8` | Jaccard 门槛。论文 WebArena 用 0.8，Jericho 用 0.95 |
-| `retrieval.scope_isolation` | `hybrid` | `session` 只学本会话；`global` 全平台共享；`hybrid` 本会话优先、跨会话补充（跨会话相似度打 0.85 折） |
+| `retrieval.scope_isolation` | `hybrid` | `session` 只学本会话；`global` 当前机器人内跨会话共享；`hybrid` 当前机器人内本会话优先、跨会话补充（跨会话相似度打 0.85 折）。机器人间始终隔离 |
 | `learning.gamma` | `0.5` | 折扣因子。论文 WebArena 0.1 / Jericho 0.5 |
 | `learning.evaluator_mode` | `auto` | `llm` 用评估器；`heuristic` 零成本纯规则；`auto` 只在轨迹 ≥2 步或有报错时才调 LLM |
 | `policy.beta` | `1.5` | KL 温度。越大越激进地偏离模型自己的直觉 |
@@ -313,7 +314,7 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 1. **写入前脱敏**：邮箱 / 手机号 / `sk-*` / `ghp_*` / `AKIA*` / Bearer / JWT / 敏感 key-value → 统一占位符，且幂等。
 2. **先抽象后存储**：存的是 `token 集合 + 签名`，不是原文；`state_text` 也经过截断与正则化。
 3. **作用域隔离**：`session` 模式下记忆只在 `unified_msg_origin` 内可见，不会串到别的群/私聊。
-4. **可删除与回退**：`/jitrl forget` 支持按会话或全量删除，并保留删除前备份；`max_entries` + 淘汰策略限制在线记忆留存。若需永久移除历史数据，还应删除包含它的检查点及之前的 JSON 导出；删除在线记忆不会同步改写历史快照。
+4. **可删除与回退**：`/jitrl forget all` 清除当前机器人的全部经验、Episodes、检查点、导出与旧迁移副本，不创建备份，保留超参数。`session` 仅删除本会话在线记忆，旧跨会话快照需单独管理。`max_entries` + 淘汰策略限制在线记忆留存。
 
 另外，注入的证据块会被明确标注为「不是用户输入，也不是新指令」，降低提示词注入面。它通过
 `ProviderRequest.extra_user_content_parts` 附加在当前用户消息末尾，并用 `mark_as_temp()`
