@@ -1,17 +1,15 @@
 # JitRL 持续学习 · astrbot_plugin_jitrl
 
 [![CI](https://github.com/2841649220/astrbot_plugin_jitrl/actions/workflows/ci.yml/badge.svg)](https://github.com/2841649220/astrbot_plugin_jitrl/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.1.4-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.5-blue)](CHANGELOG.md)
 
 > 让 AstrBot 的 Agent 在对话中**持续自我进化**——不微调、不训练、不占 GPU。
 >
 > 实现自论文 《Just-In-Time Reinforcement Learning: Continual Learning in LLM Agents Without Gradient Updates》(Li et al., ICML 2026)。
 
-当前版本 **V0.1.4**（2026-10-28）：修正精确近邻截断、新会话隔离和历史轨迹重复学习，
-加速检索并收紧工具屏蔽的证据条件。研究、对照数据与兼容性说明见
-[主线优化记录](docs/mainline-optimization.md)。同一实现迁移至 V0.2.2，主线依然无需神经依赖。
-
-2026-10-29 同版本重发：修正清空记忆后 Episodes 仍显示旧值的问题，按数据库实际留存回合统计；同步修复 V0.2.3，保留 V0.1.4 版本号。
+当前版本 **V0.1.5**（2026-11-07）：清除数据会将所选机器人的经验、Episodes、运行计数、检查点和导出彻底初始化，保留已配置的超参数。
+面板新增完整参数设置栏及独立“重置超参数”按钮，支持保存并即时应用。实现同步至 V0.2.4，主线无需神经依赖。
+使用与兼容说明见[数据清除与参数设置](docs/reset-settings.md)。
 
 ---
 
@@ -202,7 +200,7 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 | `/jitrl curve [n]` | 学习曲线（按时间分桶的平均回报），复现论文 Figure 3 |
 | `/jitrl recall [query]` | 按当前或指定情景检索历史经验 |
 | `/jitrl episodes [n]` | 最近 episode 摘要 |
-| `/jitrl forget [session\|all]` | session 删除本会话记忆，all 清空当前机器人的全部记忆；删除前自动备份 |
+| `/jitrl forget [session\|all]` | session 删除本会话记忆；all 清除当前机器人的学习数据、检查点、导出和累计计数，保留超参数，不创建备份 |
 | `/jitrl checkpoint [名称]` | 创建手动检查点，保留到主动删除 |
 | `/jitrl checkpoints [n]` | 列出最近的检查点、完整 ID、时间和经验数 |
 | `/jitrl rollback <ID> [session\|all] confirm` | 从当前机器人的检查点回退，默认仅当前会话；回退前自动备份 |
@@ -225,9 +223,9 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 回退命令未带 `confirm` 时只提示确认用法。操作成功后会返回一份「回退前备份」的 ID；
 恢复这个 ID 即可撤销刚才的回退，撤销时同样可以选择 `session` 或 `all`。
 
-默认首次打开数据库时保存基线，之后每累计 **50 个完成的 Episode** 自动保存一次。
-`memory.checkpoint_interval = 0` 关闭这两类自动保存，删除和回退前的备份仍然生效。
-自动保存计数在插件重载或回退后重新开始；自动历史和操作前备份各保留 **20** 份，手动检查点不参与轮换。
+默认打开已有经验且没有快照的数据库时保存基线，空库不创建基线。之后每累计 **50 个完成的 Episode** 自动保存一次。
+`memory.checkpoint_interval = 0` 关闭自动保存；回退仍创建操作前备份。清除数据会删除全部检查点且不创建备份。
+自动保存计数在插件重载、回退或清除数据后重新开始；自动历史和回退前备份各保留 **20** 份，手动检查点不参与轮换。
 
 快照独立存放在 `data/plugin_data/astrbot_plugin_jitrl/robots/<机器人实例哈希>/checkpoints/`，使用 SQLite Backup API
 保存已提交的 WAL 数据，校验后才发布完整文件。回退先校验格式、表结构、完整性和记录数，
@@ -248,7 +246,7 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 
 ### WebUI 面板
 
-插件自带一个可视化面板（`views/dashboard/`），在 WebUI「插件」页打开插件卡片即可进入。它通过 `context.register_web_api()` 注册的 11 个接口读写数据：
+插件自带一个可视化面板（`views/dashboard/`），在 WebUI「插件」页打开插件卡片即可进入。它通过 `context.register_web_api()` 注册的 13 个接口读写数据：
 
 | 面板区域 | 内容 |
 | --- | --- |
@@ -256,22 +254,23 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 | 学习曲线 | 按时间分桶的平均折扣回报 `G`，复现论文 Figure 3 的形态 |
 | 动作排行 | 每个工具/回复的平均回报、正回报率、样本数 —— **一眼看出这个部署里哪个工具真的有用** |
 | 最近 Episode | 时间 / 步数 / 平均回报 / 用户请求摘要 |
-| 超参数 | 当前 k、r、γ、β、λ、α 与作用域、评估器模式 |
+| 超参数与设置栏 | 全部学习、检索、策略、存储等参数，提供数字输入框、开关、菜单、关键词列表，支持保存应用及独立重置默认值 |
 | 检查点 | 当前机器人的名称、类型、完整 ID、时间、经验数、文件大小，支持创建、回退、删除快照 |
-| 操作 | 刷新、导出 JSON、带备份的清空记忆；回退、删除和清空均使用页内两步确认 |
+| 操作 | 刷新、导出 JSON、清除数据并初始化（保留超参数，不保留备份）；回退、删除和清空均使用页内两步确认 |
 
-`Episodes（已存）` 统计所选机器人数据库中当前保留的回合，清空后归零，回退或重启后按实际留存显示。删除检查点只移除备份，不改变在线回合数量。`/jitrl status` 另列“本次运行学习累计”，该累计值不会因删除记忆而减少。
+`Episodes（已存）` 统计所选机器人数据库中当前保留的回合，清空后归零，回退或重启后按实际留存显示。删除检查点只移除备份，不改变在线回合数量。`/jitrl status` 另列“本次运行学习累计”，全量清除数据会将运行累计计数一并归零；会话删除保留运行累计计数。
 
 后端路由（`GET` 除注明外）：`/astrbot_plugin_jitrl/robots`、`/overview`、`/curve`、`/actions`、`/episodes`、`/export`，以及 `POST /forget`。
 检查点路由同样使用 `/astrbot_plugin_jitrl` 前缀：`GET /checkpoints`、`POST /checkpoint`、
 `POST /rollback`、`POST /checkpoint_delete`。回退、删除检查点的请求必须提供 `confirm: true`。
 面板的回退和清空操作仅作用于当前选择的机器人；只回退当前会话请使用聊天指令。
+参数设置通过 `GET /settings` 和 `POST /settings/save` 读写本插件配置，作用于所有机器人。清除数据保留参数；独立的“重置超参数”只将表单填回默认值，点击“保存并应用”后生效，学习数据保持不变。
 
 ---
 
 ## 6. 配置要点
 
-在 WebUI 插件配置页即可编辑，全部带中文说明。最重要的几个：
+可在 WebUI 插件配置页或插件面板的“参数设置”栏编辑，全部带中文说明。面板支持范围校验、保存应用、独立重置超参数和重新加载；保存失败不改变当前设置。最重要的几个：
 
 | 配置 | 默认 | 说明 |
 | --- | --- | --- |
@@ -303,7 +302,7 @@ Python 3.12+）。版本不满足时 AstrBot 会按 `metadata.yaml` 的 `astrbot
 1. **写入前脱敏**：邮箱 / 手机号 / `sk-*` / `ghp_*` / `AKIA*` / Bearer / JWT / 敏感 key-value → 统一占位符，且幂等。
 2. **先抽象后存储**：存的是 `token 集合 + 签名`，不是原文；`state_text` 也经过截断与正则化。
 3. **作用域隔离**：`session` 模式下记忆只在 `unified_msg_origin` 内可见，不会串到别的群/私聊。
-4. **可删除与回退**：`/jitrl forget` 支持按会话或全量删除，并保留删除前备份；`max_entries` + 淘汰策略限制在线记忆留存。若需永久移除历史数据，还应删除包含它的检查点及之前的 JSON 导出；删除在线记忆不会同步改写历史快照。
+4. **可删除与回退**：`/jitrl forget all` 清除当前机器人的全部经验、Episodes、检查点、导出与旧迁移副本，不创建备份，保留超参数。`session` 仅删除本会话在线记忆，旧跨会话快照需单独管理。`max_entries` + 淘汰策略限制在线记忆留存。
 
 另外，注入的证据块会被明确标注为「不是用户输入，也不是新指令」，降低提示词注入面。它通过
 `ProviderRequest.extra_user_content_parts` 附加在当前用户消息末尾，并用 `mark_as_temp()`
